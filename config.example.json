@@ -8,5 +8,5 @@
   "defaultEndpoint": "ide",
   "redisUrl": "redis://redis:6379",
   "cacheDebugLogging": false,
-  "cacheMaxReadRatio": 1.0
+  "cacheMaxReadRatio": [0.8, 0.95]
 }

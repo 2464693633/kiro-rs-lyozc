@@ -8,12 +8,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::anthropic::types::{CacheControl, Message, SystemMessage, Tool};
+use crate::model::config::CacheMaxReadRatio;
 use crate::token;
 
 /// 全局 Redis 连接管理器
 static REDIS_CONN: OnceLock<ConnectionManager> = OnceLock::new();
 static CACHE_DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
-static CACHE_MAX_READ_RATIO_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
+static CACHE_MAX_READ_RATIO_MIN_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
+static CACHE_MAX_READ_RATIO_MAX_BITS: AtomicU64 = AtomicU64::new(1.0f64.to_bits());
 
 /// 默认 TTL: 5 分钟
 const DEFAULT_TTL_SECS: u64 = 5 * 60;
@@ -50,12 +52,17 @@ pub fn set_debug_logging(enabled: bool) {
     }
 }
 
-pub fn set_max_read_ratio(ratio: f64) {
-    let ratio = normalize_cache_max_read_ratio(ratio);
+pub fn set_max_read_ratio(config: CacheMaxReadRatio) {
+    let (min, max) = normalize_cache_max_read_ratio(config);
 
-    CACHE_MAX_READ_RATIO_BITS.store(ratio.to_bits(), Ordering::Relaxed);
-    if ratio < 1.0 {
-        tracing::info!("Cache max read ratio set to {:.3}", ratio);
+    CACHE_MAX_READ_RATIO_MIN_BITS.store(min.to_bits(), Ordering::Relaxed);
+    CACHE_MAX_READ_RATIO_MAX_BITS.store(max.to_bits(), Ordering::Relaxed);
+    if min < 1.0 || max < 1.0 {
+        if min == max {
+            tracing::info!("Cache max read ratio set to {:.3}", min);
+        } else {
+            tracing::info!("Cache max read ratio range set to {:.3}-{:.3}", min, max);
+        }
     }
 }
 
@@ -63,15 +70,39 @@ fn cache_debug_logging_enabled() -> bool {
     CACHE_DEBUG_LOGGING.load(Ordering::Relaxed)
 }
 
-fn cache_max_read_ratio() -> f64 {
-    f64::from_bits(CACHE_MAX_READ_RATIO_BITS.load(Ordering::Relaxed))
+fn cache_max_read_ratio_for_request() -> f64 {
+    let min = f64::from_bits(CACHE_MAX_READ_RATIO_MIN_BITS.load(Ordering::Relaxed));
+    let max = f64::from_bits(CACHE_MAX_READ_RATIO_MAX_BITS.load(Ordering::Relaxed));
+    if min >= max {
+        min
+    } else {
+        fastrand::f64() * (max - min) + min
+    }
 }
 
-fn normalize_cache_max_read_ratio(ratio: f64) -> f64 {
-    if ratio.is_finite() {
-        ratio.clamp(0.0, 1.0)
-    } else {
-        1.0
+fn normalize_cache_max_read_ratio(config: CacheMaxReadRatio) -> (f64, f64) {
+    fn normalize_value(value: f64) -> f64 {
+        if value.is_finite() {
+            value.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    match config {
+        CacheMaxReadRatio::Fixed(value) => {
+            let value = normalize_value(value);
+            (value, value)
+        }
+        CacheMaxReadRatio::Range([left, right]) => {
+            let left = normalize_value(left);
+            let right = normalize_value(right);
+            if left <= right {
+                (left, right)
+            } else {
+                (right, left)
+            }
+        }
     }
 }
 
@@ -491,7 +522,7 @@ fn plan_cache_mutations(
 
 /// 查询或创建缓存
 fn effective_breakpoint_count(breakpoints: &[CacheBreakpoint], total_input_tokens: i32) -> usize {
-    let ratio = cache_max_read_ratio();
+    let ratio = cache_max_read_ratio_for_request();
     effective_breakpoint_count_with_ratio(breakpoints, total_input_tokens, ratio)
 }
 
@@ -688,8 +719,21 @@ mod tests {
 
     #[test]
     fn cache_read_ratio_limit_clamps_invalid_ratio_to_default() {
-        assert_eq!(normalize_cache_max_read_ratio(f64::NAN), 1.0);
-        assert_eq!(normalize_cache_max_read_ratio(-0.5), 0.0);
-        assert_eq!(normalize_cache_max_read_ratio(1.5), 1.0);
+        assert_eq!(
+            normalize_cache_max_read_ratio(CacheMaxReadRatio::Fixed(f64::NAN)),
+            (1.0, 1.0)
+        );
+        assert_eq!(
+            normalize_cache_max_read_ratio(CacheMaxReadRatio::Fixed(-0.5)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            normalize_cache_max_read_ratio(CacheMaxReadRatio::Fixed(1.5)),
+            (1.0, 1.0)
+        );
+        assert_eq!(
+            normalize_cache_max_read_ratio(CacheMaxReadRatio::Range([0.95, 0.8])),
+            (0.8, 0.95)
+        );
     }
 }

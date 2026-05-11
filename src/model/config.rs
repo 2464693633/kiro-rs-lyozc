@@ -17,6 +17,13 @@ impl Default for TlsBackend {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CacheMaxReadRatio {
+    Fixed(f64),
+    Range([f64; 2]),
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,9 +102,10 @@ pub struct Config {
     #[serde(default)]
     pub cache_debug_logging: bool,
 
-    /// Maximum ratio of input tokens that can be read from prompt cache per request.
+    /// Maximum ratio of input tokens that can be cached per request.
+    /// Use a number for a fixed ratio, or [min, max] to randomize per request.
     #[serde(default = "default_cache_max_read_ratio")]
-    pub cache_max_read_ratio: f64,
+    pub cache_max_read_ratio: CacheMaxReadRatio,
 
     /// 负载均衡模式（"priority" 或 "balanced"）
     #[serde(default = "default_load_balancing_mode")]
@@ -163,8 +171,8 @@ fn default_load_balancing_mode() -> String {
     "priority".to_string()
 }
 
-fn default_cache_max_read_ratio() -> f64 {
-    1.0
+fn default_cache_max_read_ratio() -> CacheMaxReadRatio {
+    CacheMaxReadRatio::Fixed(1.0)
 }
 
 fn default_extract_thinking() -> bool {
