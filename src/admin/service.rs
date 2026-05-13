@@ -4,19 +4,26 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
+use crate::http_client::ProxyConfig;
+use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
+use crate::kiro::auth::social;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
+use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AssignProxyRequest, BalanceResponse,
     BatchAddProxyRequest, CredentialStatusItem, CredentialsStatusResponse,
-    LoadBalancingModeResponse, ProxyPoolEntry, ProxyPoolResponse, SetLoadBalancingModeRequest,
+    LoadBalancingModeResponse, PollIdcLoginResponse, ProxyPoolEntry, ProxyPoolResponse,
+    SetLoadBalancingModeRequest, StartIdcLoginRequest, StartIdcLoginResponse,
+    StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
@@ -43,6 +50,43 @@ pub struct AdminService {
     known_endpoints: HashSet<String>,
     /// 代理 IP 池管理器
     proxy_pool: ProxyPoolManager,
+    /// 进行中的 IdC 设备授权会话
+    idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
+    /// 进行中的 Social 登录会话
+    social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
+}
+
+/// Social 登录会话状态
+struct SocialAuthSession {
+    auth_endpoint: String,
+    /// 发起时生成的 state，用于 CSRF 验证
+    state: String,
+    code_verifier: String,
+    redirect_uri: String,
+    expires_at: DateTime<Utc>,
+    /// 收到 OAuth 回调时的数据（code + login_option + path）
+    callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
+    /// 远程回调模式：axum handler 调用 handle_oauth_callback 时通过此 sender 注入数据
+    /// 本地模式（local callback server）时为 None
+    callback_tx: Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>,
+    cred_template: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+    /// Drop 时自动关闭回调服务器并释放端口（远程模式时为 None）
+    _server_handle: Option<social::ServerHandle>,
+}
+
+/// IdC 设备授权会话状态
+struct IdcAuthSession {
+    region: String,
+    client_id: String,
+    client_secret: String,
+    device_code: String,
+    expires_at: DateTime<Utc>,
+    poll_interval: i64,
+    /// 登录成功后写入的凭据配置
+    cred_template: KiroCredentials,
+    /// 用于发起 token 请求的代理
+    proxy: Option<ProxyConfig>,
 }
 
 impl AdminService {
@@ -60,13 +104,33 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
 
-        Self {
+        let svc = Self {
             token_manager,
             balance_cache: Mutex::new(balance_cache),
             cache_path,
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path),
+            idc_sessions: Arc::new(Mutex::new(HashMap::new())),
+            social_sessions: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
+        {
+            let idc = Arc::clone(&svc.idc_sessions);
+            let social = Arc::clone(&svc.social_sessions);
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(300));
+                loop {
+                    interval.tick().await;
+                    let now = Utc::now();
+                    idc.lock().retain(|_, s| now < s.expires_at);
+                    social.lock().retain(|_, s| now < s.expires_at);
+                }
+            });
         }
+
+        svc
     }
 
     /// 获取所有凭据状态
@@ -298,6 +362,60 @@ impl AdminService {
         self.save_balance_cache();
 
         Ok(())
+    }
+
+    /// 从磁盘加载最新配置并应用更新，再写回磁盘。
+    ///
+    /// 每次读最新文件再写，避免多次调用之间字段互相覆盖。
+    fn update_config_file(&self, updater: impl FnOnce(&mut Config)) {
+        let base = self.token_manager.config();
+        let Some(path) = base.config_path() else {
+            return;
+        };
+        match Config::load(path) {
+            Ok(mut fresh) => {
+                updater(&mut fresh);
+                if let Err(e) = fresh.save() {
+                    tracing::warn!("保存配置文件失败: {}", e);
+                }
+            }
+            Err(e) => tracing::warn!("读取配置文件失败（跳过持久化）: {}", e),
+        }
+    }
+
+    /// 获取全局代理 URL
+    pub fn get_global_proxy(&self) -> Option<String> {
+        self.token_manager.proxy().map(|p| p.url.clone())
+    }
+
+    /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
+    pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
+        if let Some(ref u) = url {
+            let valid_prefix = u.starts_with("http://")
+                || u.starts_with("https://")
+                || u.starts_with("socks5://")
+                || u.starts_with("socks4://");
+            if !valid_prefix {
+                return Err(AdminServiceError::InvalidCredential(
+                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let proxy = url.as_deref().map(ProxyConfig::new);
+        self.token_manager.set_global_proxy(proxy);
+
+        // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
+        let url_for_save = url;
+        self.update_config_file(move |c| c.proxy_url = url_for_save);
+        Ok(())
+    }
+
+    /// 持久化新的 Admin API Key 到配置文件（内存中的 key 由 handler 层负责更新）
+    pub fn persist_admin_key(&self, new_key: &str) {
+        let key = new_key.to_string();
+        self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
     /// 获取负载均衡模式
@@ -628,6 +746,230 @@ impl AdminService {
         }
     }
 
+    // ── Social 登录（Portal PKCE OAuth）────────────────────────────────────────
+
+    /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
+    ///
+    /// 模式选择：
+    /// - `callback_base_url` 为 Some → 远程模式：redirect_uri 使用服务端公网地址，不启动本地端口
+    /// - `callback_base_url` 为 None  → 本地模式：启动本地 TCP 回调服务器（浏览器与服务端须同机）
+    pub async fn start_social_login(
+        &self,
+        req: StartSocialLoginRequest,
+    ) -> Result<StartSocialLoginResponse, AdminServiceError> {
+        let global_proxy = self.token_manager.proxy();
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let auth_endpoint = req
+            .auth_endpoint
+            .unwrap_or_else(|| social::KIRO_AUTH_ENDPOINT.to_string());
+
+        let (code_verifier, code_challenge) = social::generate_pkce();
+        let state = uuid::Uuid::new_v4().to_string();
+
+        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+
+        // 根据是否提供 callback_base_url 选择本地或远程回调模式
+        let (redirect_uri, server_handle, callback_tx) =
+            if let Some(ref base_url) = req.callback_base_url {
+                // 远程模式：用服务端公网地址接收 OAuth 回调
+                let uri = format!(
+                    "{}/api/admin/auth/social/callback",
+                    base_url.trim_end_matches('/')
+                );
+                (uri, None, Some(tx))
+            } else {
+                // 本地模式：启动临时 TCP 服务器（浏览器与服务端须在同一台机器）
+                let (port, handle) = social::start_callback_server(tx)
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                (format!("http://127.0.0.1:{}", port), Some(handle), None)
+            };
+
+        let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
+
+        let expires_at = Utc::now() + Duration::minutes(10);
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let cred_template = KiroCredentials {
+            auth_method: Some("social".to_string()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
+        };
+
+        let session = SocialAuthSession {
+            auth_endpoint,
+            state,
+            code_verifier,
+            redirect_uri,
+            expires_at,
+            callback_rx: tokio::sync::Mutex::new(rx),
+            callback_tx,
+            cred_template,
+            proxy,
+            _server_handle: server_handle,
+        };
+
+        self.social_sessions
+            .lock()
+            .insert(session_id.clone(), session);
+
+        Ok(StartSocialLoginResponse {
+            session_id,
+            portal_url,
+            expires_at: expires_at.to_rfc3339(),
+        })
+    }
+
+    /// 轮询一次 Social 登录状态
+    pub async fn poll_social_login(
+        &self,
+        session_id: &str,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        use tokio::sync::oneshot::error::TryRecvError;
+
+        // 一次加锁同时完成：过期检查 + 非阻塞回调接收，消除 TOCTOU
+        enum PollOutcome {
+            Expired,
+            Closed,
+            Pending,
+            Received(social::OAuthCallbackData),
+        }
+
+        let outcome = {
+            let sessions = self.social_sessions.lock();
+            let Some(session) = sessions.get(session_id) else {
+                return Err(AdminServiceError::NotFound { id: 0 });
+            };
+
+            if Utc::now() >= session.expires_at {
+                PollOutcome::Expired
+            } else {
+                match session.callback_rx.try_lock() {
+                    Ok(mut rx) => match rx.try_recv() {
+                        Ok(data) => PollOutcome::Received(data),
+                        Err(TryRecvError::Empty) => PollOutcome::Pending,
+                        Err(TryRecvError::Closed) => PollOutcome::Closed,
+                    },
+                    Err(_) => PollOutcome::Pending,
+                }
+            }
+        };
+
+        match outcome {
+            PollOutcome::Pending => return Ok(PollIdcLoginResponse::Pending),
+            PollOutcome::Expired => {
+                self.social_sessions.lock().remove(session_id);
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+            PollOutcome::Closed => {
+                self.social_sessions.lock().remove(session_id);
+                return Err(AdminServiceError::InternalError(
+                    "Social 登录回调服务器已关闭，请重新发起登录".to_string(),
+                ));
+            }
+            PollOutcome::Received(callback) => {
+                // 取出 session（含 code_verifier、state 等敏感数据）
+                let session = {
+                    let mut sessions = self.social_sessions.lock();
+                    sessions.remove(session_id)
+                };
+                let session = match session {
+                    Some(s) => s,
+                    None => return Err(AdminServiceError::NotFound { id: 0 }),
+                };
+
+                // CSRF 验证：回调 state 必须与发起时一致
+                if callback.state != session.state {
+                    tracing::warn!(
+                        "Social 登录 state 不匹配（期望 {}, 收到 {}），已拒绝",
+                        session.state, callback.state
+                    );
+                    return Err(AdminServiceError::InternalError(
+                        "OAuth state 不匹配，请重新发起登录".to_string(),
+                    ));
+                }
+
+                let config = self.token_manager.config();
+
+                // 构建完整的 redirect_uri（与 IDE 行为一致）
+                let full_redirect_uri = if callback.login_option.is_empty() {
+                    format!("{}{}", session.redirect_uri, callback.path)
+                } else {
+                    format!(
+                        "{}{}?login_option={}",
+                        session.redirect_uri,
+                        callback.path,
+                        urlencoding::encode(&callback.login_option),
+                    )
+                };
+
+                let token = social::exchange_code_for_token(
+                    &session.auth_endpoint,
+                    &callback.code,
+                    &session.code_verifier,
+                    &full_redirect_uri,
+                    config,
+                    session.proxy.as_ref(),
+                )
+                .await
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                let mut new_cred = session.cred_template;
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                new_cred.expires_at = token.expires_at.or_else(|| {
+                    token.expires_in.map(|secs| {
+                        (Utc::now() + Duration::seconds(secs)).to_rfc3339()
+                    })
+                });
+                if let Some(arn) = token.profile_arn {
+                    new_cred.profile_arn = Some(arn);
+                }
+
+                let credential_id = self
+                    .token_manager
+                    .add_credential(new_cred)
+                    .await
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
+                Ok(PollIdcLoginResponse::Success { credential_id })
+            }
+        }
+    }
+
+    /// 接收来自 axum 公开回调路由的 OAuth 数据，注入到等待中的 Social 登录会话
+    ///
+    /// 仅用于远程模式（callback_base_url 不为空时）。通过 state 参数定位会话并唤醒轮询。
+    pub fn handle_oauth_callback(
+        &self,
+        state_param: &str,
+        data: social::OAuthCallbackData,
+    ) -> Result<(), AdminServiceError> {
+        let mut sessions = self.social_sessions.lock();
+        let session = sessions
+            .iter_mut()
+            .find(|(_, s)| s.state == state_param)
+            .map(|(_, s)| s)
+            .ok_or(AdminServiceError::NotFound { id: 0 })?;
+
+        let tx = session.callback_tx.take().ok_or_else(|| {
+            AdminServiceError::InvalidCredential(
+                "该会话使用本地回调服务器，不支持远程回调接口".to_string(),
+            )
+        })?;
+
+        tx.send(data).map_err(|_| {
+            AdminServiceError::InternalError("会话回调通道已关闭，请重新发起登录".to_string())
+        })
+    }
+
     /// 分类删除凭据错误
     fn classify_delete_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
@@ -637,6 +979,146 @@ impl AdminService {
             AdminServiceError::InvalidCredential(msg)
         } else {
             AdminServiceError::InternalError(msg)
+        }
+    }
+
+    // ── IdC 设备授权登录 ──────────────────────────────────────────────────────
+
+    /// 发起 IdC 设备授权，返回验证码和 URL
+    pub async fn start_idc_login(
+        &self,
+        req: StartIdcLoginRequest,
+    ) -> Result<StartIdcLoginResponse, AdminServiceError> {
+        let config = self.token_manager.config();
+        let global_proxy = self.token_manager.proxy();
+
+        // 代理：优先用请求级，否则回退全局
+        let proxy = req
+            .proxy_url
+            .as_deref()
+            .map(ProxyConfig::new)
+            .or(global_proxy);
+
+        let start_url = req
+            .start_url
+            .as_deref()
+            .unwrap_or(BUILDER_ID_START_URL);
+
+        // 1. 注册 OIDC 客户端
+        let reg = idc::register_client(&req.region, config, proxy.as_ref())
+            .await
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        // 2. 发起设备授权
+        let device = idc::start_device_authorization(
+            &req.region,
+            start_url,
+            &reg.client_id,
+            &reg.client_secret,
+            config,
+            proxy.as_ref(),
+        )
+        .await
+        .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+        let expires_at = Utc::now() + Duration::seconds(device.expires_in);
+        let session_id = Uuid::new_v4().to_string();
+
+        // 构建登录成功后写入的凭据模板
+        let cred_template = KiroCredentials {
+            auth_method: Some("idc".to_string()),
+            client_id: Some(reg.client_id.clone()),
+            client_secret: Some(reg.client_secret.clone()),
+            region: Some(req.region.clone()),
+            priority: req.priority,
+            email: req.email,
+            proxy_url: req.proxy_url,
+            ..Default::default()
+        };
+
+        let session = IdcAuthSession {
+            region: req.region,
+            client_id: reg.client_id,
+            client_secret: reg.client_secret,
+            device_code: device.device_code,
+            expires_at,
+            poll_interval: device.interval.max(5),
+            cred_template,
+            proxy,
+        };
+
+        let poll_interval = session.poll_interval;
+        self.idc_sessions.lock().insert(session_id.clone(), session);
+
+        Ok(StartIdcLoginResponse {
+            session_id,
+            user_code: device.user_code,
+            verification_uri: device.verification_uri,
+            verification_uri_complete: device.verification_uri_complete,
+            expires_at: expires_at.to_rfc3339(),
+            poll_interval,
+        })
+    }
+
+    /// 轮询一次 IdC 登录状态
+    pub async fn poll_idc_login(
+        &self,
+        session_id: &str,
+    ) -> Result<PollIdcLoginResponse, AdminServiceError> {
+        let (region, client_id, client_secret, device_code, expires_at, proxy, cred_template) = {
+            let sessions = self.idc_sessions.lock();
+            let s = sessions
+                .get(session_id)
+                .ok_or_else(|| AdminServiceError::NotFound { id: 0 })?;
+
+            if Utc::now() >= s.expires_at {
+                return Ok(PollIdcLoginResponse::Expired);
+            }
+
+            (
+                s.region.clone(),
+                s.client_id.clone(),
+                s.client_secret.clone(),
+                s.device_code.clone(),
+                s.expires_at,
+                s.proxy.clone(),
+                s.cred_template.clone(),
+            )
+        };
+
+        let config = self.token_manager.config();
+
+        match idc::poll_token(
+            &region, &client_id, &client_secret, &device_code, config, proxy.as_ref(),
+        )
+        .await
+        {
+            idc::PollResult::Pending => Ok(PollIdcLoginResponse::Pending),
+            idc::PollResult::Expired => {
+                self.idc_sessions.lock().remove(session_id);
+                Ok(PollIdcLoginResponse::Expired)
+            }
+            idc::PollResult::Error(e) => Err(AdminServiceError::InternalError(e.to_string())),
+            idc::PollResult::Success(token) => {
+                // 写入凭据
+                let mut new_cred = cred_template;
+                new_cred.access_token = Some(token.access_token);
+                new_cred.refresh_token = token.refresh_token;
+                if let Some(secs) = token.expires_in {
+                    new_cred.expires_at =
+                        Some((Utc::now() + Duration::seconds(secs)).to_rfc3339());
+                }
+
+                let credential_id = self
+                    .token_manager
+                    .add_credential(new_cred)
+                    .await
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+
+                self.idc_sessions.lock().remove(session_id);
+                tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
+                Ok(PollIdcLoginResponse::Success { credential_id })
+            }
         }
     }
 }

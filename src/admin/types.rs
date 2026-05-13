@@ -271,6 +271,116 @@ pub struct AssignProxyRequest {
     pub proxy_id: Option<u64>,
 }
 
+// ============ 全局代理配置 ============
+
+/// 全局代理配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalProxyResponse {
+    /// 当前全局代理 URL（null 表示未配置）
+    pub proxy_url: Option<String>,
+}
+
+/// 设置全局代理请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetGlobalProxyRequest {
+    /// 代理 URL，null 表示清除全局代理
+    pub proxy_url: Option<String>,
+}
+
+// ============ Admin API Key 修改 ============
+
+/// 修改 Admin API Key 请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateAdminKeyRequest {
+    /// 新的 Admin API Key
+    pub new_key: String,
+}
+
+// ============ IdC 设备授权登录 ============
+
+/// 发起 IdC 设备授权请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcLoginRequest {
+    pub region: String,
+    #[serde(default)]
+    pub start_url: Option<String>,
+    #[serde(default)]
+    pub priority: u32,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+}
+
+/// 发起 IdC 设备授权响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartIdcLoginResponse {
+    pub session_id: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification_uri_complete: Option<String>,
+    pub expires_at: String,
+    pub poll_interval: i64,
+}
+
+/// 轮询 IdC 登录状态响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", tag = "status")]
+pub enum PollIdcLoginResponse {
+    #[serde(rename = "pending")]
+    Pending,
+    #[serde(rename = "success")]
+    Success { credential_id: u64 },
+    #[serde(rename = "expired")]
+    Expired,
+}
+
+// ============ Social 登录（Portal PKCE OAuth） ============
+
+/// 发起 Social 登录请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginRequest {
+    /// 优先级（默认 0）
+    #[serde(default)]
+    pub priority: u32,
+    /// 用户邮箱（可选）
+    #[serde(default)]
+    pub email: Option<String>,
+    /// 代理 URL（可选）
+    #[serde(default)]
+    pub proxy_url: Option<String>,
+    /// Kiro auth endpoint（留空用默认）
+    #[serde(default)]
+    pub auth_endpoint: Option<String>,
+    /// 前端所在服务器的公网基础 URL（如 https://kiro-code.ai80.vip）
+    /// 提供时启用远程回调模式，redirect_uri 指向 {callback_base_url}/api/admin/auth/social/callback
+    /// 不提供时回退到本地 TCP 回调服务器模式（浏览器与服务端须同机）
+    #[serde(default)]
+    pub callback_base_url: Option<String>,
+}
+
+/// 发起 Social 登录响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSocialLoginResponse {
+    /// 会话 ID
+    pub session_id: String,
+    /// 在浏览器打开的 portal URL
+    pub portal_url: String,
+    /// 会话过期时间（RFC3339）
+    pub expires_at: String,
+}
+
+/// 轮询 Social 登录状态（与 IdC 共用状态枚举）
+pub type PollSocialLoginResponse = PollIdcLoginResponse;
+
 // ============ 通用响应 ============
 
 /// 操作成功响应

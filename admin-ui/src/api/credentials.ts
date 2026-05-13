@@ -16,6 +16,15 @@ import type {
   BatchAddProxyRequest,
   BatchAddProxyResponse,
   AssignProxyRequest,
+  StartIdcLoginRequest,
+  StartIdcLoginResponse,
+  PollIdcLoginResponse,
+  StartSocialLoginRequest,
+  StartSocialLoginResponse,
+  PollSocialLoginResponse,
+  GlobalProxyResponse,
+  SetGlobalProxyRequest,
+  UpdateAdminKeyRequest,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -169,5 +178,51 @@ export async function getLoadBalancingMode(): Promise<{ mode: 'priority' | 'bala
 // 设置负载均衡模式
 export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promise<{ mode: 'priority' | 'balanced' }> {
   const { data } = await api.put<{ mode: 'priority' | 'balanced' }>('/config/load-balancing', { mode })
+  return data
+}
+
+// 发起 IdC 设备授权登录
+export async function startIdcLogin(
+  req: StartIdcLoginRequest
+): Promise<StartIdcLoginResponse> {
+  const { data } = await api.post<StartIdcLoginResponse>('/auth/idc/start', req)
+  return data
+}
+
+// 轮询 IdC 登录状态
+export async function pollIdcLogin(sessionId: string): Promise<PollIdcLoginResponse> {
+  const { data } = await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`)
+  return data
+}
+
+// 获取全局代理配置
+export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
+  const { data } = await api.get<GlobalProxyResponse>('/config/global-proxy')
+  return data
+}
+
+// 设置全局代理配置
+export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 修改 Admin API Key
+export async function updateAdminKey(req: UpdateAdminKeyRequest): Promise<SuccessResponse> {
+  const { data } = await api.put<SuccessResponse>('/config/admin-key', req)
+  return data
+}
+
+// 发起 Social 登录
+export async function startSocialLogin(
+  req: StartSocialLoginRequest
+): Promise<StartSocialLoginResponse> {
+  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', req)
+  return data
+}
+
+// 轮询 Social 登录状态
+export async function pollSocialLogin(sessionId: string): Promise<PollSocialLoginResponse> {
+  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`)
   return data
 }

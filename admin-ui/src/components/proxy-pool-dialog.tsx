@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { Trash2, Plus, Upload, ToggleLeft, ToggleRight } from 'lucide-react'
+import { Trash2, Plus, Upload, ToggleLeft, ToggleRight, Globe } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -17,6 +17,8 @@ import {
   batchAddProxies,
   deleteProxy,
   setProxyEnabled,
+  getGlobalProxy,
+  setGlobalProxy,
 } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import type { ProxyPoolEntry } from '@/types/api'
@@ -42,6 +44,23 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
     queryFn: getProxyPool,
     enabled: open,
   })
+
+  const { data: globalProxyData } = useQuery({
+    queryKey: ['global-proxy'],
+    queryFn: getGlobalProxy,
+    enabled: open,
+  })
+
+  const setGlobalProxyMutation = useMutation({
+    mutationFn: (url: string | null) => setGlobalProxy({ proxyUrl: url }),
+    onSuccess: (_, url) => {
+      toast.success(url ? `已设置全局代理: ${maskProxyUrl(url)}` : '已清除全局代理')
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    },
+    onError: (err) => toast.error(`操作失败: ${extractErrorMessage(err)}`),
+  })
+
+  const currentGlobalProxy = globalProxyData?.proxyUrl ?? null
 
   const addMutation = useMutation({
     mutationFn: () => addProxy({ url: newUrl.trim(), label: newLabel.trim() || undefined }),
@@ -174,6 +193,30 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
             </div>
           )}
 
+          {/* 全局代理显示 */}
+          <div className="rounded-md border p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Globe className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">全局代理</span>
+              </div>
+              {currentGlobalProxy && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-6 text-xs text-destructive hover:text-destructive"
+                  onClick={() => setGlobalProxyMutation.mutate(null)}
+                  disabled={setGlobalProxyMutation.isPending}
+                >
+                  清除
+                </Button>
+              )}
+            </div>
+            <div className="text-xs font-mono text-muted-foreground">
+              {currentGlobalProxy ? maskProxyUrl(currentGlobalProxy) : '未配置（直连）'}
+            </div>
+          </div>
+
           {/* 代理列表 */}
           <div className="space-y-1">
             <div className="text-sm text-muted-foreground">
@@ -224,6 +267,22 @@ export function ProxyPoolDialog({ open, onOpenChange, onSelectProxy }: ProxyPool
                       >
                         选用
                       </Button>
+                    )}
+                    {proxy.enabled && proxy.url !== currentGlobalProxy && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        onClick={() => setGlobalProxyMutation.mutate(proxy.url)}
+                        disabled={setGlobalProxyMutation.isPending}
+                        title="设为全局代理"
+                      >
+                        <Globe className="h-3 w-3 mr-1" />
+                        全局
+                      </Button>
+                    )}
+                    {proxy.url === currentGlobalProxy && (
+                      <Badge variant="secondary" className="text-xs h-7">全局</Badge>
                     )}
                     <Button
                       size="sm"

@@ -2,16 +2,17 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
-    response::IntoResponse,
+    extract::{Path, Query, State},
+    response::{Html, IntoResponse},
 };
 
 use super::{
     middleware::AdminState,
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, BatchAddProxyRequest,
-        SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest, SuccessResponse,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        GlobalProxyResponse, SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetPriorityRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
 };
 
@@ -248,4 +249,154 @@ pub async fn set_load_balancing_mode(
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// POST /api/admin/auth/idc/start
+/// 发起 IdC 设备授权登录
+pub async fn start_idc_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartIdcLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_idc_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/idc/poll/:session_id
+/// 轮询 IdC 登录状态（由前端按 poll_interval 调用）
+pub async fn poll_idc_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.poll_idc_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/start
+/// 发起 Social 登录，返回 portal URL
+pub async fn start_social_login(
+    State(state): State<AdminState>,
+    Json(payload): Json<StartSocialLoginRequest>,
+) -> impl IntoResponse {
+    match state.service.start_social_login(payload).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/auth/social/poll/:session_id
+/// 轮询 Social 登录状态
+pub async fn poll_social_login(
+    State(state): State<AdminState>,
+    Path(session_id): Path<String>,
+) -> impl IntoResponse {
+    match state.service.poll_social_login(&session_id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/auth/social/callback  （无需认证 —— 由 OAuth 提供商重定向过来）
+///
+/// 接收 Google / GitHub 的 OAuth 授权码，注入到对应的 Social 登录会话中。
+/// 此路由须在 admin_auth_middleware 之外注册。
+#[derive(serde::Deserialize)]
+pub struct OAuthCallbackQuery {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    pub login_option: Option<String>,
+    pub error: Option<String>,
+}
+
+pub async fn oauth_callback(
+    State(state): State<AdminState>,
+    Query(params): Query<OAuthCallbackQuery>,
+    uri: axum::http::Uri,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    // OAuth 授权被用户拒绝
+    if let Some(ref err) = params.error {
+        return Html(format!(
+            "<html><body><script>window.close()</script>\
+             <p style='font-family:sans-serif'>登录失败：{err}</p></body></html>"
+        ))
+        .into_response();
+    }
+
+    let (code, state_param) = match (params.code, params.state) {
+        (Some(c), Some(s)) => (c, s),
+        _ => {
+            return (StatusCode::BAD_REQUEST, "缺少 code 或 state 参数").into_response();
+        }
+    };
+
+    let callback_data = crate::kiro::auth::social::OAuthCallbackData {
+        code,
+        login_option: params.login_option.unwrap_or_default(),
+        path: uri.path().to_string(),
+        state: state_param.clone(),
+    };
+
+    match state.service.handle_oauth_callback(&state_param, callback_data) {
+        Ok(_) => Html(
+            "<html><body><script>window.close()</script>\
+             <p style='font-family:sans-serif;padding:2em'>✅ 登录成功，此窗口将自动关闭。\
+             如未关闭请手动返回管理页面。</p></body></html>",
+        )
+        .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            format!("回调处理失败（state 不匹配或会话已过期）: {}", e),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/admin/config/global-proxy
+/// 获取当前全局代理配置
+pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(GlobalProxyResponse {
+        proxy_url: state.service.get_global_proxy(),
+    })
+}
+
+/// PUT /api/admin/config/global-proxy
+/// 设置或清除全局代理配置
+pub async fn set_global_proxy(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetGlobalProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_global_proxy(payload.proxy_url) {
+        Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/config/admin-key
+/// 修改 Admin API Key 并持久化到配置文件
+pub async fn update_admin_key(
+    State(state): State<AdminState>,
+    Json(payload): Json<UpdateAdminKeyRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    let new_key = payload.new_key.trim().to_string();
+    if new_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request("新 Admin Key 不能为空")),
+        )
+            .into_response();
+    }
+
+    // 更新内存中的认证 key
+    *state.admin_api_key.write() = new_key.clone();
+
+    // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
+    state.service.persist_admin_key(&new_key);
+
+    Json(SuccessResponse::new("Admin API Key 已更新")).into_response()
 }

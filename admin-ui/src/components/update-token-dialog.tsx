@@ -9,7 +9,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
-import { useUpdateRefreshToken, useSetDisabled, useResetFailure } from '@/hooks/use-credentials'
+import { useUpdateRefreshToken, useSetDisabled, useResetFailure, useUpdateCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { CredentialStatusItem } from '@/types/api'
 
@@ -19,33 +19,58 @@ interface UpdateTokenDialogProps {
   credential: CredentialStatusItem
 }
 
-// 从 KAM JSON 或纯字符串中提取 refreshToken
-function extractRefreshToken(input: string): string {
+interface ParsedTokenData {
+  refreshToken: string
+  email?: string
+}
+
+// 从 KAM JSON 或纯字符串中提取 refreshToken 和 email
+function parseTokenInput(input: string): ParsedTokenData {
   const trimmed = input.trim()
-  if (!trimmed) return ''
+  if (!trimmed) return { refreshToken: '' }
 
   try {
     const parsed = JSON.parse(trimmed)
 
-    if (typeof parsed.refreshToken === 'string') {
-      return parsed.refreshToken.trim()
+    const extractFromObj = (obj: Record<string, unknown>): ParsedTokenData | null => {
+      const rt = typeof obj.refreshToken === 'string' ? obj.refreshToken.trim() : ''
+      if (!rt) return null
+      const email = typeof obj.email === 'string' ? obj.email.trim() : undefined
+      return { refreshToken: rt, email: email || undefined }
     }
 
-    if (parsed.credentials && typeof parsed.credentials.refreshToken === 'string') {
-      return parsed.credentials.refreshToken.trim()
-    }
+    const direct = extractFromObj(parsed as Record<string, unknown>)
+    if (direct) return direct
 
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      const first = parsed[0]
-      if (typeof first.refreshToken === 'string') return first.refreshToken.trim()
-      if (first.credentials && typeof first.credentials.refreshToken === 'string') {
-        return first.credentials.refreshToken.trim()
+    if (parsed.credentials) {
+      const nested = extractFromObj(parsed.credentials as Record<string, unknown>)
+      if (nested) {
+        // email 可能在外层：用 spread 返回新对象，避免 mutation
+        const outerEmail = typeof (parsed as Record<string, unknown>).email === 'string'
+          ? ((parsed as Record<string, unknown>).email as string).trim() || undefined
+          : undefined
+        return { ...nested, email: nested.email ?? outerEmail }
       }
     }
 
-    return ''
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const first = parsed[0] as Record<string, unknown>
+      const fromFirst = extractFromObj(first)
+      if (fromFirst) return fromFirst
+      if (first.credentials) {
+        const nested = extractFromObj(first.credentials as Record<string, unknown>)
+        if (nested) {
+          const outerEmail = typeof first.email === 'string'
+            ? (first.email as string).trim() || undefined
+            : undefined
+          return { ...nested, email: nested.email ?? outerEmail }
+        }
+      }
+    }
+
+    return { refreshToken: '' }
   } catch {
-    return trimmed
+    return { refreshToken: trimmed }
   }
 }
 
@@ -55,10 +80,13 @@ export function UpdateTokenDialog({ open, onOpenChange, credential }: UpdateToke
   const [stepLog, setStepLog] = useState<string[]>([])
 
   const updateRefreshToken = useUpdateRefreshToken()
+  const updateCredential = useUpdateCredential()
   const setDisabled = useSetDisabled()
   const resetFailure = useResetFailure()
 
-  const extractedToken = extractRefreshToken(input)
+  const parsed = parseTokenInput(input)
+  const extractedToken = parsed.refreshToken
+  const extractedEmail = parsed.email
   const isValid = extractedToken.length >= 100 && !extractedToken.includes('...')
   const isPending = step === 'updating'
 
@@ -116,6 +144,18 @@ export function UpdateTokenDialog({ open, onOpenChange, credential }: UpdateToke
         )
       })
       addLog('✓ 凭据已启用')
+
+      // 步骤 5：如果 JSON 中包含 email 且与当前不同，同步更新
+      if (extractedEmail && extractedEmail !== credential.email) {
+        addLog(`正在更新邮箱为 ${extractedEmail}…`)
+        await new Promise<void>((resolve, reject) => {
+          updateCredential.mutate(
+            { id: credential.id, req: { email: extractedEmail } },
+            { onSuccess: () => resolve(), onError: reject }
+          )
+        })
+        addLog(`✓ 邮箱已更新为 ${extractedEmail}`)
+      }
 
       setStep('done')
       toast.success(`凭据 #${credential.id} 重新导入完成，已自动启用`)

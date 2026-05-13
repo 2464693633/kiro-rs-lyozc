@@ -140,3 +140,58 @@ export interface BatchAddProxyResponse {
   proxies: ProxyPoolEntry[]
   errorMessages: string[]
 }
+
+// 全局代理配置
+export interface GlobalProxyResponse {
+  proxyUrl: string | null
+}
+
+export interface SetGlobalProxyRequest {
+  proxyUrl: string | null
+}
+
+// Admin Key 修改
+export interface UpdateAdminKeyRequest {
+  newKey: string
+}
+
+// IdC 设备授权登录
+export interface StartIdcLoginRequest {
+  region: string
+  startUrl?: string
+  priority?: number
+  email?: string
+  proxyUrl?: string
+}
+
+export interface StartIdcLoginResponse {
+  sessionId: string
+  userCode: string
+  verificationUri: string
+  verificationUriComplete?: string
+  expiresAt: string
+  pollInterval: number
+}
+
+export type PollIdcLoginResponse =
+  | { status: 'pending' }
+  | { status: 'success'; credentialId: number }
+  | { status: 'expired' }
+
+// Social 登录（Portal PKCE OAuth）
+export interface StartSocialLoginRequest {
+  priority?: number
+  email?: string
+  proxyUrl?: string
+  authEndpoint?: string
+  /** 前端所在服务器的公网基础 URL；提供时使用服务端公开回调路由，无需浏览器与服务端同机 */
+  callbackBaseUrl?: string
+}
+
+export interface StartSocialLoginResponse {
+  sessionId: string
+  portalUrl: string
+  expiresAt: string
+}
+
+export type PollSocialLoginResponse = PollIdcLoginResponse
