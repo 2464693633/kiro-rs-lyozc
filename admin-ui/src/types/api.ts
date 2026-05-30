@@ -411,6 +411,8 @@ export interface TraceQuery {
   status?: string
   errorType?: string
   credentialId?: number
+  /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
+  failedAttemptCredentialId?: number
   model?: string
   onlyFailed?: boolean
   limit?: number

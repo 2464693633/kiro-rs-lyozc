@@ -54,7 +54,7 @@ export function CredentialFailuresDialog({
   email,
 }: CredentialFailuresDialogProps) {
   const { data, isLoading } = useTraces(
-    { credentialId, onlyFailed: true, limit: 50 },
+    { failedAttemptCredentialId: credentialId, limit: 50 },
     open,
   );
   const records = data?.records ?? [];
@@ -78,7 +78,9 @@ export function CredentialFailuresDialog({
               该凭据暂无失败记录（trace 关闭或近期无失败）。
             </div>
           ) : (
-            records.map((rec) => <FailureRow key={rec.traceId} rec={rec} />)
+            records.map((rec) => (
+              <FailureRow key={rec.traceId} rec={rec} credentialId={credentialId} />
+            ))
           )}
         </div>
       </DialogContent>
@@ -86,14 +88,23 @@ export function CredentialFailuresDialog({
   );
 }
 
-/** 单条失败链路：取该凭据命中的那一跳错误体展示 */
-function FailureRow({ rec }: { rec: TraceRecord }) {
-  const style = outcomeStyle(rec.errorType);
-  // 找该卡片对应凭据的那一跳（优先 finalCredentialId 命中跳），取错误体片段
-  const attempt =
+/** 单条失败链路：聚焦"该凭据失败的那一跳"展示（即便整条 trace 最终成功） */
+function FailureRow({
+  rec,
+  credentialId,
+}: {
+  rec: TraceRecord;
+  credentialId: number;
+}) {
+  // 该凭据失败的那一跳（按弹框聚焦的凭据，而非 trace 最终凭据）
+  const failedHop =
     rec.attempts.find(
-      (a) => a.credentialId === rec.finalCredentialId && a.errorSnippet,
-    ) || rec.attempts.find((a) => a.errorSnippet);
+      (a) => a.credentialId === credentialId && a.outcome !== "success",
+    ) || rec.attempts.find((a) => a.credentialId === credentialId);
+  const style = outcomeStyle(failedHop?.outcome ?? rec.errorType);
+  const attempt = failedHop;
+  // 整条 trace 后续是否成功了（用别的凭据救回）
+  const traceRecovered = rec.finalStatus === "success";
   return (
     <div className="rounded-lg border border-border/50 bg-secondary/30 p-3">
       <div className="flex flex-wrap items-center gap-2 text-[13px]">
@@ -105,6 +116,9 @@ function FailureRow({ rec }: { rec: TraceRecord }) {
           <span className="font-mono text-muted-foreground">
             HTTP {attempt.httpStatus}
           </span>
+        )}
+        {traceRecovered && (
+          <Badge variant="outline">本次请求最终由其他凭据成功</Badge>
         )}
         {rec.finalStatus === "interrupted" && (
           <Badge variant="warning">中断</Badge>

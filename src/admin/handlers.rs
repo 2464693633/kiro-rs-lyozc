@@ -935,6 +935,9 @@ pub async fn list_traces(
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
         credential_id: params.get("credentialId").and_then(|s| s.parse::<u64>().ok()),
+        failed_attempt_credential_id: params
+            .get("failedAttemptCredentialId")
+            .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
         only_failed: params
             .get("onlyFailed")

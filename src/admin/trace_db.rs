@@ -119,6 +119,9 @@ pub struct TraceQuery {
     pub error_type: Option<String>,
     /// 最终凭据 id
     pub credential_id: Option<u64>,
+    /// 该凭据在某一跳失败过（attempt 级，跨 trace 最终状态）。
+    /// 用于"凭据失败详情"：即便整条 trace 最终成功，只要该凭据某跳失败也会命中。
+    pub failed_attempt_credential_id: Option<u64>,
     /// 模型名
     pub model: Option<String>,
     /// 仅返回非 success
@@ -299,6 +302,15 @@ impl TraceStore {
         }
         if let Some(c) = q.credential_id {
             clauses.push("final_credential_id = ?");
+            params.push(Box::new(c as i64));
+        }
+        if let Some(c) = q.failed_attempt_credential_id {
+            // 该凭据在某一跳失败过（不论 trace 最终成功与否）
+            clauses.push(
+                "EXISTS (SELECT 1 FROM trace_attempts a \
+                 WHERE a.trace_id = traces.trace_id \
+                 AND a.credential_id = ? AND a.outcome != 'success')",
+            );
             params.push(Box::new(c as i64));
         }
         if let Some(m) = &q.model {
