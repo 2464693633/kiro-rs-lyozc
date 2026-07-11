@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.11] - 2026-07-12
+
+主题：**修复 AWS Enterprise / IAM Identity Center 凭据首次模型调用后，Admin 余额与可用模型查询持续返回 400 的问题**。企业凭据会在首次流式模型请求前通过 `ListAvailableProfiles` 解析真实 `profileArn` 并持久化；旧代码随后将该 ARN 复用到固定使用 Kiro 0.9.2 兼容协议的 `getUsageLimits` 与 `ListAvailableModels` REST GET，导致上游返回 `400 Bad Request {"message":"Improperly formed request."}`。本版隔离流式端点与旧版 REST 端点的 ARN 语义，让企业模型调用和 Admin 查询可以同时正常工作。
+
+### 🔧 修复 — AWS Enterprise / IdC 余额与模型列表查询
+
+- **旧版 REST GET 不再携带 `profileArn`**：`getUsageLimits` 与 `ListAvailableModels` 继续使用 Kiro 0.9.2 兼容 User-Agent，但 URL 不再拼接首次模型调用解析出的真实 `profileArn`，避免上游将请求判定为格式错误。
+- **保留企业流式调用所需 ARN**：不删除、不回滚凭据中已经解析并持久化的 `profileArn`；`generateAssistantResponse` / `SendMessageStreaming` 等流式模型请求仍正常注入真实 ARN，Enterprise 的 `tokentype: EXTERNAL_IDP`、IdC Token 刷新与区域回退逻辑保持不变。
+- **覆盖状态迁移回归场景**：新增 URL 构造测试，模拟企业凭据从“刚导入、无真实 ARN”进入“首次模型调用后、已有真实 ARN”的状态，确保余额与模型列表请求始终省略 `profileArn`。
+
 ## [0.6.10] - 2026-07-10
 
 主题：**放宽 Admin API 请求体上限，修复批量导入凭据时大 JSON 被拒的 413 问题**。批量导入会一次性提交待导入凭据，包含 `refreshToken`、`clientSecret` 等较长字段；当条目较多时，请求体容易超过 axum 默认 2MB 限制并返回 HTTP 413。本版将 Admin 路由请求体上限统一放宽到 50MB，与 Anthropic 路由保持一致，确保大批量导入请求能进入服务端有界并发处理流程。
