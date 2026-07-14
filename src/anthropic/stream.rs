@@ -1379,6 +1379,12 @@ pub struct StreamContext {
     pub cache_usage: super::cache_metering::CacheUsage,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
+    /// Input token 膨胀倍率
+    pub input_inflation_multiplier: f64,
+    /// Output token 膨胀倍率
+    pub output_inflation_multiplier: f64,
+    /// Cache token 膨胀倍率
+    pub cache_inflation_multiplier: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
     /// 我们在文本出口处统计「同一短行连续重复了多少次」。
@@ -1444,6 +1450,9 @@ impl StreamContext {
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
             credits: 0.0,
+            input_inflation_multiplier: 1.0,
+            output_inflation_multiplier: 1.0,
+            cache_inflation_multiplier: 1.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -1455,6 +1464,7 @@ impl StreamContext {
 
     /// 生成 message_start 事件
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let inflated_input = (self.input_tokens as f64 * self.input_inflation_multiplier).round() as i32;
         json!({
             "type": "message_start",
             "message": {
@@ -1466,7 +1476,7 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
+                    "input_tokens": inflated_input,
                     "output_tokens": 1,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0
@@ -2453,12 +2463,18 @@ impl StreamContext {
         // 互斥口径：total 真值（contextUsage 优先）− 缓存覆盖 = 未缓存的 input。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
 
+        // 应用膨胀倍率（返回给客户端的值）
+        let inflated_input = (final_input_tokens as f64 * self.input_inflation_multiplier).round() as i32;
+        let inflated_output = (self.output_tokens as f64 * self.output_inflation_multiplier).round() as i32;
+        let inflated_cache_creation = (cache_creation as f64 * self.cache_inflation_multiplier).round() as i32;
+        let inflated_cache_read = (cache_read as f64 * self.cache_inflation_multiplier).round() as i32;
+
         // 生成最终事件（message_delta + message_stop）
         events.extend(self.state_manager.generate_final_events(
-            final_input_tokens,
-            self.output_tokens,
-            cache_creation,
-            cache_read,
+            inflated_input,
+            inflated_output,
+            inflated_cache_creation,
+            inflated_cache_read,
         ));
 
         // 工具调用 JSON 错误：在最终事件之后补一个 Anthropic `error` 事件，明确告知
@@ -2525,6 +2541,12 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    pub fn set_inflation_multipliers(&mut self, input: f64, output: f64, cache: f64) {
+        self.inner.input_inflation_multiplier = input;
+        self.inner.output_inflation_multiplier = output;
+        self.inner.cache_inflation_multiplier = cache;
     }
 
     /// 处理 Kiro 事件并缓冲结果

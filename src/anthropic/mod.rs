@@ -29,6 +29,7 @@ pub mod cache_metering;
 mod router;
 pub mod stream;
 pub mod types;
+pub mod upstream;
 mod websearch;
 mod websearch_loop;
 

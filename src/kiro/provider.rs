@@ -87,6 +87,8 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 是否由上游 Anthropic API 凭据直通返回（响应为 Anthropic JSON 格式）
+    pub is_upstream: bool,
 }
 
 /// Kiro API Provider
@@ -164,6 +166,21 @@ impl KiroProvider {
         Ok(client)
     }
 
+    /// 获取 token_manager 引用（供外部读取膨胀倍率等运行时配置）
+    #[allow(dead_code)]
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
+    /// 获取当前 token 膨胀倍率 (input, output, cache)
+    pub fn get_inflation_multipliers(&self) -> (f64, f64, f64) {
+        (
+            self.token_manager.get_input_inflation_multiplier(),
+            self.token_manager.get_output_inflation_multiplier(),
+            self.token_manager.get_cache_inflation_multiplier(),
+        )
+    }
+
     /// 根据凭据选择 endpoint 实现
     fn endpoint_for(
         &self,
@@ -239,23 +256,49 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// `sink` 可选，用于逐跳上报链路追踪。
+    #[allow(dead_code)]
     pub async fn call_api(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, None, false, sink, group).await
     }
 
     /// 发送流式 API 请求
+    #[allow(dead_code)]
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, None, true, sink, group).await
+    }
+
+    /// 发送非流式双路径 API 请求（支持上游凭据直通）
+    ///
+    /// `anthropic_body` 为 Anthropic 格式的请求体原文，当命中上游凭据时直接转发。
+    pub async fn call_api_dual(
+        &self,
+        request_body: &str,
+        anthropic_body: Option<&str>,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, anthropic_body, false, sink, group).await
+    }
+
+    /// 发送流式双路径 API 请求（支持上游凭据直通）
+    pub async fn call_api_stream_dual(
+        &self,
+        request_body: &str,
+        anthropic_body: Option<&str>,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, anthropic_body, true, sink, group).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -448,6 +491,7 @@ impl KiroProvider {
     async fn call_api_with_retry(
         &self,
         request_body: &str,
+        anthropic_body: Option<&str>,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
@@ -502,6 +546,121 @@ impl KiroProvider {
                 }
             };
             let endpoint_name = endpoint.name();
+
+            // ===== 上游凭据直通路径 =====
+            if ctx.credentials.is_upstream_credential() {
+                let base_url = ctx.credentials.upstream_base_url.as_deref().unwrap();
+                let upstream_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
+                let body = match anthropic_body {
+                    Some(b) => b.to_string(),
+                    None => {
+                        // 没有提供 anthropic_body，无法走上游直通
+                        tracing::warn!("上游凭据 #{} 被选中但无 anthropic_body，跳过", ctx.id);
+                        self.token_manager.report_failure(ctx.id);
+                        last_error = Some(anyhow::anyhow!("上游凭据缺少 anthropic_body"));
+                        continue;
+                    }
+                };
+
+                tracing::debug!("上游直通 POST {} (credential #{})", upstream_url, ctx.id);
+
+                let request = self
+                    .client_for(&ctx.credentials)?
+                    .post(&upstream_url)
+                    .body(body)
+                    .header("content-type", "application/json")
+                    .header("x-api-key", &ctx.token)
+                    .header("anthropic-version", "2023-06-01")
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("构建上游请求失败: {}", e))?;
+
+                let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        tracing::warn!(
+                            "上游 API 请求发送失败（尝试 {}/{}）: {}",
+                            attempt + 1, max_retries, e
+                        );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, "upstream", None,
+                            outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
+                        );
+                        last_error = Some(e.into());
+                        if attempt + 1 < max_retries {
+                            sleep(Self::retry_delay(attempt)).await;
+                        }
+                        continue;
+                    }
+                };
+
+                let status = response.status();
+
+                if status.is_success() {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
+                        outcome::SUCCESS, None, attempt_start,
+                    );
+                    self.token_manager.report_success(ctx.id);
+                    return Ok(KiroCallResult {
+                        response,
+                        credential_id: ctx.id,
+                        is_upstream: true,
+                    });
+                }
+
+                let body_text = response.text().await.unwrap_or_default();
+
+                if matches!(status.as_u16(), 401 | 403) {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
+                        outcome::AUTH_FAILED, Some(&body_text), attempt_start,
+                    );
+                    let has_available = self.token_manager.report_failure(ctx.id);
+                    if !has_available {
+                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
+                    }
+                    last_error = Some(anyhow::anyhow!("上游 API 请求失败: {} {}", status, body_text));
+                    continue;
+                }
+
+                if status.as_u16() == 429 {
+                    let rate_limit_error = UpstreamRateLimitError::from_headers(
+                        // 需要先获取 headers 再读 body，这里 body 已读
+                        &reqwest::header::HeaderMap::new(),
+                    );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(429),
+                        outcome::TRANSIENT, Some(&body_text), attempt_start,
+                    );
+                    last_error = Some(rate_limit_error.into());
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
+                    continue;
+                }
+
+                if status.as_u16() == 400 {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(400),
+                        outcome::BAD_REQUEST, Some(&body_text), attempt_start,
+                    );
+                    anyhow::bail!("上游 API 请求失败: {} {}", status, body_text);
+                }
+
+                // 其它错误：瞬态重试
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
+                    outcome::TRANSIENT, Some(&body_text), attempt_start,
+                );
+                last_error = Some(anyhow::anyhow!("上游 API 请求失败: {} {}", status, body_text));
+                if attempt + 1 < max_retries {
+                    sleep(Self::retry_delay(attempt)).await;
+                }
+                continue;
+            }
+
+            // ===== 正常 Kiro 协议路径 =====
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -568,6 +727,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    is_upstream: false,
                 });
             }
 

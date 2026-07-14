@@ -30,8 +30,9 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    SetLogGovernanceConfigRequest, SetTokenInflationConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, TokenInflationConfigResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
@@ -572,6 +573,8 @@ impl AdminService {
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
+                    is_upstream: entry.is_upstream,
+                    upstream_base_url: entry.upstream_base_url,
                 }
             })
             .collect();
@@ -1084,6 +1087,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            upstream_base_url: req.upstream_base_url,
+            upstream_api_key: req.upstream_api_key,
         };
 
         // 调用 token_manager 添加凭据
@@ -1871,6 +1876,27 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取 Token 膨胀倍率配置
+    pub fn get_token_inflation_config(&self) -> TokenInflationConfigResponse {
+        TokenInflationConfigResponse {
+            input_multiplier: self.token_manager.get_input_inflation_multiplier(),
+            output_multiplier: self.token_manager.get_output_inflation_multiplier(),
+            cache_multiplier: self.token_manager.get_cache_inflation_multiplier(),
+        }
+    }
+
+    /// 设置 Token 膨胀倍率配置
+    pub fn set_token_inflation_config(
+        &self,
+        req: SetTokenInflationConfigRequest,
+    ) -> Result<TokenInflationConfigResponse, AdminServiceError> {
+        self.token_manager
+            .set_token_inflation_config(req.input_multiplier, req.output_multiplier, req.cache_multiplier)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_token_inflation_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

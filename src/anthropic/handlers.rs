@@ -740,6 +740,9 @@ pub async fn post_messages(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
+    // 序列化原始 Anthropic 格式请求体（上游凭据直通时使用）
+    let anthropic_body = serde_json::to_string(&payload).unwrap_or_default();
+
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -753,6 +756,7 @@ pub async fn post_messages(
         handle_stream_request(
             provider,
             &request_body,
+            &anthropic_body,
             &payload.model,
             total_input_tokens,
             thinking_enabled,
@@ -778,6 +782,7 @@ pub async fn post_messages(
         handle_non_stream_request(
             provider,
             &request_body,
+            &anthropic_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -796,6 +801,7 @@ pub async fn post_messages(
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    anthropic_body: &str,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -806,22 +812,35 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
+    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
+
+    // 上游凭据直通：透传 SSE 流
+    if call_result.is_upstream {
+        let credential_id = call_result.credential_id;
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "success");
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+        return super::upstream::handle_upstream_stream_response(call_result.response);
+    }
+
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
+    // 设置膨胀倍率
+    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+    ctx.input_inflation_multiplier = input_mul;
+    ctx.output_inflation_multiplier = output_mul;
+    ctx.cache_inflation_multiplier = cache_mul;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1013,6 +1032,7 @@ use super::converter::get_context_window_size;
 async fn handle_non_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    anthropic_body: &str,
     model: &str,
     input_tokens: i32,
     thinking_enabled: bool,
@@ -1025,8 +1045,11 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    // 获取膨胀倍率（用于上游非流式和正常路径）
+    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+
+    // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
+    let call_result = match provider.call_api_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1034,6 +1057,28 @@ async fn handle_non_stream_request(
             return map_provider_error(e);
         }
     };
+
+    // 上游凭据直通：解析 JSON 并应用膨胀
+    if call_result.is_upstream {
+        let credential_id = call_result.credential_id;
+        let (resp, u_input, u_output, u_cache_creation, u_cache_read) =
+            super::upstream::handle_upstream_non_stream_response(
+                call_result.response, input_mul, output_mul, cache_mul,
+            ).await;
+        hook.record(credential_id, u_input, u_output, u_cache_creation, u_cache_read, 0.0, "success");
+        tracer.finalize(
+            "success", None, None, None,
+            TraceUsage {
+                input_tokens: u_input.max(0) as u64,
+                output_tokens: u_output.max(0) as u64,
+                cache_creation_tokens: u_cache_creation.max(0) as u64,
+                cache_read_tokens: u_cache_read.max(0) as u64,
+                credits: 0.0,
+            },
+        );
+        return resp;
+    }
+
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -1215,6 +1260,12 @@ async fn handle_non_stream_request(
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_against_total(total_input_tokens);
 
+    // 应用膨胀倍率（返回给客户端的值）
+    let inflated_input = (final_input_tokens as f64 * input_mul).round() as i32;
+    let inflated_output = (output_tokens as f64 * output_mul).round() as i32;
+    let inflated_cache_creation = (cache_creation_tokens as f64 * cache_mul).round() as i32;
+    let inflated_cache_read = (cache_read_tokens as f64 * cache_mul).round() as i32;
+
     // 构建 Anthropic 响应
     let response_body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
@@ -1225,10 +1276,10 @@ async fn handle_non_stream_request(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {
-            "input_tokens": final_input_tokens,
-            "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_creation_tokens,
-            "cache_read_input_tokens": cache_read_tokens
+            "input_tokens": inflated_input,
+            "output_tokens": inflated_output,
+            "cache_creation_input_tokens": inflated_cache_creation,
+            "cache_read_input_tokens": inflated_cache_read
         }
     });
 
@@ -1530,6 +1581,9 @@ pub async fn post_messages_cc(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
+    // 序列化原始 Anthropic 格式请求体（上游凭据直通时使用）
+    let anthropic_body = serde_json::to_string(&payload).unwrap_or_default();
+
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1543,6 +1597,7 @@ pub async fn post_messages_cc(
         handle_stream_request_buffered(
             provider,
             &request_body,
+            &anthropic_body,
             &payload.model,
             thinking_enabled,
             tool_name_map,
@@ -1568,6 +1623,7 @@ pub async fn post_messages_cc(
         handle_non_stream_request(
             provider,
             &request_body,
+            &anthropic_body,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -1589,6 +1645,7 @@ pub async fn post_messages_cc(
 async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
+    anthropic_body: &str,
     model: &str,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
@@ -1599,8 +1656,8 @@ async fn handle_stream_request_buffered(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
-    // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
+    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -1608,6 +1665,15 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+
+    // 上游凭据直通：透传 SSE 流
+    if call_result.is_upstream {
+        let credential_id = call_result.credential_id;
+        hook.record(credential_id, fallback_input_tokens, 0, 0, 0, 0.0, "success");
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+        return super::upstream::handle_upstream_stream_response(call_result.response);
+    }
+
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -1620,6 +1686,8 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+    ctx.set_inflation_multipliers(input_mul, output_mul, cache_mul);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

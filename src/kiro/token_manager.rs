@@ -980,6 +980,12 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 是否为上游 Anthropic API 凭据
+    #[serde(default)]
+    pub is_upstream: bool,
+    /// 上游 API Base URL（仅上游凭据有值）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -1030,6 +1036,12 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// Input token 膨胀倍率（运行时可修改）
+    input_inflation_multiplier: AtomicU64,
+    /// Output token 膨胀倍率（运行时可修改）
+    output_inflation_multiplier: AtomicU64,
+    /// Cache token 膨胀倍率（运行时可修改）
+    cache_inflation_multiplier: AtomicU64,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1182,6 +1194,9 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let input_inflation = config.input_inflation_multiplier.max(1.0);
+        let output_inflation = config.output_inflation_multiplier.max(1.0);
+        let cache_inflation = config.cache_inflation_multiplier.max(1.0);
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1197,6 +1212,9 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            input_inflation_multiplier: AtomicU64::new(input_inflation.to_bits()),
+            output_inflation_multiplier: AtomicU64::new(output_inflation.to_bits()),
+            cache_inflation_multiplier: AtomicU64::new(cache_inflation.to_bits()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1500,6 +1518,19 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?;
+            return Ok(CallContext {
+                id,
+                credentials: credentials.clone(),
+                token,
+            });
+        }
+
+        // 上游凭据直接使用 upstream_api_key，无需 OAuth 刷新
+        if credentials.is_upstream_credential() {
+            let token = credentials
+                .upstream_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("上游凭据缺少 upstreamApiKey"))?;
             return Ok(CallContext {
                 id,
                 credentials: credentials.clone(),
@@ -2239,6 +2270,8 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    is_upstream: e.credentials.is_upstream_credential(),
+                    upstream_base_url: e.credentials.upstream_base_url.clone(),
                 })
                 .collect(),
             current_id,
@@ -3404,6 +3437,79 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化账号级风控配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
+
+    // ============ Token 膨胀倍率 ============
+
+    pub fn get_input_inflation_multiplier(&self) -> f64 {
+        f64::from_bits(self.input_inflation_multiplier.load(Ordering::Relaxed))
+    }
+
+    pub fn get_output_inflation_multiplier(&self) -> f64 {
+        f64::from_bits(self.output_inflation_multiplier.load(Ordering::Relaxed))
+    }
+
+    pub fn get_cache_inflation_multiplier(&self) -> f64 {
+        f64::from_bits(self.cache_inflation_multiplier.load(Ordering::Relaxed))
+    }
+
+    /// 设置 token 膨胀倍率（Admin API），同时持久化到 config.json。
+    /// 每个倍率必须在 [1.0, 100.0] 范围内。
+    pub fn set_token_inflation_config(
+        &self,
+        input_mul: f64,
+        output_mul: f64,
+        cache_mul: f64,
+    ) -> anyhow::Result<()> {
+        for (name, val) in [("input", input_mul), ("output", output_mul), ("cache", cache_mul)] {
+            if !val.is_finite() || val < 1.0 || val > 100.0 {
+                anyhow::bail!("{} 膨胀倍率必须在 1.0..=100.0 范围内: {}", name, val);
+            }
+        }
+
+        let prev_input = self.get_input_inflation_multiplier();
+        let prev_output = self.get_output_inflation_multiplier();
+        let prev_cache = self.get_cache_inflation_multiplier();
+
+        self.input_inflation_multiplier.store(input_mul.to_bits(), Ordering::Relaxed);
+        self.output_inflation_multiplier.store(output_mul.to_bits(), Ordering::Relaxed);
+        self.cache_inflation_multiplier.store(cache_mul.to_bits(), Ordering::Relaxed);
+
+        if let Err(err) = self.persist_token_inflation_config(input_mul, output_mul, cache_mul) {
+            self.input_inflation_multiplier.store(prev_input.to_bits(), Ordering::Relaxed);
+            self.output_inflation_multiplier.store(prev_output.to_bits(), Ordering::Relaxed);
+            self.cache_inflation_multiplier.store(prev_cache.to_bits(), Ordering::Relaxed);
+            return Err(err);
+        }
+
+        tracing::info!(
+            "Token 膨胀倍率已更新: input={}, output={}, cache={}",
+            input_mul, output_mul, cache_mul
+        );
+        Ok(())
+    }
+
+    fn persist_token_inflation_config(&self, input: f64, output: f64, cache: f64) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，膨胀倍率仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.input_inflation_multiplier = input;
+        config.output_inflation_multiplier = output;
+        config.cache_inflation_multiplier = cache;
+        config
+            .save()
+            .with_context(|| format!("持久化膨胀倍率配置失败: {}", config_path.display()))?;
 
         Ok(())
     }

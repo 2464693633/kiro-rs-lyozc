@@ -80,6 +80,12 @@ pub struct CredentialStatusItem {
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
+    /// 是否为上游 Anthropic API 凭据
+    #[serde(default)]
+    pub is_upstream: bool,
+    /// 上游 API Base URL（仅上游凭据有值）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -194,6 +200,13 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+
+    /// 上游 Anthropic API Base URL（上游凭据必填）
+    #[serde(default)]
+    pub upstream_base_url: Option<String>,
+    /// 上游 Anthropic API Key（上游凭据必填）
+    #[serde(default)]
+    pub upstream_api_key: Option<String>,
 }
 
 fn default_auth_method() -> String {
@@ -469,6 +482,26 @@ pub struct SetLogGovernanceConfigRequest {
     /// 用量日志保留天数，1..=365
     #[serde(default)]
     pub usage_log_retention_days: Option<u32>,
+}
+
+// ============ Token 膨胀倍率 ============
+
+/// Token 膨胀倍率配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenInflationConfigResponse {
+    pub input_multiplier: f64,
+    pub output_multiplier: f64,
+    pub cache_multiplier: f64,
+}
+
+/// 设置 Token 膨胀倍率请求
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetTokenInflationConfigRequest {
+    pub input_multiplier: f64,
+    pub output_multiplier: f64,
+    pub cache_multiplier: f64,
 }
 
 // ============ 代理池 ============

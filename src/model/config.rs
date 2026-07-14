@@ -179,6 +179,18 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// Input token 膨胀倍率（应用于 input_tokens，>= 1.0）
+    #[serde(default = "default_inflation_multiplier")]
+    pub input_inflation_multiplier: f64,
+
+    /// Output token 膨胀倍率（应用于 output_tokens，>= 1.0）
+    #[serde(default = "default_inflation_multiplier")]
+    pub output_inflation_multiplier: f64,
+
+    /// Cache token 膨胀倍率（应用于 cache_creation + cache_read，>= 1.0）
+    #[serde(default = "default_inflation_multiplier")]
+    pub cache_inflation_multiplier: f64,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -256,6 +268,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_inflation_multiplier() -> f64 {
+    1.0
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -292,6 +308,9 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            input_inflation_multiplier: default_inflation_multiplier(),
+            output_inflation_multiplier: default_inflation_multiplier(),
+            cache_inflation_multiplier: default_inflation_multiplier(),
             config_path: None,
         }
     }

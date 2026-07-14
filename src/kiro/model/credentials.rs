@@ -156,6 +156,17 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 上游 Anthropic API Base URL（如 "https://api.anthropic.com"）
+    /// 设置后此凭据为"上游"类型：请求直接转发 Anthropic 格式，不走 Kiro 协议转换。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_base_url: Option<String>,
+
+    /// 上游 Anthropic API Key（作为 x-api-key 头发送）
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_api_key: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -204,6 +215,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("endpoint", &self.endpoint)
             .field("groups", &self.groups)
             .field("source_channel", &self.source_channel)
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field("upstream_api_key", &fmt_redacted(&self.upstream_api_key))
             .finish()
     }
 }
@@ -474,6 +487,14 @@ impl KiroCredentials {
                 .as_deref()
                 .map(|m| m.eq_ignore_ascii_case("api_key") || m.eq_ignore_ascii_case("apikey"))
                 .unwrap_or(false)
+    }
+
+    /// 检查是否为上游 Anthropic API 凭据
+    ///
+    /// 上游凭据直接转发 Anthropic 格式请求到 upstream_base_url，不走 Kiro 协议转换。
+    /// 仅当 upstream_base_url 和 upstream_api_key 均有值时生效。
+    pub fn is_upstream_credential(&self) -> bool {
+        self.upstream_base_url.is_some() && self.upstream_api_key.is_some()
     }
 
     /// 是否为企业 SSO (external_idp) 凭据。
