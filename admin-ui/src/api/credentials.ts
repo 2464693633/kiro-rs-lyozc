@@ -431,6 +431,26 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+export interface TokenInflationConfig {
+  inputMultiplier: number
+  outputMultiplier: number
+  cacheMultiplier: number
+}
+
+// 获取 Token 膨胀倍率配置
+export async function getTokenInflationConfig(): Promise<TokenInflationConfig> {
+  const { data } = await api.get<TokenInflationConfig>('/config/token-inflation')
+  return data
+}
+
+// 更新 Token 膨胀倍率配置
+export async function setTokenInflationConfig(
+  config: TokenInflationConfig,
+): Promise<TokenInflationConfig> {
+  const { data } = await api.put<TokenInflationConfig>('/config/token-inflation', config)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

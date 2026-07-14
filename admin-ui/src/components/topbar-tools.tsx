@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck,
+  MoreHorizontal, ShieldAlert, ShieldCheck, TrendingUp,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -19,6 +19,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useTokenInflationConfig, useSetTokenInflationConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
@@ -41,10 +42,16 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
   const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
+  const { data: inflationConfig, isLoading: isLoadingInflation } = useTokenInflationConfig()
+  const { mutate: setInflationConfig, isPending: isSettingInflation } = useSetTokenInflationConfig()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
+  const [inflationDialogOpen, setInflationDialogOpen] = useState(false)
+  const [inflationInput, setInflationInput] = useState('1.0')
+  const [inflationOutput, setInflationOutput] = useState('1.0')
+  const [inflationCache, setInflationCache] = useState('1.0')
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -54,6 +61,31 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     queryClient.invalidateQueries({ queryKey: ['client-keys'] })
     queryClient.invalidateQueries({ queryKey: ['stats'] })
     toast.success('已刷新')
+  }
+
+  const openInflationDialog = () => {
+    setInflationInput(String(inflationConfig?.inputMultiplier ?? 1.0))
+    setInflationOutput(String(inflationConfig?.outputMultiplier ?? 1.0))
+    setInflationCache(String(inflationConfig?.cacheMultiplier ?? 1.0))
+    setInflationDialogOpen(true)
+  }
+
+  const handleSaveInflation = (e: React.FormEvent) => {
+    e.preventDefault()
+    const input = parseFloat(inflationInput)
+    const output = parseFloat(inflationOutput)
+    const cache = parseFloat(inflationCache)
+    if ([input, output, cache].some(v => isNaN(v) || v < 1.0 || v > 100.0)) {
+      toast.error('倍率必须在 1.0 ~ 100.0 之间')
+      return
+    }
+    setInflationConfig({ inputMultiplier: input, outputMultiplier: output, cacheMultiplier: cache }, {
+      onSuccess: () => {
+        toast.success('Token 膨胀倍率已更新')
+        setInflationDialogOpen(false)
+      },
+      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+    })
   }
 
   const handleToggleLoadBalancing = () => {
@@ -112,7 +144,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     loadBalancingMode: loadBalancingData?.mode,
     openImageUpdate: () => setImageUpdateOpen(true),
     openKeyDialog,
+    openInflationDialog,
     throttleConfig,
+    inflationConfig,
+    isLoadingInflation,
     updateCheck,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
@@ -126,6 +161,72 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     <>
       {compact ? <CompactTools controls={controls} /> : <FullTools controls={controls} />}
       <ImageUpdateDialog open={imageUpdateOpen} onOpenChange={setImageUpdateOpen} />
+
+      <Dialog
+        open={inflationDialogOpen}
+        onOpenChange={(open) => { if (!isSettingInflation) setInflationDialogOpen(open) }}
+      >
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <TrendingUp className="h-4 w-4" />
+              Token 用量膨胀倍率
+            </DialogTitle>
+            <DialogDescription>
+              设置返回给客户端的 token 用量膨胀倍率（1.0 = 不膨胀）。
+            </DialogDescription>
+          </DialogHeader>
+          <form onSubmit={handleSaveInflation} className="space-y-3 py-2">
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Input 倍率</label>
+              <Input
+                type="number"
+                step="0.1"
+                min="1"
+                max="100"
+                value={inflationInput}
+                onChange={(e) => setInflationInput(e.target.value)}
+                disabled={isSettingInflation}
+                className="font-mono text-[13px]"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Output 倍率</label>
+              <Input
+                type="number"
+                step="0.1"
+                min="1"
+                max="100"
+                value={inflationOutput}
+                onChange={(e) => setInflationOutput(e.target.value)}
+                disabled={isSettingInflation}
+                className="font-mono text-[13px]"
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-xs text-muted-foreground">Cache 倍率</label>
+              <Input
+                type="number"
+                step="0.1"
+                min="1"
+                max="100"
+                value={inflationCache}
+                onChange={(e) => setInflationCache(e.target.value)}
+                disabled={isSettingInflation}
+                className="font-mono text-[13px]"
+              />
+            </div>
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setInflationDialogOpen(false)} disabled={isSettingInflation}>
+                取消
+              </Button>
+              <Button type="submit" disabled={isSettingInflation}>
+                {isSettingInflation ? '保存中…' : '保存'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={keyDialogOpen}
@@ -232,7 +333,10 @@ interface ToolControls {
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
+  openInflationDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
+  inflationConfig?: { inputMultiplier: number; outputMultiplier: number; cacheMultiplier: number }
+  isLoadingInflation: boolean
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
 }
@@ -248,6 +352,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      <InflationButton controls={controls} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
       <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
@@ -290,6 +395,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openInflationDialog}>
+          <TrendingUp />Token 膨胀倍率
+        </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
@@ -316,6 +424,32 @@ function LoadBalancingButton({ controls }: { controls: ToolControls }) {
           : controls.loadBalancingMode === 'priority'
             ? '优先级'
             : '均衡负载'}
+      </span>
+    </Button>
+  )
+}
+
+function InflationButton({ controls }: { controls: ToolControls }) {
+  const hasInflation = controls.inflationConfig && (
+    controls.inflationConfig.inputMultiplier > 1 ||
+    controls.inflationConfig.outputMultiplier > 1 ||
+    controls.inflationConfig.cacheMultiplier > 1
+  )
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={controls.openInflationDialog}
+      disabled={controls.isLoadingInflation}
+      title="Token 膨胀倍率设置"
+    >
+      <TrendingUp className={`h-3.5 w-3.5 ${hasInflation ? 'text-orange-500' : ''}`} />
+      <span className="hidden md:inline">
+        {controls.isLoadingInflation
+          ? '加载中…'
+          : hasInflation
+            ? '膨胀中'
+            : '倍率 1x'}
       </span>
     </Button>
   )

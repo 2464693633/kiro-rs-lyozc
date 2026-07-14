@@ -16,6 +16,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getTokenInflationConfig,
+  setTokenInflationConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -211,6 +213,25 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取 Token 膨胀倍率配置
+export function useTokenInflationConfig() {
+  return useQuery({
+    queryKey: ['tokenInflationConfig'],
+    queryFn: getTokenInflationConfig,
+  })
+}
+
+// 更新 Token 膨胀倍率配置
+export function useSetTokenInflationConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setTokenInflationConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['tokenInflationConfig'] })
     },
   })
 }
