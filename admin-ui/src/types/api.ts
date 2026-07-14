@@ -102,7 +102,7 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp' | 'upstream'
   provider?: string
   clientId?: string
   clientSecret?: string
@@ -125,6 +125,10 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 上游 Anthropic API Base URL（upstream 凭据必填） */
+  upstreamBaseUrl?: string
+  /** 上游 Anthropic API Key（upstream 凭据必填） */
+  upstreamApiKey?: string
 }
 
 // 添加凭据响应

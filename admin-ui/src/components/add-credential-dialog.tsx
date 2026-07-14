@@ -26,7 +26,7 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp' | 'upstream'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -46,6 +46,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
+  const [upstreamBaseUrl, setUpstreamBaseUrl] = useState('')
+  const [upstreamApiKey, setUpstreamApiKey] = useState('')
 
   const groupOptions = useGroupOptions()
 
@@ -69,16 +71,28 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
+    setUpstreamBaseUrl('')
+    setUpstreamApiKey('')
   }
 
   const isApiKey = authMethod === 'api_key'
   const isExternalIdp = authMethod === 'external_idp'
+  const isUpstream = authMethod === 'upstream'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
 
     // 验证必填字段
-    if (isApiKey) {
+    if (isUpstream) {
+      if (!upstreamBaseUrl.trim()) {
+        toast.error('请输入上游 API Base URL')
+        return
+      }
+      if (!upstreamApiKey.trim()) {
+        toast.error('请输入上游 API Key')
+        return
+      }
+    } else if (isApiKey) {
       if (!kiroApiKey.trim()) {
         toast.error('请输入 Kiro API Key')
         return
@@ -104,12 +118,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         authMethod,
         provider: isExternalIdp ? 'AzureAD' : undefined,
-        refreshToken: isApiKey ? undefined : refreshToken.trim(),
+        refreshToken: isApiKey || isUpstream ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
-        clientId: isApiKey ? undefined : clientId.trim() || undefined,
-        clientSecret: isApiKey || isExternalIdp ? undefined : clientSecret.trim() || undefined,
+        clientId: isApiKey || isUpstream ? undefined : clientId.trim() || undefined,
+        clientSecret: isApiKey || isExternalIdp || isUpstream ? undefined : clientSecret.trim() || undefined,
         tokenEndpoint: isExternalIdp ? tokenEndpoint.trim() || undefined : undefined,
         issuerUrl: isExternalIdp ? issuerUrl.trim() || undefined : undefined,
         scopes: isExternalIdp ? scopes.trim() || undefined : undefined,
@@ -120,6 +134,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
+        upstreamBaseUrl: isUpstream ? upstreamBaseUrl.trim() : undefined,
+        upstreamApiKey: isUpstream ? upstreamApiKey.trim() : undefined,
       },
       {
         onSuccess: (data) => {
@@ -161,6 +177,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <SelectItem value="idc">IdC/Builder-ID/IAM</SelectItem>
                   <SelectItem value="external_idp">企业 SSO (Microsoft Entra / Azure AD)</SelectItem>
                   <SelectItem value="api_key">API Key</SelectItem>
+                  <SelectItem value="upstream">上游 API（Anthropic 兼容）</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -182,8 +199,45 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               </div>
             )}
 
+            {/* 上游 API 配置 */}
+            {isUpstream && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="upstreamBaseUrl" className="text-sm font-medium">
+                    Base URL <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="upstreamBaseUrl"
+                    placeholder="https://api.anthropic.com"
+                    value={upstreamBaseUrl}
+                    onChange={(e) => setUpstreamBaseUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    上游 Anthropic 兼容 API 的地址，请求将转发到 {'{baseUrl}'}/v1/messages
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="upstreamApiKey" className="text-sm font-medium">
+                    API Key <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="upstreamApiKey"
+                    type="password"
+                    placeholder="sk-ant-xxxxxxxx"
+                    value={upstreamApiKey}
+                    onChange={(e) => setUpstreamApiKey(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    作为 x-api-key 头发送到上游
+                  </p>
+                </div>
+              </>
+            )}
+
             {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && (
+            {!isApiKey && !isUpstream && (
               <div className="space-y-2">
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>
