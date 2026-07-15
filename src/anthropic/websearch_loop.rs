@@ -40,6 +40,10 @@ const MAX_WEB_SEARCH_ROUNDS: usize = 5;
 struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
+    /// Accumulated thinking / reasoning text (Kiro reasoningContentEvent).
+    /// Surfaced out-of-band via render_json's `kiro_thinking` so Anthropic
+    /// clients never see (and never replay) an unsigned thinking block.
+    thinking: String,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<CompletedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
@@ -91,6 +95,7 @@ async fn decode_round(
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
+    let mut thinking = String::new();
     // id -> (name, json_buffer), preserving the order of appearance
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -127,6 +132,11 @@ async fn decode_round(
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::ReasoningContent(r) => {
+                    if let Some(t) = &r.text {
+                        thinking.push_str(t);
+                    }
+                }
                 Event::ToolUse(tu) => {
                     let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
                         order.push(tu.tool_use_id.clone());
@@ -177,6 +187,7 @@ async fn decode_round(
 
     RoundOutcome {
         text,
+        thinking,
         tool_uses,
         context_input_tokens,
         credits,
@@ -531,6 +542,7 @@ pub(super) async fn run_web_search_loop(
     let mut last_credential_id: u64 = 0;
     let mut last_context_input: Option<i32> = None;
     let mut total_credits = 0.0;
+    let mut all_thinking = String::new();
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let (round, credential_id) =
@@ -550,6 +562,12 @@ pub(super) async fn run_web_search_loop(
         last_credential_id = credential_id;
         last_context_input = round.context_input_tokens.or(last_context_input);
         total_credits += round.credits;
+        if !round.thinking.is_empty() {
+            if !all_thinking.is_empty() {
+                all_thinking.push_str("\n\n");
+            }
+            all_thinking.push_str(&round.thinking);
+        }
 
         if should_search_round(round_idx, &round.tool_uses) {
             // Real search: if any one fails -> propagate the error, never silently turn it into "No results found"
@@ -649,7 +667,14 @@ pub(super) async fn run_web_search_loop(
         return if stream_client {
             render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
         } else {
-            render_json(&payload.model, content, &stop_reason, final_input, output_tokens)
+            render_json(
+                &payload.model,
+                content,
+                &stop_reason,
+                final_input,
+                output_tokens,
+                &all_thinking,
+            )
         };
     }
 
@@ -663,14 +688,21 @@ pub(super) async fn run_web_search_loop(
 }
 
 /// Single JSON response (non-streaming)
+///
+/// `thinking`: optional out-of-band reasoning text. Emitted as a TOP-LEVEL
+/// `kiro_thinking` field (NOT a content block): Anthropic clients ignore
+/// unknown top-level fields and thus never replay an unsigned thinking block
+/// upstream, while the Responses translator picks it up for codex's
+/// reasoning-summary display.
 pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
     stop_reason: &str,
     input_tokens: i32,
     output_tokens: i32,
+    thinking: &str,
 ) -> Response {
-    let body = json!({
+    let mut body = json!({
         "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
         "type": "message",
         "role": "assistant",
@@ -685,6 +717,9 @@ pub(crate) fn render_json(
             "cache_read_input_tokens": 0
         }
     });
+    if !thinking.is_empty() {
+        body["kiro_thinking"] = json!(thinking);
+    }
     (StatusCode::OK, Json(body)).into_response()
 }
 
