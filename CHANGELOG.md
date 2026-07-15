@@ -4,6 +4,44 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-07-15
+
+主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。
+
+> 来源：[PR #39](https://github.com/ZyphrZero/kiro.rs/pull/39)。提交人：[@yeeyon](https://github.com/yeeyon)，感谢贡献。
+
+### ✨ 新功能 — Codex CLI 完整工具桥接
+
+- **请求方向收集工具声明**：同时从 `req.tools`（顶层）和 `additional_tools` input item（Codex 0.144 把工具声明放在此处）收集工具定义，合并转换后转发给上游模型，不再忽略 Codex 的真实工具。
+- **区分 `function` 与 `custom` 工具类型**：Codex 要求应答 item 类型与声明严格一致（否则抛出 "tool invoked with incompatible payload" 并终止本轮）。`function` 类型（shell / MCP / view_image 等）→ 应答 `function_call`（JSON arguments）；`custom` 类型（apply_patch / code-mode exec 等自由文本工具）→ 应答 `custom_tool_call`（原始字符串 input）。每请求维护一张 `ToolKindMap`，请求翻译时生成、响应构造时消费，保证出方向 item 类型永远正确。
+- **自由文本工具包装与解包**：Anthropic 侧没有自由文本工具概念，进方向将 custom 工具包装为 `{"input": <string>}` 单字段 schema（grammar / format 附到 description 提示模型输入格式），出方向通过多级回退链解出原始 input 字符串（模型偶尔不守 schema 时也能兜住）。
+- **Namespace 分组支持**：Codex 0.144 的 collaboration 子代理等工具挂在 `namespace` 分组下——对 Anthropic 模型展平为 `ns__name`（`__` 连接，避免与工具名中的 `.` 冲突），应答时还原为原 `name` + `namespace` 字段。
+- **混合工具集的 Agentic Loop**：有 Codex 工具时仍注入原生 `web_search_20250305`（除非客户端已声明同名工具），请求进入 web_search agentic loop——loop 内部消化 web_search、把其它 client 工具的 `tool_use` 原样透传，实现搜索与代码工具无缝共存。
+- **软化 System Prompt**：有 Codex 工具时使用软化 nudge（"Use your other tools normally for all other work"），替代无工具时的严格 nudge（"Do not call any other tool"），让模型自由选择搜索或执行代码工具。
+- **Developer 角色 → System 映射**：Codex 的 `role:developer` message item（AGENTS.md / user_instructions / environment_context）转为 Anthropic system 消息，确保技能文件和环境上下文到达模型。
+
+### ✨ 新功能 — 推理摘要与搜索展示（Phase 2）
+
+- **推理摘要 `reasoning` item**：从上游 reasoning 事件收集思考文本，通过顶层 `kiro_thinking` 字段（非 content block）出带传递——Anthropic 客户端忽略未知顶层字段，不会回放未签名的 thinking block；Responses 译者则将其渲染为 `reasoning` summary item，供 Codex UI 展示"模型正在思考"。
+- **`web_search_call` 展示项**：内部代答的 web_search 以 `server_tool_use` 块收集，在 Responses 响应中渲染为 `web_search_call` item（含 query 与 status），Codex 界面可展示 "Searched the web"。
+- **SSE 事件序列补齐**：新增 `reasoning`、`custom_tool_call`、`web_search_call` 三类 output item 的完整 SSE 事件序列（added → delta/part → done），每个 item 保证 `output_item.done` 携带完整内容（Codex 仅从 done 构建回合）。
+
+### 🔧 修复 — 工具结果后空助手响应
+
+- **问题**：上游 Kiro 偶尔在收到 `tool_result` 后返回一个只有思考文本（无可见 assistant text、无 client 工具调用）的回合——旧代码将其序列化为 `end_turn`，导致 Codex 将该回合视为任务完成、在工具尚未执行完时错误标记任务结束。
+- **修复**：新增 `empty_tool_result_disposition` 判别——仅当最后一轮 user 消息含 `tool_result`、且助手回合无可见文本、无工具调用、无终止原因时，判定为"空洞继续"。此时重试一次；重试仍空洞则返回 `502 Bad Gateway`（而非静默标记完成）。纯思考文本本身不足以构成有效继续——Codex 需要真实 assistant 文本或 client tool call 才能保持任务生命周期正确。
+- **kiro_thinking 不重复**：只有被接受的（非空洞）回合的思考文本才累积到 `all_thinking`；被丢弃的空洞回合的思考不被回放，避免与成功回合的总结重复或矛盾。
+
+### 📝 文档
+
+- **README 更新**：反映项目已支持 OpenAI Chat Completions / Responses 端点与 Codex CLI；补充 GPT-5.6 模型族说明、流式格式说明、部署示例更新到 0.7.0。
+
+### 🧪 测试
+
+- **20 个纯单元测试**（无网络依赖）覆盖：工具声明收集（additional_tools / 顶层 / 混合）、namespace 展平与还原、custom 工具包装 schema、function 工具 schema 原样映射、noop 回退、nudge 软化、web_search 名字冲突处理、custom_tool_call 回放往返、function_call_output 数组 stringify、developer→system 映射、reasoning/web_search_call/compaction 跳过、custom_input 多级回退链、build_view 输出类型与顺序、SSE 事件完整性。
+- **4 个空响应判别测试**：工具结果后空洞重试一次→失败、有文本/工具调用则不重试、仅思考文本无可见输出仍触发重试、仅最后一条消息决定是否为工具继续场景。
+- E2E 验证（gpt-5.6-sol + claude-sonnet-4-6）：shell 读文件、apply_patch 写文件、多轮循环、实时 web_search、只读 /plan 项目研究、技能发现——均无 incompatible payload 错误。
+
 ## [0.7.0] - 2026-07-15
 
 主题：**新增 GPT-5.6 模型与 OpenAI Chat Completions / Responses 兼容端点，并统一入口 API Key 的生成与自定义配置语义**。OpenAI 协议客户端（包括仅支持 Responses API 的新版 Codex CLI）现在可以直接复用 Kiro 的模型映射、凭据故障转移、用量计量、工具调用与 WebSearch 链路；同时，程序生成的入口 Key 统一使用 `sk-` 前缀，鉴权不再限制前缀，`config.json` 中的 `apiKey` 可使用任意自定义值并作为系统密钥的权威配置。
