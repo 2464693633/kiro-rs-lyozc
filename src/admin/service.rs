@@ -1292,7 +1292,7 @@ impl AdminService {
         self.update_config_file(move |c| c.admin_api_key = Some(key));
     }
 
-    /// 持久化新的 apiKey（系统密钥轮换后同步 config.json，保证下次启动不重复导入）
+    /// 将系统密钥写回 `config.json`。
     pub fn persist_api_key(&self, new_key: &str) {
         let key = new_key.to_string();
         self.update_config_file(move |c| c.api_key = Some(key));
