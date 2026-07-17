@@ -22,7 +22,7 @@ use super::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
-        CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
@@ -37,8 +37,35 @@ type CredSessionPath = (u64, String);
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
+/// GET /api/admin/credentials
+/// 获取所有凭据状态（含近 7 天 token 用量统计）
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let response = state.service.get_all_credentials();
+    let mut response = state.service.get_all_credentials();
+
+    // 查询近 7 天各凭据 token 用量，附加到对应凭据
+    let window = StatsQueryWindow::preset(Range::Last7d, StatsGranularity::Day);
+    let usage_map: HashMap<u64, _> = state
+        .usage_aggregator
+        .query_by_credential(window, None, None)
+        .into_iter()
+        .map(|d| (d.credential_id, d))
+        .collect();
+
+    for cred in &mut response.credentials {
+        if let Some(dist) = usage_map.get(&cred.id) {
+            if dist.calls > 0 {
+                cred.token_usage_7d = Some(CredentialTokenUsage {
+                    calls: dist.calls,
+                    input_tokens: dist.input_tokens,
+                    output_tokens: dist.output_tokens,
+                    cache_creation_tokens: dist.cache_creation_tokens,
+                    cache_read_tokens: dist.cache_read_tokens,
+                    credits: dist.credits,
+                });
+            }
+        }
+    }
+
     Json(response)
 }
 

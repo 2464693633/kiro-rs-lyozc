@@ -40,6 +40,22 @@ export interface CredentialStatusItem {
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
+  /** 是否为上游 Anthropic API 凭据 */
+  isUpstream?: boolean
+  /** 上游 API Base URL */
+  upstreamBaseUrl?: string
+  /** 近 7 天 token 用量统计 */
+  tokenUsage7d?: CredentialTokenUsage
+}
+
+/** 凭据近 7 天 token 用量统计 */
+export interface CredentialTokenUsage {
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  credits: number
 }
 
 // 余额响应

@@ -323,6 +323,9 @@ pub struct CredentialDistribution {
     pub calls: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
     pub errors: u64,
 }
 
@@ -532,6 +535,9 @@ impl UsageAggregator {
                 let entry = acc.entry(*id).or_default();
                 entry.input_tokens += stats.input_tokens;
                 entry.output_tokens += stats.output_tokens;
+                entry.cache_creation_tokens += stats.cache_creation_tokens;
+                entry.cache_read_tokens += stats.cache_read_tokens;
+                entry.credits += stats.credits;
                 entry.calls += stats.calls;
                 entry.errors += stats.errors;
             }
@@ -543,6 +549,9 @@ impl UsageAggregator {
                 calls: stats.calls,
                 input_tokens: stats.input_tokens,
                 output_tokens: stats.output_tokens,
+                cache_creation_tokens: stats.cache_creation_tokens,
+                cache_read_tokens: stats.cache_read_tokens,
+                credits: stats.credits,
                 errors: stats.errors,
             })
             .collect();

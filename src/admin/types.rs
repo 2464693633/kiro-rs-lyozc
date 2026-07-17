@@ -86,6 +86,21 @@ pub struct CredentialStatusItem {
     /// 上游 API Base URL（仅上游凭据有值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_base_url: Option<String>,
+    /// 近 7 天 token 用量统计（有历史数据时才存在）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage_7d: Option<CredentialTokenUsage>,
+}
+
+/// 凭据近 7 天 token 用量统计
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialTokenUsage {
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
 }
 
 // ============ 操作请求 ============

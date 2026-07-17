@@ -575,6 +575,7 @@ impl AdminService {
                     balance_updated_at,
                     is_upstream: entry.is_upstream,
                     upstream_base_url: entry.upstream_base_url,
+                    token_usage_7d: None,
                 }
             })
             .collect();

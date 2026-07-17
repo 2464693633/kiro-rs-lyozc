@@ -94,6 +94,13 @@ function formatNumber(n: number): string {
   });
 }
 
+/** 紧凑数字格式：≥1M 显示 xM，≥1K 显示 xK，否则原值 */
+function fmtNum(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
   return new Date(ts * 1000).toLocaleString("zh-CN");
@@ -980,6 +987,29 @@ export function CredentialCard({
                 <dd className="min-w-0 truncate text-right font-mono text-xs">
                   {maskProxyUrl(credential.proxyUrl ?? "")}
                 </dd>
+              </div>
+            )}
+            {credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
+              <div className="min-[420px]:col-span-2 border-t border-border/50 pt-2">
+                <div className="mb-1 text-xs text-muted-foreground">Token 用量（近 7 天）</div>
+                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-4">
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">调用</span>
+                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.calls)}</span>
+                  </div>
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">输入</span>
+                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.inputTokens)}</span>
+                  </div>
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">输出</span>
+                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.outputTokens)}</span>
+                  </div>
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">缓存读</span>
+                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.cacheReadTokens)}</span>
+                  </div>
+                </div>
               </div>
             )}
           </dl>
