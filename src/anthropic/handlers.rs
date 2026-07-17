@@ -849,12 +849,15 @@ async fn handle_stream_request(
         }
     };
 
-    // 上游凭据直通：透传 SSE 流
+    // 上游凭据直通：应用膨胀倍率 + 模拟缓存（与 Kiro 账号路径一致）
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
+        let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
         hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "success");
         tracer.finalize("success", None, None, None, TraceUsage::zero());
-        return super::upstream::handle_upstream_stream_response(call_result.response);
+        return super::upstream::handle_upstream_stream_response_with_inflation(
+            call_result.response, input_mul, output_mul, cache_mul, cache_usage,
+        );
     }
 
     let response = call_result.response;
@@ -1085,12 +1088,12 @@ async fn handle_non_stream_request(
         }
     };
 
-    // 上游凭据直通：解析 JSON 并应用膨胀
+    // 上游凭据直通：解析 JSON，用模拟缓存替换真实 Anthropic 缓存，应用膨胀倍率
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (resp, u_input, u_output, u_cache_creation, u_cache_read) =
             super::upstream::handle_upstream_non_stream_response(
-                call_result.response, input_mul, output_mul, cache_mul,
+                call_result.response, input_mul, output_mul, cache_mul, cache_usage,
             ).await;
         hook.record(credential_id, u_input, u_output, u_cache_creation, u_cache_read, 0.0, "success");
         tracer.finalize(

@@ -9,9 +9,10 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{stream, StreamExt};
 use std::convert::Infallible;
 
+use super::cache_metering::CacheUsage;
 use super::types::ErrorResponse;
 
 /// 对 JSON 响应体中的 usage 对象应用膨胀倍率（非流式）
@@ -47,14 +48,16 @@ fn inflate_usage_obj(
     }
 }
 
-/// 处理上游非流式响应：读取完整 JSON，应用膨胀倍率，返回给客户端。
+/// 处理上游非流式响应：读取完整 JSON，用模拟缓存替换真实 Anthropic 缓存，应用膨胀倍率，返回给客户端。
 ///
 /// 返回 `(Response, input_tokens, output_tokens, cache_creation, cache_read)` 供调用方记录用量。
+/// 返回的 token 数为膨胀前的模拟缓存值（与 Kiro 账号路径一致）。
 pub async fn handle_upstream_non_stream_response(
     response: reqwest::Response,
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_usage: CacheUsage,
 ) -> (Response, i32, i32, i32, i32) {
     let status = response.status();
     let body = match response.text().await {
@@ -81,11 +84,20 @@ pub async fn handle_upstream_non_stream_response(
         }
     };
 
-    // 提取真实用量（膨胀前）
-    let (input_tokens, output_tokens, cache_creation, cache_read) = extract_usage(&json);
+    // 提取真实 token 数，计算总 input（用于模拟缓存分摊）
+    let (real_input, real_output, real_cc, real_cr) = extract_usage(&json);
+    let total_input = real_input + real_cc + real_cr;
 
-    // 应用膨胀
-    inflate_usage_in_json(&mut json, input_mul, output_mul, cache_mul);
+    // 用模拟缓存替换上游真实 Anthropic 缓存（与 Kiro 账号路径一致）
+    let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
+
+    // 应用膨胀倍率并写回 usage 字段
+    if let Some(usage) = json.get_mut("usage") {
+        usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
+        usage["output_tokens"] = serde_json::json!((real_output as f64 * output_mul).round() as i64);
+        usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_mul).round() as i64);
+        usage["cache_read_input_tokens"] = serde_json::json!((sim_cr as f64 * cache_mul).round() as i64);
+    }
 
     let resp = Response::builder()
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
@@ -93,10 +105,113 @@ pub async fn handle_upstream_non_stream_response(
         .body(Body::from(json.to_string()))
         .unwrap();
 
-    (resp, input_tokens, output_tokens, cache_creation, cache_read)
+    // 返回膨胀前的模拟值供 hook.record 记录
+    (resp, sim_input, real_output, sim_cc, sim_cr)
 }
 
-/// 处理上游流式响应：透明代理 SSE 流（流式不应用膨胀）。
+/// 对单条 SSE 事件文本应用膨胀倍率（模拟缓存）。
+///
+/// 仅重写 `message_start`（usage.input_tokens / cache_* 字段）和
+/// `message_delta`（usage.output_tokens 字段），其余事件原样透传。
+fn inflate_sse_event(
+    event_text: &str,
+    input_mul: f64,
+    output_mul: f64,
+    cache_mul: f64,
+    cache_usage: CacheUsage,
+) -> String {
+    let mut event_type: Option<&str> = None;
+    let mut data_line: Option<&str> = None;
+
+    for line in event_text.lines() {
+        if let Some(t) = line.strip_prefix("event: ") {
+            event_type = Some(t.trim());
+        } else if let Some(d) = line.strip_prefix("data: ") {
+            data_line = Some(d);
+        }
+    }
+
+    match (event_type, data_line) {
+        (Some("message_start"), Some(data)) => {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(data) {
+                // 计算总 input（含真实缓存字段）用于模拟缓存分摊
+                let total_input = {
+                    let u = json.pointer("/message/usage");
+                    let i = u.and_then(|v| v.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cc = u.and_then(|v| v.get("cache_creation_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                    let cr = u.and_then(|v| v.get("cache_read_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                    (i + cc + cr) as i32
+                };
+                // 用模拟缓存分摊替换真实 Anthropic 缓存
+                let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
+                if let Some(usage) = json.pointer_mut("/message/usage") {
+                    usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
+                    usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_mul).round() as i64);
+                    usage["cache_read_input_tokens"] = serde_json::json!((sim_cr as f64 * cache_mul).round() as i64);
+                }
+                return format!("event: message_start\ndata: {}\n\n", json);
+            }
+            event_text.to_string()
+        }
+        (Some("message_delta"), Some(data)) => {
+            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(usage) = json.get_mut("usage") {
+                    if let Some(v) = usage.get("output_tokens").and_then(|v| v.as_i64()) {
+                        usage["output_tokens"] = serde_json::json!((v as f64 * output_mul).round() as i64);
+                    }
+                }
+                return format!("event: message_delta\ndata: {}\n\n", json);
+            }
+            event_text.to_string()
+        }
+        _ => event_text.to_string(),
+    }
+}
+
+/// 处理上游流式响应：解析 SSE 事件，应用膨胀倍率和模拟缓存，与 Kiro 账号路径保持一致。
+pub fn handle_upstream_stream_response_with_inflation(
+    response: reqwest::Response,
+    input_mul: f64,
+    output_mul: f64,
+    cache_mul: f64,
+    cache_usage: CacheUsage,
+) -> Response {
+    // 初始状态：(行缓冲区, input_mul, output_mul, cache_mul, cache_usage)
+    let initial = (String::new(), input_mul, output_mul, cache_mul, cache_usage);
+
+    let inflated = response
+        .bytes_stream()
+        .scan(initial, |state, chunk| {
+            let bytes = match chunk {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::error!("上游流式响应读取失败: {}", e);
+                    return futures::future::ready(Some(vec![]));
+                }
+            };
+            // 追加到行缓冲区，按 SSE 事件边界（\n\n）切割并逐个重写
+            state.0.push_str(&String::from_utf8_lossy(&bytes));
+            let mut out: Vec<Bytes> = Vec::new();
+            while let Some(pos) = state.0.find("\n\n") {
+                let event_text = state.0[..pos + 2].to_string();
+                state.0 = state.0[pos + 2..].to_string();
+                let inflated_event = inflate_sse_event(&event_text, state.1, state.2, state.3, state.4);
+                out.push(Bytes::from(inflated_event));
+            }
+            futures::future::ready(Some(out))
+        })
+        .flat_map(|chunks| stream::iter(chunks.into_iter().map(Ok::<Bytes, Infallible>)));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CONNECTION, "keep-alive")
+        .body(Body::from_stream(inflated))
+        .unwrap()
+}
+
+/// 处理上游流式响应：透明代理 SSE 流（保留用于降级）。
 pub fn handle_upstream_stream_response(response: reqwest::Response) -> Response {
     let stream = response.bytes_stream().map(|chunk| -> Result<Bytes, Infallible> {
         match chunk {
