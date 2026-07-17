@@ -460,7 +460,7 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
+const GITHUB_RELEASES_REPO: &str = "2464693633/kiro-rs-lyozc";
 
 impl AdminService {
     pub fn new(
@@ -2503,6 +2503,8 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
+            || msg.contains("缺少 upstream Base URL")
+            || msg.contains("缺少 upstream API Key")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");

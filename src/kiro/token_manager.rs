@@ -91,6 +91,72 @@ pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::R
     Ok(())
 }
 
+/// 验证上游 Anthropic 兼容 API 凭据的基本有效性
+///
+/// 上游凭据只需 Base URL + API Key，不需要 refreshToken。
+pub(crate) fn validate_upstream_credential(credentials: &KiroCredentials) -> anyhow::Result<()> {
+    if credentials
+        .upstream_base_url
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        bail!("缺少 upstream Base URL");
+    }
+    if credentials
+        .upstream_api_key
+        .as_deref()
+        .unwrap_or("")
+        .is_empty()
+    {
+        bail!("缺少 upstream API Key");
+    }
+    Ok(())
+}
+
+/// 计算凭据的去重指纹（按凭据类型选择去重字段）。
+///
+/// - API Key 凭据按 `kiroApiKey`
+/// - 上游凭据按 `upstreamBaseUrl` + `upstreamApiKey`
+/// - 其余（OAuth / SSO / IdC）按 `refreshToken`
+///
+/// 返回 `None` 表示相关字段缺失或为空（调用方应已在校验阶段拦截）。
+fn credential_dedup_fingerprint(cred: &KiroCredentials) -> Option<String> {
+    if cred.is_api_key_credential() {
+        cred.kiro_api_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(sha256_hex)
+    } else if cred.is_upstream_credential() {
+        match (
+            cred.upstream_base_url.as_deref(),
+            cred.upstream_api_key.as_deref(),
+        ) {
+            (Some(base), Some(key)) if !base.is_empty() && !key.is_empty() => {
+                Some(sha256_hex(&format!("{base}\u{0}{key}")))
+            }
+            _ => None,
+        }
+    } else {
+        cred.refresh_token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(sha256_hex)
+    }
+}
+
+/// 凭据重复时的用户提示文案（按凭据类型）。
+fn duplicate_credential_message(cred: &KiroCredentials) -> &'static str {
+    if cred.is_api_key_credential() {
+        "凭据已存在（kiroApiKey 重复）"
+    } else if cred.is_upstream_credential() {
+        "凭据已存在（上游 API 重复）"
+    } else {
+        "凭据已存在（refreshToken 重复）"
+    }
+}
+
 /// Refresh Token 永久失效错误
 ///
 /// 当服务端返回 400 + `invalid_grant` 时，表示 refreshToken 已被撤销或过期，
@@ -2856,7 +2922,7 @@ impl MultiTokenManager {
     /// - `Ok(u64)` - 新凭据 ID
     /// - `Err(_)` - 验证失败或添加失败
     pub async fn add_credential(&self, new_cred: KiroCredentials) -> anyhow::Result<u64> {
-        // 1. 基本验证
+        // 1. 基本验证（三类凭据：API Key / 上游 API / OAuth 系）
         if new_cred.is_api_key_credential() {
             let api_key = new_cred
                 .kiro_api_key
@@ -2865,57 +2931,30 @@ impl MultiTokenManager {
             if api_key.is_empty() {
                 anyhow::bail!("kiroApiKey 为空");
             }
+        } else if new_cred.is_upstream_credential() {
+            validate_upstream_credential(&new_cred)?;
         } else {
             validate_refresh_token(&new_cred)?;
         }
 
-        // 2. 基于哈希检测重复
-        if new_cred.is_api_key_credential() {
-            let new_api_key = new_cred
-                .kiro_api_key
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 kiroApiKey"))?;
-            let new_api_key_hash = sha256_hex(new_api_key);
+        // 2. 基于哈希检测重复（按凭据类型选择去重字段）
+        if let Some(fingerprint) = credential_dedup_fingerprint(&new_cred) {
             let duplicate_exists = {
                 let entries = self.entries.lock();
                 entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .kiro_api_key
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_api_key_hash.as_str())
+                    credential_dedup_fingerprint(&entry.credentials).as_deref()
+                        == Some(fingerprint.as_str())
                 })
             };
             if duplicate_exists {
-                anyhow::bail!("凭据已存在（kiroApiKey 重复）");
-            }
-        } else {
-            let new_refresh_token = new_cred
-                .refresh_token
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("缺少 refreshToken"))?;
-            let new_refresh_token_hash = sha256_hex(new_refresh_token);
-            let duplicate_exists = {
-                let entries = self.entries.lock();
-                entries.iter().any(|entry| {
-                    entry
-                        .credentials
-                        .refresh_token
-                        .as_deref()
-                        .map(sha256_hex)
-                        .as_deref()
-                        == Some(new_refresh_token_hash.as_str())
-                })
-            };
-            if duplicate_exists {
-                anyhow::bail!("凭据已存在（refreshToken 重复）");
+                anyhow::bail!("{}", duplicate_credential_message(&new_cred));
             }
         }
 
-        // 3. 验证凭据有效性（API Key 无需网络刷新）
-        let mut validated_cred = if new_cred.is_api_key_credential() {
+        // 3. 验证凭据有效性（API Key 和上游 API 均无需网络刷新）
+        let mut validated_cred = if new_cred.is_api_key_credential()
+            || new_cred.is_upstream_credential()
+        {
             new_cred.clone()
         } else {
             let global_proxy = self.proxy.lock().clone();
@@ -2924,18 +2963,10 @@ impl MultiTokenManager {
         };
 
         // 捕获原始输入的去重指纹。刷新可能轮换 refreshToken，且下方 step 5 会把
-        // new_cred 的字段 move 走，故必须在此处（字段尚完整时）取指纹，
+        // new_cred 的字段 move 走，故必须在此处（字段尚完整时）取指纹与文案，
         // 供插入临界区的权威去重重检使用。
-        let dedup_is_api_key = new_cred.is_api_key_credential();
-        let dedup_hash: Option<String> = if dedup_is_api_key {
-            new_cred
-                .kiro_api_key
-                .as_deref()
-                .filter(|k| !k.is_empty())
-                .map(sha256_hex)
-        } else {
-            new_cred.refresh_token.as_deref().map(sha256_hex)
-        };
+        let dedup_hash: Option<String> = credential_dedup_fingerprint(&new_cred);
+        let dedup_dup_message = duplicate_credential_message(&new_cred);
 
         // 4. 分配新 ID。必须使用单调计数器，不能按当前 entries 最大值重算；
         // 否则删除最后一个账号后再添加会复用旧 ID，导致 trace/usage/kiro_stats
@@ -2976,20 +3007,10 @@ impl MultiTokenManager {
             // next_id 即便已自增也只是跳号，无副作用）。
             if let Some(hash) = &dedup_hash {
                 let dup = entries.iter().any(|e| {
-                    let entry_hash = if dedup_is_api_key {
-                        e.credentials.kiro_api_key.as_deref().map(sha256_hex)
-                    } else {
-                        e.credentials.refresh_token.as_deref().map(sha256_hex)
-                    };
-                    entry_hash.as_deref() == Some(hash.as_str())
+                    credential_dedup_fingerprint(&e.credentials).as_deref() == Some(hash.as_str())
                 });
                 if dup {
-                    let msg = if dedup_is_api_key {
-                        "凭据已存在（kiroApiKey 重复）"
-                    } else {
-                        "凭据已存在（refreshToken 重复）"
-                    };
-                    anyhow::bail!(msg);
+                    anyhow::bail!("{}", dedup_dup_message);
                 }
             }
             entries.push(CredentialEntry {
@@ -3731,6 +3752,58 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(manager.snapshot().total, 2);
         assert_eq!(manager.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_upstream_success_without_refresh_token() {
+        // 上游 API（Anthropic 兼容）凭据只需 Base URL + API Key，不应要求 refreshToken。
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut upstream = KiroCredentials::default();
+        upstream.upstream_base_url = Some("https://maxapi.example.xyz".to_string());
+        upstream.upstream_api_key = Some("sk-upstream-123".to_string());
+
+        let result = manager.add_credential(upstream).await;
+        assert!(result.is_ok(), "upstream add should succeed: {result:?}");
+        assert_eq!(manager.snapshot().total, 1);
+        assert_eq!(manager.available_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_upstream_missing_base_url_rejected() {
+        let config = Config::default();
+        let manager = MultiTokenManager::new(config, vec![], None, None, false).unwrap();
+
+        let mut upstream = KiroCredentials::default();
+        // 只填 api_key，base_url 缺失 → is_upstream_credential 为 false，
+        // 落入 refreshToken 分支，报“缺少 refreshToken”。这里断言添加失败即可。
+        upstream.upstream_api_key = Some("sk-upstream-123".to_string());
+
+        let result = manager.add_credential(upstream).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_add_credential_reject_duplicate_upstream() {
+        let config = Config::default();
+
+        let mut existing = KiroCredentials::default();
+        existing.upstream_base_url = Some("https://maxapi.example.xyz".to_string());
+        existing.upstream_api_key = Some("sk-dup".to_string());
+
+        let manager = MultiTokenManager::new(config, vec![existing], None, None, false).unwrap();
+
+        let mut duplicate = KiroCredentials::default();
+        duplicate.upstream_base_url = Some("https://maxapi.example.xyz".to_string());
+        duplicate.upstream_api_key = Some("sk-dup".to_string());
+
+        let result = manager.add_credential(duplicate).await;
+        assert!(result.is_err());
+        assert!(
+            result.err().unwrap().to_string().contains("上游 API 重复"),
+            "expected upstream duplicate error"
+        );
     }
 
     // MultiTokenManager 测试
