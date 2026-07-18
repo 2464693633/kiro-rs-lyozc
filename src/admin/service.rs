@@ -1088,8 +1088,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
-            upstream_base_url: req.upstream_base_url,
-            upstream_api_key: req.upstream_api_key,
+            upstream_base_url: req.upstream_base_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            upstream_api_key: req.upstream_api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         };
 
         // 调用 token_manager 添加凭据

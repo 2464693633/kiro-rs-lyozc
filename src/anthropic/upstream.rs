@@ -179,9 +179,12 @@ pub fn handle_upstream_stream_response_with_inflation(
     // 初始状态：(行缓冲区, input_mul, output_mul, cache_mul, cache_usage)
     let initial = (String::new(), input_mul, output_mul, cache_mul, cache_usage);
 
+    // 每个 SSE 事件最大 4MB；超出视为上游异常，关闭流防止 OOM
+    const MAX_BUF: usize = 4 * 1024 * 1024;
+
     let inflated = response
         .bytes_stream()
-        .scan(initial, |state, chunk| {
+        .scan(initial, move |state, chunk| {
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
@@ -189,6 +192,14 @@ pub fn handle_upstream_stream_response_with_inflation(
                     return futures::future::ready(Some(vec![]));
                 }
             };
+            // 缓冲区超限：上游发送了无边界的异常数据，终止流
+            if state.0.len() + bytes.len() > MAX_BUF {
+                tracing::error!(
+                    "上游 SSE 缓冲超过 {}MB 上限，强制关闭流",
+                    MAX_BUF / 1024 / 1024
+                );
+                return futures::future::ready(None);
+            }
             // 追加到行缓冲区，按 SSE 事件边界（\n\n）切割并逐个重写
             state.0.push_str(&String::from_utf8_lossy(&bytes));
             let mut out: Vec<Bytes> = Vec::new();

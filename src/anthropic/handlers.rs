@@ -1696,12 +1696,15 @@ async fn handle_stream_request_buffered(
         }
     };
 
-    // 上游凭据直通：透传 SSE 流
+    // 上游凭据直通：应用膨胀倍率 + 模拟缓存（与普通流式路径一致）
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
+        let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
         hook.record(credential_id, fallback_input_tokens, 0, 0, 0, 0.0, "success");
         tracer.finalize("success", None, None, None, TraceUsage::zero());
-        return super::upstream::handle_upstream_stream_response(call_result.response);
+        return super::upstream::handle_upstream_stream_response_with_inflation(
+            call_result.response, input_mul, output_mul, cache_mul, cache_usage,
+        );
     }
 
     let response = call_result.response;

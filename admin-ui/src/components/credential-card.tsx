@@ -992,7 +992,7 @@ export function CredentialCard({
             {credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
               <div className="min-[420px]:col-span-2 border-t border-border/50 pt-2">
                 <div className="mb-1 text-xs text-muted-foreground">Token 用量（近 7 天）</div>
-                <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-4">
+                <div className="grid grid-cols-3 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-5">
                   <div className="flex justify-between gap-1">
                     <span className="text-muted-foreground">调用</span>
                     <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.calls)}</span>
@@ -1004,6 +1004,10 @@ export function CredentialCard({
                   <div className="flex justify-between gap-1">
                     <span className="text-muted-foreground">输出</span>
                     <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.outputTokens)}</span>
+                  </div>
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">缓存写</span>
+                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.cacheCreationTokens)}</span>
                   </div>
                   <div className="flex justify-between gap-1">
                     <span className="text-muted-foreground">缓存读</span>
