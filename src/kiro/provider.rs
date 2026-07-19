@@ -263,7 +263,7 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, None, false, sink, group).await
+        self.call_api_with_retry(request_body, None, None, false, sink, group).await
     }
 
     /// 发送流式 API 请求
@@ -274,20 +274,22 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, None, true, sink, group).await
+        self.call_api_with_retry(request_body, None, None, true, sink, group).await
     }
 
     /// 发送非流式双路径 API 请求（支持上游凭据直通）
     ///
     /// `anthropic_body` 为 Anthropic 格式的请求体原文，当命中上游凭据时直接转发。
+    /// `upstream_beta` 为客户端携带的 `anthropic-beta` 头值，透传给上游。
     pub async fn call_api_dual(
         &self,
         request_body: &str,
         anthropic_body: Option<&str>,
+        upstream_beta: Option<&str>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, anthropic_body, false, sink, group).await
+        self.call_api_with_retry(request_body, anthropic_body, upstream_beta, false, sink, group).await
     }
 
     /// 发送流式双路径 API 请求（支持上游凭据直通）
@@ -295,10 +297,11 @@ impl KiroProvider {
         &self,
         request_body: &str,
         anthropic_body: Option<&str>,
+        upstream_beta: Option<&str>,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, anthropic_body, true, sink, group).await
+        self.call_api_with_retry(request_body, anthropic_body, upstream_beta, true, sink, group).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -492,6 +495,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         anthropic_body: Option<&str>,
+        upstream_beta: Option<&str>,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
@@ -565,13 +569,20 @@ impl KiroProvider {
 
                 tracing::debug!("上游直通 POST {} (credential #{})", upstream_url, ctx.id);
 
-                let request = self
+                let mut req_builder = self
                     .client_for(&ctx.credentials)?
                     .post(&upstream_url)
                     .body(body)
                     .header("content-type", "application/json")
                     .header("x-api-key", &ctx.token)
-                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-version", "2023-06-01");
+
+                // 透传客户端的 anthropic-beta 头（kiro.rs 需要它来启用扩展思考等功能）
+                if let Some(beta) = upstream_beta {
+                    req_builder = req_builder.header("anthropic-beta", beta);
+                }
+
+                let request = req_builder
                     .build()
                     .map_err(|e| anyhow::anyhow!("构建上游请求失败: {}", e))?;
 

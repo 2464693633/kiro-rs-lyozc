@@ -614,6 +614,7 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -653,21 +654,26 @@ pub async fn post_messages(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    // 在 override_thinking 之前捕获原始 body，确保上游（kiro.rs）收到的是未经修改的请求
+    let anthropic_body_raw = serde_json::to_string(&payload).unwrap_or_default();
+    // 提取客户端 anthropic-beta 头，透传给上游（kiro.rs 需要它启用扩展思考等功能）
+    let upstream_beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置（仅 Kiro 路径使用）
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
-
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
@@ -675,21 +681,18 @@ pub async fn post_messages(
             key_ctx.group.as_deref(),
         )
         .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
 
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    // Mixed-tools: web_search coexists with other tools, use internal agentic loop
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
             .await;
     }
-
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
@@ -767,8 +770,8 @@ pub async fn post_messages(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
-    // 序列化原始 Anthropic 格式请求体（上游凭据直通时使用）
-    let anthropic_body = serde_json::to_string(&payload).unwrap_or_default();
+    // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
+    // anthropic_body_raw 已在 override_thinking 前捕获，此处直接使用
 
     if payload.stream {
         // 流式响应
@@ -783,7 +786,7 @@ pub async fn post_messages(
         handle_stream_request(
             provider,
             &request_body,
-            &anthropic_body,
+            &anthropic_body_raw,
             &payload.model,
             total_input_tokens,
             thinking_enabled,
@@ -792,6 +795,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
+            upstream_beta,
             key_ctx.group.clone(),
         )
         .await
@@ -809,7 +813,7 @@ pub async fn post_messages(
         handle_non_stream_request(
             provider,
             &request_body,
-            &anthropic_body,
+            &anthropic_body_raw,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -818,6 +822,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
+            upstream_beta,
             key_ctx.group.clone(),
         )
         .await
@@ -837,10 +842,11 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    upstream_beta: Option<String>,
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
-    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), upstream_beta.as_deref(), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1067,19 +1073,18 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    // 非流式路径直接处理结构化 Event::ToolUse，不经过 <invoke> 文本嗅探，
-    // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    upstream_beta: Option<String>,
     group: Option<String>,
 ) -> Response {
     // 获取膨胀倍率（用于上游非流式和正常路径）
     let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
 
     // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
-    let call_result = match provider.call_api_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_dual(request_body, Some(anthropic_body), upstream_beta.as_deref(), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1471,6 +1476,7 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: axum::http::HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1499,21 +1505,26 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
+    // 在 override_thinking 之前捕获原始 body，确保上游（kiro.rs）收到的是未经修改的请求
+    let anthropic_body_raw = serde_json::to_string(&payload).unwrap_or_default();
+    // 提取客户端 anthropic-beta 头，透传给上游
+    let upstream_beta = headers
+        .get("anthropic-beta")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置（仅 Kiro 路径使用）
     override_thinking_from_model_name(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
         tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
         let input_tokens = token::count_all_tokens(
             payload.model.clone(),
             payload.system.clone(),
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
-
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
@@ -1527,14 +1538,12 @@ pub async fn post_messages_cc(
     }
 
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
+    // Mixed-tools: web_search coexists with other tools, use internal agentic loop
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
             .await;
     }
-
     // 转换请求
     let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
@@ -1611,8 +1620,8 @@ pub async fn post_messages_cc(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
-    // 序列化原始 Anthropic 格式请求体（上游凭据直通时使用）
-    let anthropic_body = serde_json::to_string(&payload).unwrap_or_default();
+    // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
+    // anthropic_body_raw 已在 override_thinking 前捕获，此处直接使用
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1627,7 +1636,7 @@ pub async fn post_messages_cc(
         handle_stream_request_buffered(
             provider,
             &request_body,
-            &anthropic_body,
+            &anthropic_body_raw,
             &payload.model,
             thinking_enabled,
             tool_name_map,
@@ -1636,6 +1645,7 @@ pub async fn post_messages_cc(
             total_input_tokens,
             cache_usage,
             tracer,
+            upstream_beta,
             key_ctx.group.clone(),
         )
         .await
@@ -1653,7 +1663,7 @@ pub async fn post_messages_cc(
         handle_non_stream_request(
             provider,
             &request_body,
-            &anthropic_body,
+            &anthropic_body_raw,
             &payload.model,
             total_input_tokens,
             extract_thinking,
@@ -1662,6 +1672,7 @@ pub async fn post_messages_cc(
             hook,
             cache_usage,
             tracer,
+            upstream_beta,
             key_ctx.group.clone(),
         )
         .await
@@ -1684,10 +1695,11 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    upstream_beta: Option<String>,
     group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
-    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider.call_api_stream_dual(request_body, Some(anthropic_body), upstream_beta.as_deref(), Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
