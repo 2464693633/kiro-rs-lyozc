@@ -15,6 +15,15 @@ use std::convert::Infallible;
 use super::cache_metering::CacheUsage;
 use super::types::ErrorResponse;
 
+/// 上游流式响应结束后回传给 handler 的用量统计（膨胀前，供 hook.record 使用）
+#[derive(Debug, Default)]
+pub struct UpstreamStreamUsage {
+    pub input_tokens: i32,
+    pub output_tokens: i32,
+    pub cache_creation_tokens: i32,
+    pub cache_read_tokens: i32,
+}
+
 /// 对 JSON 响应体中的 usage 对象应用膨胀倍率（非流式）
 pub fn inflate_usage_in_json(
     json: &mut serde_json::Value,
@@ -168,58 +177,108 @@ fn inflate_sse_event(
     }
 }
 
+/// 从 SSE 事件提取膨胀前的用量（仅 message_start / message_delta）
+fn update_stream_stats(
+    event_text: &str,
+    stats: &mut UpstreamStreamUsage,
+    cache_usage: CacheUsage,
+) {
+    let mut event_type: Option<&str> = None;
+    let mut data_line: Option<&str> = None;
+    for line in event_text.lines() {
+        if let Some(t) = line.strip_prefix("event: ") { event_type = Some(t.trim()); }
+        else if let Some(d) = line.strip_prefix("data: ") { data_line = Some(d); }
+    }
+    match (event_type, data_line) {
+        (Some("message_start"), Some(data)) => {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                let u = json.pointer("/message/usage");
+                let i  = u.and_then(|v| v.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                let cc = u.and_then(|v| v.get("cache_creation_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                let cr = u.and_then(|v| v.get("cache_read_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total((i + cc + cr) as i32);
+                stats.input_tokens = sim_input;
+                stats.cache_creation_tokens = sim_cc;
+                stats.cache_read_tokens = sim_cr;
+            }
+        }
+        (Some("message_delta"), Some(data)) => {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                if let Some(v) = json.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
+                    stats.output_tokens = v as i32;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// 处理上游流式响应：解析 SSE 事件，应用膨胀倍率和模拟缓存，与 Kiro 账号路径保持一致。
+///
+/// 返回 `(Response, Receiver<UpstreamStreamUsage>)`：
+/// - Response 立即返回给客户端（SSE 流）。
+/// - Receiver 在流全部消耗完后收到膨胀前的用量统计，供 hook.record / tracer.finalize 使用。
 pub fn handle_upstream_stream_response_with_inflation(
     response: reqwest::Response,
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
     cache_usage: CacheUsage,
-) -> Response {
-    // 初始状态：(行缓冲区, input_mul, output_mul, cache_mul, cache_usage)
-    let initial = (String::new(), input_mul, output_mul, cache_mul, cache_usage);
+) -> (Response, tokio::sync::oneshot::Receiver<UpstreamStreamUsage>) {
+    let (usage_tx, usage_rx) = tokio::sync::oneshot::channel::<UpstreamStreamUsage>();
+    let (bytes_tx, bytes_rx) = tokio::sync::mpsc::channel::<Bytes>(32);
 
-    // 每个 SSE 事件最大 4MB；超出视为上游异常，关闭流防止 OOM
     const MAX_BUF: usize = 4 * 1024 * 1024;
 
-    let inflated = response
-        .bytes_stream()
-        .scan(initial, move |state, chunk| {
+    // 后台任务：读取上游 SSE 流 → 膨胀 → 发送到 bytes_tx；结束时通过 usage_tx 回报用量
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut stats = UpstreamStreamUsage::default();
+        let mut byte_stream = response.bytes_stream();
+
+        while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
                 Ok(b) => b,
                 Err(e) => {
                     tracing::error!("上游流式响应读取失败: {}", e);
-                    return futures::future::ready(Some(vec![]));
+                    break;
                 }
             };
-            // 缓冲区超限：上游发送了无边界的异常数据，终止流
-            if state.0.len() + bytes.len() > MAX_BUF {
-                tracing::error!(
-                    "上游 SSE 缓冲超过 {}MB 上限，强制关闭流",
-                    MAX_BUF / 1024 / 1024
-                );
-                return futures::future::ready(None);
+            if buffer.len() + bytes.len() > MAX_BUF {
+                tracing::error!("上游 SSE 缓冲超过 {}MB 上限，强制关闭流", MAX_BUF / 1024 / 1024);
+                break;
             }
-            // 追加到行缓冲区，按 SSE 事件边界（\n\n）切割并逐个重写
-            state.0.push_str(&String::from_utf8_lossy(&bytes));
-            let mut out: Vec<Bytes> = Vec::new();
-            while let Some(pos) = state.0.find("\n\n") {
-                let event_text = state.0[..pos + 2].to_string();
-                state.0 = state.0[pos + 2..].to_string();
-                let inflated_event = inflate_sse_event(&event_text, state.1, state.2, state.3, state.4);
-                out.push(Bytes::from(inflated_event));
+            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(pos) = buffer.find("\n\n") {
+                let event_text = buffer[..pos + 2].to_string();
+                buffer = buffer[pos + 2..].to_string();
+                // 提取膨胀前用量（在 inflate 之前）
+                update_stream_stats(&event_text, &mut stats, cache_usage);
+                let inflated = inflate_sse_event(&event_text, input_mul, output_mul, cache_mul, cache_usage);
+                if bytes_tx.send(Bytes::from(inflated)).await.is_err() {
+                    // 客户端已断开
+                    return;
+                }
             }
-            futures::future::ready(Some(out))
-        })
-        .flat_map(|chunks| stream::iter(chunks.into_iter().map(Ok::<Bytes, Infallible>)));
+        }
+        // 流结束，回传用量（忽略 receiver 已丢弃的情况）
+        let _ = usage_tx.send(stats);
+    });
 
-    Response::builder()
+    // 把 mpsc::Receiver 转为 Stream 供 axum Body 消费
+    let body_stream = futures::stream::unfold(bytes_rx, |mut rx| async move {
+        rx.recv().await.map(|b| (Ok::<Bytes, Infallible>(b), rx))
+    });
+
+    let resp = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
         .header(header::CONNECTION, "keep-alive")
-        .body(Body::from_stream(inflated))
-        .unwrap()
+        .body(Body::from_stream(body_stream))
+        .unwrap();
+
+    (resp, usage_rx)
 }
 
 /// 处理上游流式响应：透明代理 SSE 流（保留用于降级）。

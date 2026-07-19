@@ -855,15 +855,37 @@ async fn handle_stream_request(
         }
     };
 
-    // 上游凭据直通：应用膨胀倍率 + 模拟缓存（与 Kiro 账号路径一致）
+    // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
-        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "success");
-        tracer.finalize("success", None, None, None, TraceUsage::zero());
-        return super::upstream::handle_upstream_stream_response_with_inflation(
+        let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
             call_result.response, input_mul, output_mul, cache_mul, cache_usage,
         );
+        // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
+        tokio::spawn(async move {
+            let usage = usage_rx.await.unwrap_or_default();
+            hook.record(
+                credential_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens,
+                0.0,
+                "success",
+            );
+            tracer.finalize(
+                "success", None, None, None,
+                TraceUsage {
+                    input_tokens: usage.input_tokens.max(0) as u64,
+                    output_tokens: usage.output_tokens.max(0) as u64,
+                    cache_creation_tokens: usage.cache_creation_tokens.max(0) as u64,
+                    cache_read_tokens: usage.cache_read_tokens.max(0) as u64,
+                    credits: 0.0,
+                },
+            );
+        });
+        return resp;
     }
 
     let response = call_result.response;
@@ -1708,15 +1730,36 @@ async fn handle_stream_request_buffered(
         }
     };
 
-    // 上游凭据直通：应用膨胀倍率 + 模拟缓存（与普通流式路径一致）
+    // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
-        hook.record(credential_id, fallback_input_tokens, 0, 0, 0, 0.0, "success");
-        tracer.finalize("success", None, None, None, TraceUsage::zero());
-        return super::upstream::handle_upstream_stream_response_with_inflation(
+        let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
             call_result.response, input_mul, output_mul, cache_mul, cache_usage,
         );
+        tokio::spawn(async move {
+            let usage = usage_rx.await.unwrap_or_default();
+            hook.record(
+                credential_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_creation_tokens,
+                usage.cache_read_tokens,
+                0.0,
+                "success",
+            );
+            tracer.finalize(
+                "success", None, None, None,
+                TraceUsage {
+                    input_tokens: usage.input_tokens.max(0) as u64,
+                    output_tokens: usage.output_tokens.max(0) as u64,
+                    cache_creation_tokens: usage.cache_creation_tokens.max(0) as u64,
+                    cache_read_tokens: usage.cache_read_tokens.max(0) as u64,
+                    credits: 0.0,
+                },
+            );
+        });
+        return resp;
     }
 
     let response = call_result.response;
