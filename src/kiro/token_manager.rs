@@ -2805,6 +2805,51 @@ impl MultiTokenManager {
         &self,
         id: u64,
     ) -> anyhow::Result<ListAvailableModelsResponse> {
+        // 上游直通凭据没有 Kiro refreshToken，直接查询上游 Anthropic /v1/models
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+        if credentials.is_upstream_credential() {
+            let base = credentials
+                .upstream_base_url
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("上游凭据缺少 upstreamBaseUrl"))?;
+            let api_key = credentials
+                .upstream_api_key
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("上游凭据缺少 upstreamApiKey"))?;
+            let url = format!("{}/v1/models", base.trim_end_matches('/'));
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await?
+                .json::<serde_json::Value>()
+                .await?;
+            let models = resp
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.get("id").and_then(|v| v.as_str()))
+                        .map(|mid| crate::kiro::model::available_models::UpstreamModel {
+                            model_id: mid.to_string(),
+                            model_name: None,
+                            description: None,
+                            token_limits: None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            return Ok(ListAvailableModelsResponse { models });
+        }
+
         let (token, credentials) = self.prepare_request_token(id).await?;
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
