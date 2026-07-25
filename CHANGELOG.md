@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### ✨ 新功能 — 自定义模型支持
+
+- **`config.json` 新增 `customModels` 数组**：把任意客户端模型别名映射到 Kiro 后端模型 ID，并可声明 `displayName` / `contextWindow` / `maxTokens` / `supportsReasoning` / `ownedBy`。自定义条目按 `id`（大小写不敏感）精确匹配，**优先于**内置关键词模糊映射——既能新增模型，也能覆盖内置模型的后端指向。
+- **thinking 后缀回退**：客户端传 `<alias>-thinking` 而无同名精确条目时，自动剥离后缀回退到 `<alias>`，与内置映射对 thinking 变体的处理一致。
+- **`GET /v1/models` 展示**：所有自定义模型追加到列表尾部（保持配置顺序）。
+- **上下文窗口 / reasoning**：设了 `contextWindow` 时以其为准；`supportsReasoning: true` 让对应 backend_id 放行 `additionalModelRequestFields`。
+- **零透传实现**：复用项目既有的 `OnceLock` 全局配置惯例（同 `token.rs`），启动时装载一次只读注册表，`map_model` / `get_context_window_size` / `available_models` 内部查表，未改动任何函数签名。`/v1/chat/completions` 与 `/v1/responses` 因复用同一映射链路自动生效。默认空数组，向后兼容。
+
 ## [0.7.1] - 2026-07-15
 
 主题：**打通 Codex CLI 完整工具链——桥接 function / custom / namespace 工具到 Anthropic 模型，并修复工具结果后空响应导致任务误标记完成的问题**。0.7.0 引入了 Responses 端点使 Codex CLI 能连接 kiro-rs，但此前仅支持纯聊天与 Web 搜索——Codex 的真实工具（shell / apply_patch / view_image / MCP 等）被全部剥离，导致 Codex 无法读写文件、执行命令或编辑代码。本版补全工具桥接的全链路：从 Codex 的工具声明收集、到 Anthropic 模型侧的 schema 翻译、再到响应侧按声明类型正确生成 `function_call` 或 `custom_tool_call`——实现 Codex CLI 与 kiro-rs 的完整能力对齐。
