@@ -385,6 +385,24 @@ fn resolve_usage_input_tokens(
 fn available_models() -> Vec<Model> {
     vec![
         Model {
+            id: "claude-opus-5".to_string(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-5-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1782000000,
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 5 (Extended Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
             id: "gpt-5.6-sol".to_string(),
             object: "model".to_string(),
             created: 1782000000,
@@ -597,15 +615,59 @@ fn available_models() -> Vec<Model> {
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
-pub async fn get_models() -> impl IntoResponse {
+pub async fn get_models(
+    State(state): State<AppState>,
+    Extension(key_ctx): Extension<KeyContext>,
+) -> impl IntoResponse {
     tracing::info!("Received GET /v1/models request");
 
-    let models = available_models();
+    // 若存在匹配分组的上游凭据，代理到上游 /v1/models 返回实时模型列表
+    if let Some(provider) = &state.kiro_provider {
+        let creds = provider.token_manager().clone_all_credentials();
+        let upstream_cred = creds.iter().find(|c| {
+            let matches_group = key_ctx
+                .group
+                .as_ref()
+                .map(|g| c.groups.iter().any(|g2| g2 == g))
+                .unwrap_or(true);
+            matches_group && c.is_upstream_credential()
+        });
+        if let Some(cred) = upstream_cred {
+            let base = cred.upstream_base_url.as_ref().unwrap();
+            let api_key = cred.upstream_api_key.as_ref().unwrap();
+            let url = format!("{}/v1/models", base.trim_end_matches('/'));
+            match reqwest::Client::new()
+                .get(&url)
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap();
+                }
+                Ok(resp) => {
+                    tracing::warn!("上游 /v1/models 返回非成功状态: {}", resp.status());
+                }
+                Err(e) => {
+                    tracing::error!("请求上游 /v1/models 失败: {}", e);
+                }
+            }
+        }
+    }
 
+    // 回退到静态模型列表
+    let models = available_models();
     Json(ModelsResponse {
         object: "list".to_string(),
         data: models,
     })
+    .into_response()
 }
 
 /// POST /v1/messages
