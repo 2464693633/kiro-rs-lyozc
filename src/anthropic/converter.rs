@@ -226,6 +226,11 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-opus-4.5".to_string())
         } else if model_lower.contains("4-6") || model_lower.contains("4.6") {
             Some("claude-opus-4.6".to_string())
+        } else if model_lower.contains("opus-5")
+            || model_lower.contains("opus5")
+            || model_lower.contains("opus.5")
+        {
+            Some("claude-opus-5".to_string())
         } else {
             None
         }
@@ -257,6 +262,7 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
+                || mapped == "claude-opus-5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000

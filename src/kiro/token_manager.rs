@@ -2590,6 +2590,17 @@ impl MultiTokenManager {
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
 
+        // 上游凭据（upstream_base_url + upstream_api_key）无 Kiro 用量端点，直接返回空响应
+        if credentials.is_upstream_credential() {
+            return Ok(UsageLimitsResponse {
+                next_date_reset: None,
+                subscription_info: None,
+                usage_breakdown_list: vec![],
+                overage_configuration: None,
+                user_info: None,
+            });
+        }
+
         // API Key 凭据直接使用 kiro_api_key，无需刷新
         let token = if credentials.is_api_key_credential() {
             credentials
