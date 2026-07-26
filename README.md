@@ -121,7 +121,7 @@ docker compose logs --tail=200 kiro-rs
 指定镜像版本：
 
 ```bash
-KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.1 docker compose up -d
+KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.7.2 docker compose up -d
 ```
 
 ### 下载二进制
@@ -814,7 +814,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.1](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.1)。
+当前稳定版：[v0.7.2](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.2)。
 
 Docker 镜像：
 
