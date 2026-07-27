@@ -314,6 +314,8 @@ codex
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
+| `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
@@ -509,7 +511,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 <a id="models"></a>
 ## 模型
 
-`GET /v1/models` 会查询当前客户端 Key 所属分组可访问的凭据，返回这些凭据上游模型列表的去重并集。列表按凭据缓存，默认 TTL 为一小时；刷新部分失败时继续使用最后一次成功缓存。动态 Claude 模型会同时展示兼容的 `-thinking` 别名。
+`GET /v1/models` 会查询当前客户端 Key 所属分组可访问的凭据，返回这些凭据上游模型列表的去重并集，不额外生成 `-thinking` 模型。列表按凭据缓存，默认 TTL 为一小时；刷新部分失败时继续使用最后一次成功缓存。为兼容已有客户端，请求中仍可使用 `-thinking` 后缀自动开启 Thinking。
 
 请求模型按以下顺序解析：
 
