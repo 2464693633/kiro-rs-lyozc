@@ -178,6 +178,10 @@ pub struct Config {
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
 
+    /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
+    #[serde(default = "default_model_cache_ttl_secs")]
+    pub model_cache_ttl_secs: u64,
+
     /// 是否开启非流式响应的 thinking 块提取（默认 true）
     ///
     /// 启用后，非流式响应中的 `<thinking>...</thinking>` 标签会被解析为
@@ -273,6 +277,10 @@ fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
 }
 
+fn default_model_cache_ttl_secs() -> u64 {
+    60 * 60
+}
+
 fn default_update_auto_apply_time() -> String {
     "03:00".to_string()
 }
@@ -330,6 +338,7 @@ impl Default for Config {
             load_balancing_mode: default_load_balancing_mode(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
@@ -401,5 +410,23 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn model_cache_ttl_defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.model_cache_ttl_secs, 3600);
+        assert_eq!(Config::default().model_cache_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn model_cache_ttl_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"modelCacheTtlSecs":120}"#).unwrap();
+        assert_eq!(config.model_cache_ttl_secs, 120);
     }
 }
