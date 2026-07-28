@@ -626,6 +626,64 @@ mod tests {
         assert!(json.contains("\"cacheEngine\":\"go\""), "实际: {json}");
     }
 
+    /// 经**磁盘**往返后每个 Key 的引擎选择必须原样存活，且互不串味。
+    ///
+    /// 与 `legacy_keys_default_to_rust_engine_and_field_is_omitted` 的区别：那条只测
+    /// serde 层的单条序列化，本条驱动真实 `save_locked` → 新 manager `load`。
+    /// `cache_engine` 带 `skip_serializing_if`，默认值不落盘、靠 `serde(default)` 读回 ——
+    /// 若谁去掉 `default`，非默认 Key 仍能存活，只有本条会失败。
+    #[test]
+    fn cache_engine_survives_disk_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-ck-{}-{:?}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // load 于不存在的路径 → 空 manager 但带 path，后续 create 会真实写盘
+        let mgr = ClientKeyManager::load(&path).expect("空路径应可加载");
+        let rust_key = mgr.create("走引擎A".into(), None, None, CacheEngineKind::Rust);
+        let go_key = mgr.create("走引擎B".into(), None, None, CacheEngineKind::Go);
+        // 第三条：建成默认再改成 Go，覆盖 update_meta 的写盘路径
+        let flipped = mgr.create("后改B".into(), None, None, CacheEngineKind::default());
+        assert!(mgr.update_meta(flipped.id, None, None, None, Some(CacheEngineKind::Go)));
+
+        // 磁盘形状：只有非默认引擎的 Key 才写出 cacheEngine（此处 2 条）
+        let on_disk = std::fs::read_to_string(&path).expect("应已写盘");
+        assert_eq!(
+            on_disk.matches("\"cacheEngine\"").count(),
+            2,
+            "只应有 2 条非默认引擎落盘，实际文件: {on_disk}"
+        );
+
+        // 换一个 manager 重新加载，模拟重启
+        let reloaded = ClientKeyManager::load(&path).expect("应可重新加载");
+        assert_eq!(
+            reloaded.cache_engine_of(rust_key.id),
+            CacheEngineKind::Rust,
+            "引擎 A 的 Key 重启后应仍为 A"
+        );
+        assert_eq!(
+            reloaded.cache_engine_of(go_key.id),
+            CacheEngineKind::Go,
+            "引擎 B 的 Key 重启后应仍为 B（字段真的落盘了）"
+        );
+        assert_eq!(
+            reloaded.cache_engine_of(flipped.id),
+            CacheEngineKind::Go,
+            "经 update_meta 改过的 Key 重启后应保持 B"
+        );
+        // Key 本身也要能继续鉴权，确认加载的是同一批条目而非空表
+        assert_eq!(reloaded.verify_and_touch(&go_key.key), Some(go_key.id));
+        assert_eq!(reloaded.list().len(), 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// 系统 Key（id=0）经 `sync_system_key` 反复同步后，引擎选择必须存活。
     #[test]
     fn system_key_retains_cache_engine_across_sync() {
