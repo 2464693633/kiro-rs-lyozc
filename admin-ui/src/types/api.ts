@@ -375,6 +375,16 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
+/**
+ * 该 Key 使用哪套缓存模拟引擎。
+ *
+ * - `rust`：引擎 A，带会话隔离（按 session / key 隔离前缀，主 Key 无 session 时不模拟）
+ * - `go`：引擎 B，移植自 kiro-go，全局共享指纹表（不同 Key 的相同前缀会互相命中）
+ *
+ * 省略即 `rust`，与后端 `#[serde(default)]` 对齐。
+ */
+export type CacheEngineKind = 'rust' | 'go'
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -393,6 +403,8 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
+  /** 该 Key 使用的缓存模拟引擎（老 Key 无此字段时后端按 rust 返回） */
+  cacheEngine?: CacheEngineKind
 }
 
 export interface ClientKeysResponse {
@@ -404,6 +416,8 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
+  /** 省略即 rust（引擎 A） */
+  cacheEngine?: CacheEngineKind
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -418,6 +432,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 省略 = 不改动该 Key 的引擎选择 */
+  cacheEngine?: CacheEngineKind
 }
 
 // ============ 用量统计 ============

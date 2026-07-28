@@ -451,6 +451,69 @@ export async function setTokenInflationConfig(
   return data
 }
 
+// ==== 双缓存模拟引擎 ====
+
+/** 引擎 A（rust，带会话隔离）参数 */
+export interface CacheEngineRustConfig {
+  capacity: number
+  maxTtlSecs: number
+  defaultTtlSecs: number
+}
+
+/** 引擎 B（go，全局共享指纹表）参数 */
+export interface CacheEngineGoConfig {
+  maxRatio: number
+  ttlSeconds: number
+  maxEntries: number
+  minCacheableTokens: number
+  opusMinCacheableTokens: number
+  /** go 引擎专属：下发前对 input_tokens 的缩放倍率（不走全局膨胀倍率） */
+  inputTokenMultiplier: number
+  /** go 引擎专属：下发前对 cache_read_input_tokens 的缩放倍率 */
+  cacheReadMultiplier: number
+  /** go 引擎专属：下发前对 cache_creation_input_tokens 的缩放倍率（默认 1.0 = Go 原实现） */
+  cacheCreationMultiplier: number
+}
+
+export interface CacheEnginesConfig {
+  rust: CacheEngineRustConfig
+  go: CacheEngineGoConfig
+}
+
+export interface CacheEngineCounters {
+  entries: number
+  capacity: number
+  hits: number
+  misses: number
+  evictions: number
+  expirations: number
+}
+
+export interface CacheEnginesStats {
+  rust: CacheEngineCounters
+  go: CacheEngineCounters
+}
+
+/** 获取两套引擎参数（返回 sanitized 后、运行时真正生效的值） */
+export async function getCacheEnginesConfig(): Promise<CacheEnginesConfig> {
+  const { data } = await api.get<CacheEnginesConfig>('/config/cache-engines')
+  return data
+}
+
+/** 更新两套引擎参数（落盘 + 热生效，无需重启） */
+export async function setCacheEnginesConfig(
+  config: CacheEnginesConfig,
+): Promise<CacheEnginesConfig> {
+  const { data } = await api.put<CacheEnginesConfig>('/config/cache-engines', config)
+  return data
+}
+
+/** 获取两套引擎的运行计数器 */
+export async function getCacheEnginesStats(): Promise<CacheEnginesStats> {
+  const { data } = await api.get<CacheEnginesStats>('/cache-engines/stats')
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

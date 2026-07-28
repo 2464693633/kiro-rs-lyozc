@@ -20,7 +20,7 @@ import {
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import type { CacheEngineKind, ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 
@@ -56,6 +56,7 @@ export function ClientKeysPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
+  const [createEngine, setCreateEngine] = useState<CacheEngineKind>('rust')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -77,12 +78,14 @@ export function ClientKeysPage() {
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
+        cacheEngine: createEngine,
       })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
+      setCreateEngine('rust')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -252,6 +255,15 @@ export function ClientKeysPage() {
                             系统
                           </Badge>
                         )}
+                        {/* 仅标注非默认引擎：默认 rust 不占视觉噪声 */}
+                        {k.cacheEngine === 'go' && (
+                          <Badge
+                            variant="outline"
+                            title="缓存模拟走 go 引擎（移植自 kiro-go，全局共享指纹表）"
+                          >
+                            go 引擎
+                          </Badge>
+                        )}
                       </div>
                       {k.description && (
                         <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
@@ -388,6 +400,34 @@ export function ClientKeysPage() {
               />
               <p className="mt-1 text-[11px] text-muted-foreground">
                 绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
+              </p>
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">缓存模拟引擎</label>
+              <div className="mt-1 flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={createEngine === 'rust' ? 'default' : 'outline'}
+                  onClick={() => setCreateEngine('rust')}
+                  disabled={createKey.isPending}
+                >
+                  rust（引擎 A）
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={createEngine === 'go' ? 'default' : 'outline'}
+                  onClick={() => setCreateEngine('go')}
+                  disabled={createKey.isPending}
+                >
+                  go（引擎 B）
+                </Button>
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {createEngine === 'rust'
+                  ? 'rust：按 session / Key 隔离缓存前缀；主 Key 无 session 时不模拟缓存。'
+                  : 'go：移植自 kiro-go，全局共享指纹表 —— 不同 Key 的相同前缀会互相命中。'}
               </p>
             </div>
             <DialogFooter>

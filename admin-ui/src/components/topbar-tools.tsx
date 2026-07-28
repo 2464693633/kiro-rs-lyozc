@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
-  MoreHorizontal, ShieldAlert, ShieldCheck, TrendingUp,
+  MoreHorizontal, ShieldAlert, ShieldCheck, TrendingUp, Database,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -25,6 +25,7 @@ import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
+import { CacheEngineDialog } from '@/components/cache-engine-dialog'
 
 /**
  * 顶栏右侧通用工具栏：负载均衡切换、刷新、在线更新、设置（Key 管理）。
@@ -49,6 +50,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [inflationDialogOpen, setInflationDialogOpen] = useState(false)
+  const [cacheEngineDialogOpen, setCacheEngineDialogOpen] = useState(false)
   const [inflationInput, setInflationInput] = useState('1.0')
   const [inflationOutput, setInflationOutput] = useState('1.0')
   const [inflationCache, setInflationCache] = useState('1.0')
@@ -145,6 +147,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openImageUpdate: () => setImageUpdateOpen(true),
     openKeyDialog,
     openInflationDialog,
+    openCacheEngineDialog: () => setCacheEngineDialogOpen(true),
     throttleConfig,
     inflationConfig,
     isLoadingInflation,
@@ -227,6 +230,11 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
           </form>
         </DialogContent>
       </Dialog>
+
+      <CacheEngineDialog
+        open={cacheEngineDialogOpen}
+        onOpenChange={setCacheEngineDialogOpen}
+      />
 
       <Dialog
         open={keyDialogOpen}
@@ -334,6 +342,7 @@ interface ToolControls {
   openImageUpdate: () => void
   openKeyDialog: () => void
   openInflationDialog: () => void
+  openCacheEngineDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   inflationConfig?: { inputMultiplier: number; outputMultiplier: number; cacheMultiplier: number }
   isLoadingInflation: boolean
@@ -397,6 +406,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openInflationDialog}>
           <TrendingUp />Token 膨胀倍率
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={controls.openCacheEngineDialog}>
+          <Database />缓存模拟引擎参数
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
