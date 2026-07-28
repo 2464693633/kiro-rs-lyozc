@@ -307,7 +307,8 @@ impl KiroProvider {
                 Err(e) => {
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, None, group);
                     continue;
                 }
             };
@@ -353,7 +354,7 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success(ctx.id);
+                self.token_manager.report_success_for_request(ctx.id, None);
                 return Ok(response);
             }
 
@@ -362,7 +363,9 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_quota_exhausted_for_request(ctx.id, None, group);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -382,7 +385,9 @@ impl KiroProvider {
                     && self.token_manager.get_suspended_detection_enabled()
                     && endpoint.is_account_suspended(&body)
                 {
-                    let has_available = self.token_manager.report_suspended(ctx.id);
+                    let has_available = self
+                        .token_manager
+                        .report_suspended_for_request(ctx.id, None, group);
                     if !has_available {
                         anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                     }
@@ -403,7 +408,9 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available = self
+                    .token_manager
+                    .report_failure_for_request(ctx.id, None, group);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
@@ -515,7 +522,8 @@ impl KiroProvider {
                         Some(&e.to_string()), attempt_start,
                     );
                     last_error = Some(e);
-                    self.token_manager.report_failure(ctx.id);
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, model.as_deref(), group);
                     continue;
                 }
             };
@@ -582,7 +590,8 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
                     outcome::SUCCESS, None, attempt_start,
                 );
-                self.token_manager.report_success(ctx.id);
+                self.token_manager
+                    .report_success_for_request(ctx.id, model.as_deref());
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -606,7 +615,11 @@ impl KiroProvider {
                     outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
                 );
 
-                let has_available = self.token_manager.report_quota_exhausted(ctx.id);
+                let has_available = self.token_manager.report_quota_exhausted_for_request(
+                    ctx.id,
+                    model.as_deref(),
+                    group,
+                );
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -654,7 +667,11 @@ impl KiroProvider {
                         outcome::ACCOUNT_SUSPENDED, Some(&body), attempt_start,
                     );
 
-                    let has_available = self.token_manager.report_suspended(ctx.id);
+                    let has_available = self.token_manager.report_suspended_for_request(
+                        ctx.id,
+                        model.as_deref(),
+                        group,
+                    );
                     if !has_available {
                         anyhow::bail!(
                             "{} API 请求失败（所有凭据已用尽）: {} {}",
@@ -697,7 +714,9 @@ impl KiroProvider {
                     tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
                 }
 
-                let has_available = self.token_manager.report_failure(ctx.id);
+                let has_available =
+                    self.token_manager
+                        .report_failure_for_request(ctx.id, model.as_deref(), group);
                 if !has_available {
                     anyhow::bail!(
                         "{} API 请求失败（所有凭据已用尽）: {} {}",
