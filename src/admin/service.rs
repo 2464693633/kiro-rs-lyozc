@@ -37,8 +37,9 @@ use super::types::{
     ExportedCredentials, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
-    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetSelfHealConfigRequest,
+    SetUpdateConfigRequest,
     StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
     UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
@@ -2061,6 +2062,44 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取自愈治理配置
+    pub fn get_self_heal_config(&self) -> SelfHealConfigResponse {
+        let (enabled, min_interval_secs, max_consecutive_rounds, consecutive_rounds, total_count) =
+            self.token_manager.get_self_heal_config();
+        SelfHealConfigResponse {
+            enabled,
+            min_interval_secs,
+            max_consecutive_rounds,
+            consecutive_rounds,
+            total_count,
+        }
+    }
+
+    /// 更新自愈治理配置
+    pub fn set_self_heal_config(
+        &self,
+        req: SetSelfHealConfigRequest,
+    ) -> Result<SelfHealConfigResponse, AdminServiceError> {
+        if req.enabled.is_none()
+            && req.min_interval_secs.is_none()
+            && req.max_consecutive_rounds.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled / minIntervalSecs / maxConsecutiveRounds 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_self_heal_config(
+                req.enabled,
+                req.min_interval_secs,
+                req.max_consecutive_rounds,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_self_heal_config())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

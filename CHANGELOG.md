@@ -4,6 +4,39 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.4] - 2026-07-28
+
+主题：**修复持续 403 场景下"全账号自愈"陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题（[issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51)）**。两条主线：① 精准识别 403 账号封禁文案并立即禁用（不参与自愈）；② 为自愈引入配置驱动的**节流 + 连续上限 + 可观测**治理。兼容性补丁版本：新增字段均 `serde(default)`、默认值即修复行为、旧 `config.json` 无需改动。
+
+### 🐛 问题背景
+
+当所有凭据均因连续失败被自动禁用时，系统会执行"自愈"——重置失败计数并重新启用（等价于重启）。旧实现**无冷却、无上限**：持续 403 会形成 `全禁 → 自愈(重置) → 403 → 累计 3 次 → 全禁 → 自愈` 的紧密死循环，表现为自愈日志刷屏、持续无效打上游、面板状态抖动。其中一类高频根因是**账号被上游封禁**（响应体形如 `Your User ID (...) temporarily is suspended. We've locked your account ...`）——这类凭据不可能自愈恢复，重置只是徒劳地推迟下一次失败。
+
+### 🔒 修复方案一：403 账号封禁识别
+
+- 新增端点级 `is_account_suspended`：仅当 403 响应体**同时**命中 `suspended` 与 `locked your account` 两个高特异短语（大小写不敏感）时判定为封禁。只针对这类明确文案，**不影响**普通 403（权限/WAF/区域抖动），避免误伤瞬态 403。
+- 命中后立即标记凭据为 `Suspended` 并禁用、切换到下一个可用凭据，**不累计、不参与自愈**；需人工联系客服核实后经 Admin API / 面板手动重置（误判逃生途径）。
+- 新增配置项 **`suspendedDetectionEnabled`（默认 `true`）** 作为总开关；trace 新增 `account_suspended` 分类；管理面板凭据卡片新增「账号封禁」徽标。
+
+### 🔧 修复方案二：自愈治理（配置入手）
+
+对齐既有账号级风控配置的运行时可改 + 持久化模式，新增 3 个 `selfHeal*` 配置项：
+
+- **`selfHealEnabled`（默认 `true`）**：全账号自愈总开关。关闭后全灭即直接失败、不再重置。
+- **`selfHealMinIntervalSecs`（默认 `300`）**：两次自愈的最小冷却间隔。冷却窗口内即使再次全灭也不触发自愈——**这是打断死循环的关键**：持续故障下自愈频率从"每请求一次"降到"每 5 分钟一次"。
+- **`selfHealMaxConsecutiveRounds`（默认 `5`，`0`=不限）**：连续自愈达到该轮数且期间**无任何一次成功**时停止自愈，记录错误日志提示人工核查（账号可能已被封禁/额度耗尽）。任意一次成功调用都会把连续轮数清零，故瞬态故障恢复后自愈能力不受影响。
+
+### 📊 可观测性
+
+- 自愈日志新增 `第 N 轮 / 上限 M · 累计 K 次`，达上限时输出显式的人工介入提示。
+- 新增 Admin API `GET|PUT /api/admin/config/self-heal`，读写全部 4 个开关（含 `suspendedDetectionEnabled`）并返回只读观测值 `consecutiveRounds` / `totalCount`。
+- 管理面板顶栏新增「全账号自愈」设置项：自愈开关、403 封禁识别开关、冷却间隔预设、连续上限输入，并展示当前连续轮数与累计次数。
+
+### 🔒 兼容性
+
+- 封禁识别只匹配 `suspended` + `locked your account` 两个高特异短语同时出现的情形，普通 403 仍走既有累计路径，不误伤瞬态 403。
+- 全部新增字段 `serde(default)`，缺省即默认值；如需完全回退旧行为，可将 `suspendedDetectionEnabled` 设为 `false`、`selfHealMinIntervalSecs` 与 `selfHealMaxConsecutiveRounds` 均设为 `0`。
+
 ## [0.7.3] - 2026-07-28
 
 主题：**以 Kiro 上游实际返回的模型目录替代本地静态列表，新增按凭据缓存、分组聚合和模型感知路由，并开放未知合法模型 ID 的直接透传**。本次兼容性补丁同时扩展了 Admin 模型面板：可按账号池策略查询模型、查看输入/输出 Token 上限，并发送真实的最小化请求验证模型。已有 `customModels`、`-thinking` 请求方式和静态上下文估算继续兼容。
