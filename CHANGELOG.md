@@ -6,7 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.7.4] - 2026-07-28
 
-主题：**修复持续 403 场景下"全账号自愈"陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题（[issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51)）**。两条主线：① 精准识别 403 账号封禁文案并立即禁用（不参与自愈）；② 为自愈引入配置驱动的**节流 + 连续上限 + 可观测**治理。兼容性补丁版本：新增字段均 `serde(default)`、默认值即修复行为、旧 `config.json` 无需改动。
+主题：**修复 IdC / Enterprise 重新登录后 Token 无法刷新，以及持续 403 场景下“全账号自愈”陷入 `全禁 → 自愈 → 403 → 再禁` 死循环的问题**。本版合并 [PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52) 与 [issue #51](https://github.com/ZyphrZero/kiro.rs/issues/51) 的修复：重新登录会整体替换与 OIDC 客户端绑定的凭据；账号池则精准识别 403 封禁，并通过配置驱动的**节流 + 连续上限 + 可观测**治理自愈行为。新增配置字段均 `serde(default)`，旧 `config.json` 无需改动。
+
+### 🔧 修复 — IdC / Enterprise 重新登录凭据失配
+
+> 来源：[PR #52](https://github.com/ZyphrZero/kiro.rs/pull/52)。提交人：[@Xm798](https://github.com/Xm798)，感谢贡献。
+
+- **整体替换 OIDC 客户端绑定凭据**：IdC refresh token 与注册时生成的 `clientId` / `clientSecret` 绑定；重新登录不再只写入新 refresh token，而是同步替换 access token、refresh token、客户端注册、区域、Start URL 与 provider，避免下一次刷新因“新 token + 旧客户端”组合返回 `invalid_grant`。
+- **清理已失效或跨认证方式的字段**：重新登录后清除属于旧身份的 `profileArn`，使其在后续请求中重新解析；同时移除 `tokenEndpoint` / `issuerUrl` / `scopes` / `kiroApiKey` 等非 IdC 残留字段，并保留邮箱、API 区域、分组等与本次客户端注册无关的账号配置。
+- **Enterprise 不再静默降级**：重新登录请求未显式提供 Start URL 或区域时继承原凭据配置，不会把 Enterprise 账号按 Builder ID 默认端点重新注册。
+- **失败不再伪装成成功**：上游未返回 refresh token 时显式报错；失效 refresh token 归类为 HTTP 400，管理端可提示重新登录，而不是返回 500 或在未更新凭据时报告成功。
+- **收紧并发窗口**：强制刷新先取得凭据刷新锁再读取快照，避免与重新登录并发时继续使用旧凭据；完成内存替换后先释放全局刷新锁再持久化，防止文件写入阻塞其它账号刷新。
+- **合并后的健康状态一致**：重新登录会重置失败、禁用、自愈连续轮数、冷却时间与模型状态，但保留累计自愈次数；与本版新增的每凭据自愈状态可以共同工作。
 
 ### 🐛 问题背景
 
