@@ -366,6 +366,7 @@ Admin API 鉴权同样支持：
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
@@ -722,7 +723,7 @@ Admin 还提供：
 - 全局代理设置和代理池健康检查。
 - 负载均衡模式配置。
 - 账号级风控故障转移配置。
-- 全账号自愈治理配置（开关 / 冷却间隔 / 连续上限，含连续轮数与累计次数观测）。
+- 全账号自愈治理配置（403 封禁识别 / 自愈开关 / 冷却间隔 / 连续上限，含连续轮数与累计次数观测）。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
 
