@@ -123,6 +123,9 @@ export function CacheEngineDialog({
                 <p className="text-[11px] text-muted-foreground">
                   按 session / Key 隔离前缀；主 Key 无 session 时不模拟缓存。
                 </p>
+                <p className="text-[11px] text-amber-600 dark:text-amber-500">
+                  倍率不在这里 —— rust 引擎走顶栏「Token 膨胀倍率」那一套。
+                </p>
               </div>
               <div className="space-y-1">
                 <label className="text-xs text-muted-foreground">条目上限</label>

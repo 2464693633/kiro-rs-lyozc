@@ -187,10 +187,12 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <TrendingUp className="h-4 w-4" />
-              Token 用量膨胀倍率
+              Token 用量膨胀倍率（rust 引擎）
             </DialogTitle>
             <DialogDescription>
               设置返回给客户端的 token 用量膨胀倍率（1.0 = 不膨胀）。
+              这里的倍率作用于 <strong>rust 缓存引擎</strong>（引擎 A，默认）的 Key。
+              选了 <strong>go 引擎</strong> 的 Key 不受此处影响，它用「缓存引擎」里自己的三个倍率。
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleSaveInflation} className="space-y-3 py-2">
@@ -377,6 +379,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
         onChangeCooldown={controls.updateCooldown}
       />
       <InflationButton controls={controls} />
+      <CacheEngineButton onOpen={controls.openCacheEngineDialog} />
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
@@ -482,6 +485,20 @@ function InflationButton({ controls }: { controls: ToolControls }) {
             ? '膨胀中'
             : '倍率 1x'}
       </span>
+    </Button>
+  )
+}
+
+function CacheEngineButton({ onOpen }: { onOpen: () => void }) {
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={onOpen}
+      title="缓存模拟引擎参数（go 引擎专属倍率在此处）"
+    >
+      <Database className="h-3.5 w-3.5" />
+      <span className="hidden md:inline">缓存引擎</span>
     </Button>
   )
 }
