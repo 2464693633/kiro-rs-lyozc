@@ -17,6 +17,8 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::anthropic::cache_engine::CacheEngineKind;
+
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,6 +57,10 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+    /// 该 Key 使用哪套缓存模拟引擎。
+    /// 老数据无此字段，默认 `rust`（引擎 A），使既有 Key 行为完全不变。
+    #[serde(default, skip_serializing_if = "CacheEngineKind::is_default")]
+    pub cache_engine: CacheEngineKind,
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
@@ -145,8 +151,22 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
+        cache_engine: CacheEngineKind,
     ) -> ClientKey {
-        self.create_with_key(name, description, group, generate_client_key())
+        let entry = self.create_with_key(name, description, group, generate_client_key());
+        // 引擎选择在创建后单独落一次，避免改动 create_with_key 的既有签名
+        // （sync_system_key 也走它，那条路径必须保持默认引擎）。
+        if cache_engine != CacheEngineKind::default() {
+            self.update_meta(entry.id, None, None, None, Some(cache_engine));
+            return self
+                .inner
+                .read()
+                .entries
+                .get(&entry.id)
+                .cloned()
+                .unwrap_or(entry);
+        }
+        entry
     }
 
     /// 使用指定明文创建 Key；明文已存在时返回原条目。
@@ -179,6 +199,7 @@ impl ClientKeyManager {
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
+            cache_engine: CacheEngineKind::default(),
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -222,6 +243,7 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
+                    cache_engine: CacheEngineKind::default(),
                 },
             );
             changed = true;
@@ -298,6 +320,7 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
+        cache_engine: Option<CacheEngineKind>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -310,6 +333,10 @@ impl ClientKeyManager {
                 }
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
+                }
+                // None = 不变，与其余字段的可选语义一致
+                if let Some(engine) = cache_engine {
+                    e.cache_engine = engine;
                 }
                 true
             }
@@ -324,6 +351,16 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 返回指定 Key 选择的缓存模拟引擎；Key 不存在时回落默认（引擎 A）。
+    pub fn cache_engine_of(&self, id: u64) -> CacheEngineKind {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.cache_engine)
+            .unwrap_or_default()
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -529,16 +566,90 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
         assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         assert_eq!(mgr.verify_and_touch("nope"), None);
     }
 
+    /// 按 Key 选引擎：创建时可指定，`cache_engine_of` 能读回，`update_meta` 可改，
+    /// 传 None 表示不变。未知 id 回落默认（引擎 A）。
+    #[test]
+    fn per_key_cache_engine_selection() {
+        let mgr = ClientKeyManager::new();
+
+        // 默认创建 → 引擎 A
+        let a = mgr.create("a".into(), None, None, CacheEngineKind::default());
+        assert_eq!(mgr.cache_engine_of(a.id), CacheEngineKind::Rust);
+
+        // 创建时指定引擎 B
+        let b = mgr.create("b".into(), None, None, CacheEngineKind::Go);
+        assert_eq!(b.cache_engine, CacheEngineKind::Go, "返回的条目应带所选引擎");
+        assert_eq!(mgr.cache_engine_of(b.id), CacheEngineKind::Go);
+
+        // update_meta 传 Some 改引擎、传 None 不动
+        assert!(mgr.update_meta(a.id, None, None, None, Some(CacheEngineKind::Go)));
+        assert_eq!(mgr.cache_engine_of(a.id), CacheEngineKind::Go);
+        assert!(mgr.update_meta(a.id, Some("改名".into()), None, None, None));
+        assert_eq!(
+            mgr.cache_engine_of(a.id),
+            CacheEngineKind::Go,
+            "cache_engine 传 None 时不应被重置"
+        );
+
+        // 未知 id → 默认
+        assert_eq!(mgr.cache_engine_of(9999), CacheEngineKind::Rust);
+    }
+
+    /// 老数据缺 `cacheEngine` 字段时必须反序列化成引擎 A，且默认值不写回 JSON
+    /// （保持既有文件形状不变）。
+    #[test]
+    fn legacy_keys_default_to_rust_engine_and_field_is_omitted() {
+        let legacy = r#"[{
+            "id": 1, "key": "sk-legacy", "name": "老 Key",
+            "createdAt": "2026-01-01T00:00:00Z"
+        }]"#;
+        let keys: Vec<ClientKey> = serde_json::from_str(legacy).unwrap();
+        assert_eq!(keys[0].cache_engine, CacheEngineKind::Rust);
+
+        // 默认值不序列化
+        let json = serde_json::to_string(&keys[0]).unwrap();
+        assert!(
+            !json.contains("cacheEngine"),
+            "默认引擎不应写进 JSON，实际: {json}"
+        );
+
+        // 非默认值必须序列化
+        let mut go_key = keys[0].clone();
+        go_key.cache_engine = CacheEngineKind::Go;
+        let json = serde_json::to_string(&go_key).unwrap();
+        assert!(json.contains("\"cacheEngine\":\"go\""), "实际: {json}");
+    }
+
+    /// 系统 Key（id=0）经 `sync_system_key` 反复同步后，引擎选择必须存活。
+    #[test]
+    fn system_key_retains_cache_engine_across_sync() {
+        let mgr = ClientKeyManager::new();
+        mgr.sync_system_key("系统".into(), None, "key-v1".into());
+        assert_eq!(mgr.cache_engine_of(0), CacheEngineKind::Rust, "初始为默认");
+
+        assert!(mgr.update_meta(0, None, None, None, Some(CacheEngineKind::Go)));
+        assert_eq!(mgr.cache_engine_of(0), CacheEngineKind::Go);
+
+        // 轮换 apiKey：既有条目路径只改 key/disabled/is_system，引擎选择应保留。
+        mgr.sync_system_key("系统".into(), None, "key-v2".into());
+        assert_eq!(
+            mgr.cache_engine_of(0),
+            CacheEngineKind::Go,
+            "轮换系统 Key 不应重置引擎选择"
+        );
+        assert_eq!(mgr.verify_and_touch("key-v2"), Some(0));
+    }
+
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -548,7 +659,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None);
+        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -569,7 +680,7 @@ mod tests {
     #[test]
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()), CacheEngineKind::default());
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
@@ -611,6 +722,7 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
+            None,
         );
         mgr.record_usage(0, 100, 50, 5, 10, 1.5);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));

@@ -30,9 +30,10 @@ pub fn inflate_usage_in_json(
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_creation_mul: f64,
 ) {
     if let Some(usage) = json.get_mut("usage") {
-        inflate_usage_obj(usage, input_mul, output_mul, cache_mul);
+        inflate_usage_obj(usage, input_mul, output_mul, cache_mul, cache_creation_mul);
     }
 }
 
@@ -42,6 +43,7 @@ fn inflate_usage_obj(
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_creation_mul: f64,
 ) {
     if let Some(v) = usage.get("input_tokens").and_then(|v| v.as_i64()) {
         usage["input_tokens"] = serde_json::json!((v as f64 * input_mul).round() as i64);
@@ -50,7 +52,7 @@ fn inflate_usage_obj(
         usage["output_tokens"] = serde_json::json!((v as f64 * output_mul).round() as i64);
     }
     if let Some(v) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()) {
-        usage["cache_creation_input_tokens"] = serde_json::json!((v as f64 * cache_mul).round() as i64);
+        usage["cache_creation_input_tokens"] = serde_json::json!((v as f64 * cache_creation_mul).round() as i64);
     }
     if let Some(v) = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()) {
         usage["cache_read_input_tokens"] = serde_json::json!((v as f64 * cache_mul).round() as i64);
@@ -66,6 +68,7 @@ pub async fn handle_upstream_non_stream_response(
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_creation_mul: f64,
     cache_usage: CacheUsage,
 ) -> (Response, i32, i32, i32, i32) {
     let status = response.status();
@@ -104,7 +107,7 @@ pub async fn handle_upstream_non_stream_response(
     if let Some(usage) = json.get_mut("usage") {
         usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
         usage["output_tokens"] = serde_json::json!((real_output as f64 * output_mul).round() as i64);
-        usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_mul).round() as i64);
+        usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_creation_mul).round() as i64);
         usage["cache_read_input_tokens"] = serde_json::json!((sim_cr as f64 * cache_mul).round() as i64);
     }
 
@@ -127,6 +130,7 @@ fn inflate_sse_event(
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_creation_mul: f64,
     cache_usage: CacheUsage,
 ) -> String {
     let mut event_type: Option<&str> = None;
@@ -155,7 +159,7 @@ fn inflate_sse_event(
                 let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
                 if let Some(usage) = json.pointer_mut("/message/usage") {
                     usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
-                    usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_mul).round() as i64);
+                    usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_creation_mul).round() as i64);
                     usage["cache_read_input_tokens"] = serde_json::json!((sim_cr as f64 * cache_mul).round() as i64);
                 }
                 return format!("event: message_start\ndata: {}\n\n", json);
@@ -223,6 +227,7 @@ pub fn handle_upstream_stream_response_with_inflation(
     input_mul: f64,
     output_mul: f64,
     cache_mul: f64,
+    cache_creation_mul: f64,
     cache_usage: CacheUsage,
 ) -> (Response, tokio::sync::oneshot::Receiver<UpstreamStreamUsage>) {
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel::<UpstreamStreamUsage>();
@@ -254,7 +259,7 @@ pub fn handle_upstream_stream_response_with_inflation(
                 buffer = buffer[pos + 2..].to_string();
                 // 提取膨胀前用量（在 inflate 之前）
                 update_stream_stats(&event_text, &mut stats, cache_usage);
-                let inflated = inflate_sse_event(&event_text, input_mul, output_mul, cache_mul, cache_usage);
+                let inflated = inflate_sse_event(&event_text, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage);
                 if bytes_tx.send(Bytes::from(inflated)).await.is_err() {
                     // 客户端已断开
                     return;

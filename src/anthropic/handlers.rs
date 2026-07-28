@@ -52,6 +52,17 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    /// 缓存引擎句柄，用于在成功路径提交引擎 B 的写入（两阶段的第二阶段）。
+    cache_engines: super::cache_engine::CacheEngines,
+    /// 待提交的写入意图。
+    ///
+    /// 挂在 hook 上而非各 handler 的 return 处：`record` 已覆盖全部成功 / 失败
+    /// 路径（含流式那条已被 move 进闭包的），在此提交最不易漏。
+    ///
+    /// `Arc<Mutex<_>>` 而非裸 Mutex：本结构体是 `Clone` 的，各克隆必须共享同一
+    /// 个槽，否则某个克隆提交后其他克隆仍持有旧 profile 会重复写入。`take()`
+    /// 使提交天然幂等 —— 同一请求多次调 `record` 也只写一次。
+    pending_cache: std::sync::Arc<parking_lot::Mutex<Option<super::cache_engine::PendingCache>>>,
 }
 
 impl UsageRecordHook {
@@ -63,6 +74,21 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            cache_engines: state.cache_engines.clone(),
+            pending_cache: std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        }
+    }
+
+    /// 登记本次请求待提交的缓存写入。仅引擎 B 会产生非 `None` 的意图。
+    fn set_pending_cache(&self, pending: super::cache_engine::PendingCache) {
+        *self.pending_cache.lock() = Some(pending);
+    }
+
+    /// 提交缓存写入。只在 `status == "success"` 时调用，使失败请求不污染缓存
+    /// （对齐 Go：`Update` 只在成功分支执行）。
+    fn commit_pending_cache(&self) {
+        if let Some(pending) = self.pending_cache.lock().take() {
+            self.cache_engines.commit(pending);
         }
     }
 
@@ -99,6 +125,12 @@ impl UsageRecordHook {
         if let Some(a) = &self.aggregator {
             a.ingest(&rec);
         }
+        // 引擎 B 的第二阶段：仅成功时落写。放在 key_id 判断之外，因为系统 Key
+        // （id=0）的请求同样需要提交缓存。
+        if status == "success" {
+            self.commit_pending_cache();
+        }
+
         if status == "success" && self.key_id != 0 {
             if let Some(m) = &self.client_keys {
                 m.record_usage(
@@ -824,13 +856,16 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
-    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    // 缓存模拟：按客户端 Key 选中的引擎查缓存覆盖情况（estimate 口径）。
+    // 真实 input/cache 互斥分摊在拿到 total 真值时进行。
+    //
+    // 引擎 B 是两阶段的：此处只查，写入意图存进 hook，待 `record("success")` 时提交。
+    // 引擎 A 在 begin 内已完成查+写，其 pending 为 None、commit 是空操作。
+    let (cache_usage, cache_multipliers, pending_cache) =
+        state
+            .cache_engines
+            .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+    hook.set_pending_cache(pending_cache);
 
     // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
     // anthropic_body_raw 已在 override_thinking 前捕获，此处直接使用
@@ -856,6 +891,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_multipliers,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -883,6 +919,7 @@ pub async fn post_messages(
             known_tool_names,
             hook,
             cache_usage,
+            cache_multipliers,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -903,6 +940,7 @@ async fn handle_stream_request(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_multipliers: super::cache_engine::UsageMultipliers,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
@@ -920,9 +958,10 @@ async fn handle_stream_request(
     // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
-        let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+        let (input_mul, output_mul, cache_mul, cache_creation_mul) =
+        cache_multipliers.resolve(provider.get_inflation_multipliers());
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
-            call_result.response, input_mul, output_mul, cache_mul, cache_usage,
+            call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
         );
         // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
         tokio::spawn(async move {
@@ -957,10 +996,12 @@ async fn handle_stream_request(
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
     // 设置膨胀倍率
-    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+    let (input_mul, output_mul, cache_mul, cache_creation_mul) =
+        cache_multipliers.resolve(provider.get_inflation_multipliers());
     ctx.input_inflation_multiplier = input_mul;
     ctx.output_inflation_multiplier = output_mul;
     ctx.cache_inflation_multiplier = cache_mul;
+    ctx.cache_creation_inflation_multiplier = cache_creation_mul;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1160,12 +1201,14 @@ async fn handle_non_stream_request(
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_multipliers: super::cache_engine::UsageMultipliers,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
 ) -> Response {
     // 获取膨胀倍率（用于上游非流式和正常路径）
-    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+    let (input_mul, output_mul, cache_mul, cache_creation_mul) =
+        cache_multipliers.resolve(provider.get_inflation_multipliers());
 
     // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
     let call_result = match provider.call_api_dual(request_body, Some(anthropic_body), upstream_beta.as_deref(), Some(tracer.as_ref()), group.as_deref()).await {
@@ -1182,7 +1225,7 @@ async fn handle_non_stream_request(
         let credential_id = call_result.credential_id;
         let (resp, u_input, u_output, u_cache_creation, u_cache_read) =
             super::upstream::handle_upstream_non_stream_response(
-                call_result.response, input_mul, output_mul, cache_mul, cache_usage,
+                call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
             ).await;
         hook.record(credential_id, u_input, u_output, u_cache_creation, u_cache_read, 0.0, "success");
         tracer.finalize(
@@ -1382,7 +1425,9 @@ async fn handle_non_stream_request(
     // 应用膨胀倍率（返回给客户端的值）
     let inflated_input = (final_input_tokens as f64 * input_mul).round() as i32;
     let inflated_output = (output_tokens as f64 * output_mul).round() as i32;
-    let inflated_cache_creation = (cache_creation_tokens as f64 * cache_mul).round() as i32;
+    // creation 用独立倍率：go 引擎不缩放它（对齐 Go 只缩放 input / cache_read）。
+    let inflated_cache_creation =
+        (cache_creation_tokens as f64 * cache_creation_mul).round() as i32;
     let inflated_cache_read = (cache_read_tokens as f64 * cache_mul).round() as i32;
 
     // 构建 Anthropic 响应
@@ -1697,12 +1742,13 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
-        .cache_meter
-        .as_ref()
-        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
-        .unwrap_or_default();
+    // 缓存模拟：按客户端 Key 选中的引擎查缓存覆盖情况（estimate 口径）。
+    // 引擎 B 两阶段，写入意图存进 hook，待 `record("success")` 时提交。
+    let (cache_usage, cache_multipliers, pending_cache) =
+        state
+            .cache_engines
+            .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+    hook.set_pending_cache(pending_cache);
 
     // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
     // anthropic_body_raw 已在 override_thinking 前捕获，此处直接使用
@@ -1728,6 +1774,7 @@ pub async fn post_messages_cc(
             hook,
             total_input_tokens,
             cache_usage,
+            cache_multipliers,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -1755,6 +1802,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             cache_usage,
+            cache_multipliers,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -1778,6 +1826,7 @@ async fn handle_stream_request_buffered(
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
+    cache_multipliers: super::cache_engine::UsageMultipliers,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
@@ -1795,9 +1844,10 @@ async fn handle_stream_request_buffered(
     // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
-        let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
+        let (input_mul, output_mul, cache_mul, cache_creation_mul) =
+        cache_multipliers.resolve(provider.get_inflation_multipliers());
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
-            call_result.response, input_mul, output_mul, cache_mul, cache_usage,
+            call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
         );
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
@@ -1836,8 +1886,9 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
-    let (input_mul, output_mul, cache_mul) = provider.get_inflation_multipliers();
-    ctx.set_inflation_multipliers(input_mul, output_mul, cache_mul);
+    let (input_mul, output_mul, cache_mul, cache_creation_mul) =
+        cache_multipliers.resolve(provider.get_inflation_multipliers());
+    ctx.set_inflation_multipliers_split(input_mul, output_mul, cache_mul, cache_creation_mul);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);

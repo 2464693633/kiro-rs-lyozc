@@ -798,6 +798,9 @@ pub struct ClientKeyItem {
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
+    /// 该 Key 使用的缓存模拟引擎
+    #[serde(default)]
+    pub cache_engine: crate::anthropic::cache_engine::CacheEngineKind,
 }
 
 /// 客户端 Key 列表响应
@@ -817,6 +820,9 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 该 Key 使用哪套缓存模拟引擎。省略即 `rust`（引擎 A）。
+    #[serde(default)]
+    pub cache_engine: crate::anthropic::cache_engine::CacheEngineKind,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -829,6 +835,24 @@ pub struct CreateClientKeyResponse {
     pub created_at: String,
 }
 
+// ============ 双缓存模拟引擎 ============
+
+/// 两套引擎的参数（GET/PUT /config/cache-engines 共用同一形状）
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEnginesConfigPayload {
+    pub rust: crate::model::config::CacheEngineRustConfig,
+    pub go: crate::model::config::CacheEngineGoConfig,
+}
+
+/// 两套引擎的运行计数器
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEnginesStatsResponse {
+    pub rust: crate::anthropic::cache_metering::CacheMeterStats,
+    pub go: crate::anthropic::cache_metering_go::GoCacheStats,
+}
+
 /// 更新客户端 Key 元数据
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -837,6 +861,9 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 省略 = 不改动该 Key 的引擎选择。
+    #[serde(default)]
+    pub cache_engine: Option<crate::anthropic::cache_engine::CacheEngineKind>,
 }
 
 // ============ IdC 设备授权登录 ============

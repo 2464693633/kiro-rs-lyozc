@@ -23,12 +23,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
-/// 默认条目上限（防止内存无限增长）
+/// 默认条目上限（防止内存无限增长）。可经 `cacheEngineRust.capacity` 覆盖。
 const DEFAULT_CAPACITY: usize = 4096;
-/// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
+/// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）。可经 `cacheEngineRust.maxTtlSecs` 覆盖。
 const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
+/// 默认 TTL（5min，ephemeral 默认值）。可经 `cacheEngineRust.defaultTtlSecs` 覆盖。
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
 /// 单个缓存条目
@@ -105,10 +106,38 @@ impl CacheUsage {
     }
 }
 
+/// 引擎运行计数器快照（经 admin 暴露，用于对比两套引擎的实际命中率）。
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheMeterStats {
+    /// 当前有效条目数
+    pub entries: usize,
+    /// 条目上限
+    pub capacity: usize,
+    /// `compute_cache_usage` 产出 cache_read > 0 的次数
+    pub hits: u64,
+    /// `compute_cache_usage` 产出 cache_read == 0 的次数
+    pub misses: u64,
+    /// 容量超限被淘汰的条目数
+    pub evictions: u64,
+    /// TTL 过期被清理的条目数
+    pub expirations: u64,
+}
+
 /// 进程内提示词缓存
 pub struct CacheMeter {
     inner: Mutex<Inner>,
     persist_path: Option<PathBuf>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
+    expirations: AtomicU64,
+    /// 条目上限。原子量而非不可变字段，使 admin 改配置后无需重启即生效。
+    capacity: AtomicUsize,
+    /// 单条目最长 TTL（秒）
+    max_ttl_secs: AtomicI64,
+    /// 默认 TTL（秒），用于无显式 ttl 的 cache_control
+    default_ttl_secs: AtomicI64,
 }
 
 #[derive(Default)]
@@ -142,6 +171,44 @@ impl CacheMeter {
         Self {
             inner: Mutex::new(inner),
             persist_path,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            expirations: AtomicU64::new(0),
+            capacity: AtomicUsize::new(DEFAULT_CAPACITY),
+            max_ttl_secs: AtomicI64::new(MAX_TTL_SECS),
+            default_ttl_secs: AtomicI64::new(DEFAULT_TTL_SECS),
+        }
+    }
+
+    /// 带配置构造。`persist_path` 语义同 [`CacheMeter::new`]。
+    pub fn new_with_config(
+        persist_path: Option<PathBuf>,
+        config: crate::model::config::CacheEngineRustConfig,
+    ) -> Self {
+        let meter = Self::new(persist_path);
+        meter.apply_config(config);
+        meter
+    }
+
+    /// 热更新参数（admin 改配置后调用，无需重启）。
+    pub fn apply_config(&self, config: crate::model::config::CacheEngineRustConfig) {
+        let c = config.sanitized();
+        self.capacity.store(c.capacity, Ordering::Relaxed);
+        self.max_ttl_secs.store(c.max_ttl_secs, Ordering::Relaxed);
+        self.default_ttl_secs
+            .store(c.default_ttl_secs, Ordering::Relaxed);
+    }
+
+    /// 当前计数器快照。
+    pub fn stats(&self) -> CacheMeterStats {
+        CacheMeterStats {
+            entries: self.inner.lock().entries.len(),
+            capacity: self.capacity.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            expirations: self.expirations.load(Ordering::Relaxed),
         }
     }
 
@@ -170,7 +237,7 @@ impl CacheMeter {
     /// 把一组前缀段写入缓存（用于 miss 后登记 / 续期）。`ttl_secs` clip 到 [60, MAX_TTL_SECS]。
     pub fn record(&self, segment_hashes: &[u64], segment_tokens: &[u32], ttl_secs: i64) {
         debug_assert_eq!(segment_hashes.len(), segment_tokens.len());
-        let ttl = ttl_secs.clamp(60, MAX_TTL_SECS);
+        let ttl = ttl_secs.clamp(60, self.max_ttl_secs.load(Ordering::Relaxed).max(60));
         let now = now_secs();
         let expires_at = now + ttl;
         let mut inner = self.inner.lock();
@@ -186,8 +253,9 @@ impl CacheMeter {
         }
         inner.dirty = true;
         // 容量超限：按 last_hit_at 淘汰最旧的若干条
-        if inner.entries.len() > DEFAULT_CAPACITY {
-            let drop_n = inner.entries.len() - DEFAULT_CAPACITY;
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if inner.entries.len() > capacity {
+            let drop_n = inner.entries.len() - capacity;
             let mut victims: Vec<(u64, i64)> = inner
                 .entries
                 .iter()
@@ -196,6 +264,7 @@ impl CacheMeter {
             victims.sort_by_key(|x| x.1);
             for (k, _) in victims.into_iter().take(drop_n) {
                 inner.entries.remove(&k);
+                self.evictions.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -221,10 +290,7 @@ impl CacheMeter {
                 return;
             }
         };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Err(e) = std::fs::write(&path, json) {
+        if let Err(e) = crate::common::fs::write_file_atomic(&path, &json) {
             tracing::warn!("CacheMeter 落盘失败 {}: {}", path.display(), e);
         }
     }
@@ -250,8 +316,10 @@ impl CacheMeter {
         let mut inner = self.inner.lock();
         let before = inner.entries.len();
         inner.entries.retain(|_, v| v.expires_at > now);
-        if inner.entries.len() != before {
+        let removed = before - inner.entries.len();
+        if removed > 0 {
             inner.dirty = true;
+            self.expirations.fetch_add(removed as u64, Ordering::Relaxed);
         }
     }
 
@@ -271,10 +339,15 @@ fn now_secs() -> i64 {
 
 /// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒
 pub fn parse_ttl(ttl: Option<&str>) -> i64 {
+    parse_ttl_with_default(ttl, DEFAULT_TTL_SECS)
+}
+
+/// 同 [`parse_ttl`]，但缺省值来自配置（`cacheEngineRust.defaultTtlSecs`）。
+fn parse_ttl_with_default(ttl: Option<&str>, default_secs: i64) -> i64 {
     match ttl {
         Some(s) if s.eq_ignore_ascii_case("1h") => 3600,
         Some(s) if s.eq_ignore_ascii_case("5m") => 300,
-        _ => DEFAULT_TTL_SECS,
+        _ => default_secs,
     }
 }
 
@@ -320,7 +393,8 @@ struct Segment {
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
 /// 缓存互不命中——同一前缀只在同一会话内复用。
 pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u64) -> CacheUsage {
-    let (segments, prompt_total_est) = extract_segments(req, key_id);
+    let (segments, prompt_total_est) =
+        extract_segments(req, key_id, cache.default_ttl_secs.load(Ordering::Relaxed));
     if segments.is_empty() {
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
@@ -352,6 +426,13 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     }
 
     let deepest_hit = results.iter().rposition(|r| r.hit);
+    // 只统计真正做了查表的请求；无断点的早退分支不计入（对齐 Go 里 profile 为 nil
+    // 时在 defer 之前就 return 的行为），否则 miss 会被无缓存意图的请求灌满。
+    if deepest_hit.is_some() {
+        cache.hits.fetch_add(1, Ordering::Relaxed);
+    } else {
+        cache.misses.fetch_add(1, Ordering::Relaxed);
+    }
     // 被缓存覆盖的前缀 = 最深断点累计（最深断点之后的尾部是未缓存的真 input）。
     // 命中时 read = 命中段累计、creation = covered − read；全 miss 时 read = 0。
     let covered = *cum_tokens.last().unwrap();
@@ -382,7 +463,11 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 ///
 /// `key_id` 用于会话隔离：哈希以一个隔离种子起头（优先用 metadata session，否则
 /// key_id），种子不计入 token，只让不同会话的同前缀产生不同 hash → 互不命中。
-fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
+fn extract_segments(
+    req: &MessagesRequest,
+    key_id: u64,
+    default_ttl_secs: i64,
+) -> (Vec<Segment>, u32) {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     let mut cum_tokens: u32 = 0;
@@ -439,7 +524,7 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     // 导致 cache_read 恒为 0、全部记成 creation。
 
     // 统一 ttl：探测整个请求里出现过的最大 cache_control.ttl，否则默认 5m。
-    let ttl = detect_max_ttl(req);
+    let ttl = detect_max_ttl(req, default_ttl_secs);
 
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
     if let Some(tools) = req.tools.as_ref() {
@@ -567,11 +652,11 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 
 /// 探测请求里出现过的最大 cache_control.ttl（"1h" 优先于 "5m"）；
 /// 无任何 cache_control 时返回默认 5m。决定写入缓存段的存活时长。
-fn detect_max_ttl(req: &MessagesRequest) -> i64 {
-    let mut ttl = DEFAULT_TTL_SECS;
+fn detect_max_ttl(req: &MessagesRequest, default_secs: i64) -> i64 {
+    let mut ttl = default_secs;
     let mut bump = |cc: Option<&CacheControl>| {
         if let Some(cc) = cc {
-            ttl = ttl.max(parse_ttl(cc.ttl.as_deref()));
+            ttl = ttl.max(parse_ttl_with_default(cc.ttl.as_deref(), default_secs));
         }
     };
     if let Some(tools) = req.tools.as_ref() {
@@ -592,7 +677,7 @@ fn detect_max_ttl(req: &MessagesRequest) -> i64 {
                     .and_then(|cc| cc.get("ttl"))
                     .and_then(|t| t.as_str())
                 {
-                    ttl = ttl.max(parse_ttl(Some(t)));
+                    ttl = ttl.max(parse_ttl_with_default(Some(t), default_secs));
                 }
             }
         }
@@ -701,6 +786,79 @@ mod tests {
         }
         cache.evict_expired();
         assert_eq!(cache.len(), 0);
+    }
+
+    /// 常量→配置的迁移必须行为等价：默认配置产出的运行参数应与迁移前的硬编码
+    /// 常量逐一相同。若哪天默认值被改动，这条会失败并提示这是**行为变更**。
+    #[test]
+    fn default_config_matches_legacy_constants() {
+        let cfg = crate::model::config::CacheEngineRustConfig::default();
+        assert_eq!(cfg.capacity, DEFAULT_CAPACITY);
+        assert_eq!(cfg.max_ttl_secs, MAX_TTL_SECS);
+        assert_eq!(cfg.default_ttl_secs, DEFAULT_TTL_SECS);
+
+        // 走一遍构造，确认原子量确实被载入而非仍用常量。
+        let meter = CacheMeter::new_with_config(None, cfg);
+        let stats = meter.stats();
+        assert_eq!(stats.capacity, DEFAULT_CAPACITY);
+        assert_eq!(meter.max_ttl_secs.load(Ordering::Relaxed), MAX_TTL_SECS);
+        assert_eq!(
+            meter.default_ttl_secs.load(Ordering::Relaxed),
+            DEFAULT_TTL_SECS
+        );
+    }
+
+    /// 非法配置一律回落默认，避免误配把缓存彻底关掉。
+    #[test]
+    fn zero_and_negative_config_falls_back_to_defaults() {
+        let bad = crate::model::config::CacheEngineRustConfig {
+            capacity: 0,
+            max_ttl_secs: 0,
+            default_ttl_secs: -5,
+        };
+        let meter = CacheMeter::new_with_config(None, bad);
+        assert_eq!(meter.stats().capacity, DEFAULT_CAPACITY);
+        assert_eq!(meter.max_ttl_secs.load(Ordering::Relaxed), MAX_TTL_SECS);
+        assert_eq!(
+            meter.default_ttl_secs.load(Ordering::Relaxed),
+            DEFAULT_TTL_SECS
+        );
+    }
+
+    /// 计数器：命中 / 未命中分别累加，无断点的请求两者都不动。
+    #[test]
+    fn counters_track_hits_and_misses() {
+        let cache = CacheMeter::new(None);
+        let req = build_request_with_system_breakpoint();
+
+        let _ = compute_cache_usage(&cache, &req, 1);
+        assert_eq!(cache.stats().misses, 1, "首次应记 miss");
+        assert_eq!(cache.stats().hits, 0);
+
+        let _ = compute_cache_usage(&cache, &req, 1);
+        assert_eq!(cache.stats().hits, 1, "第二次应记 hit");
+        assert_eq!(cache.stats().misses, 1);
+
+        // 单条消息、无可缓存前缀 → 早退，不计入任何计数器。
+        use super::super::types::{Message, MessagesRequest};
+        let bare = MessagesRequest {
+            model: "m".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("hi".to_string()),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+        let _ = compute_cache_usage(&cache, &bare, 1);
+        let s = cache.stats();
+        assert_eq!((s.hits, s.misses), (1, 1), "无断点请求不应污染命中率");
     }
 
     #[test]

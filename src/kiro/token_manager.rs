@@ -3590,6 +3590,36 @@ impl MultiTokenManager {
 
         Ok(())
     }
+
+    /// 落盘两套缓存模拟引擎的参数。
+    ///
+    /// 写入的是已 `sanitized()` 的值，使磁盘内容与运行时生效值一致 —— 否则运维
+    /// 会看到文件里存着非法值而行为却是默认值。
+    pub fn persist_cache_engines_config(
+        &self,
+        rust: crate::model::config::CacheEngineRustConfig,
+        go: crate::model::config::CacheEngineGoConfig,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+
+        let config_path = match self.config.config_path() {
+            Some(path) => path.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，缓存引擎参数仅在当前进程生效");
+                return Ok(());
+            }
+        };
+
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.cache_engine_rust = rust.sanitized();
+        config.cache_engine_go = go.sanitized();
+        config
+            .save()
+            .with_context(|| format!("持久化缓存引擎配置失败: {}", config_path.display()))?;
+
+        Ok(())
+    }
 }
 
 impl Drop for MultiTokenManager {

@@ -35,6 +35,10 @@ pub struct AdminState {
     pub trace_store: SharedTraceStore,
     /// 账号分组注册表（持久化到 groups.json）
     pub groups: SharedGroupManager,
+    /// 引擎 A 句柄（读计数器 / 热改参数）
+    pub cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+    /// 引擎 B 句柄（读计数器 / 热改参数）
+    pub go_cache_tracker: Option<Arc<crate::anthropic::cache_metering_go::GoCacheTracker>>,
 }
 
 impl AdminState {
@@ -53,7 +57,23 @@ impl AdminState {
             usage_aggregator,
             trace_store,
             groups,
+            cache_meter: None,
+            go_cache_tracker: None,
         }
+    }
+
+    /// 注入两套缓存模拟引擎的句柄。
+    ///
+    /// 用 builder 而非扩 `new` 的参数表：`new` 已有 6 个位置参数，再加两个同类型
+    /// Option 极易在调用点写错顺序。
+    pub fn with_cache_engines(
+        mut self,
+        cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
+        go_cache_tracker: Option<Arc<crate::anthropic::cache_metering_go::GoCacheTracker>>,
+    ) -> Self {
+        self.cache_meter = cache_meter;
+        self.go_cache_tracker = go_cache_tracker;
+        self
     }
 }
 

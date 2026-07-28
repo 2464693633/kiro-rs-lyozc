@@ -575,6 +575,76 @@ pub async fn get_token_inflation_config(State(state): State<AdminState>) -> impl
     Json(state.service.get_token_inflation_config())
 }
 
+/// GET /api/admin/config/cache-engines
+///
+/// 返回磁盘配置经 `sanitized()` 后的值，即**运行时真正生效的参数**。直接回显原始
+/// 文件内容会在配置非法时误导运维（文件写 0，运行时其实用的是默认值）。
+pub async fn get_cache_engines_config(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = state.service.token_manager().config();
+    Json(super::types::CacheEnginesConfigPayload {
+        rust: config.cache_engine_rust.sanitized(),
+        go: config.cache_engine_go.sanitized(),
+    })
+}
+
+/// PUT /api/admin/config/cache-engines
+///
+/// 落盘后立即对两个 tracker 调 `apply_config`（内部是原子量），**无需重启生效**。
+pub async fn set_cache_engines_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::CacheEnginesConfigPayload>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+
+    let rust_cfg = payload.rust.sanitized();
+    let go_cfg = payload.go.sanitized();
+
+    if let Err(e) = state
+        .service
+        .token_manager()
+        .persist_cache_engines_config(rust_cfg, go_cfg)
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(super::types::AdminErrorResponse::internal_error(format!(
+                "写入配置失败: {e}"
+            ))),
+        )
+            .into_response();
+    }
+
+    if let Some(meter) = &state.cache_meter {
+        meter.apply_config(rust_cfg);
+    }
+    if let Some(tracker) = &state.go_cache_tracker {
+        tracker.apply_config(go_cfg);
+    }
+
+    Json(super::types::CacheEnginesConfigPayload {
+        rust: rust_cfg,
+        go: go_cfg,
+    })
+    .into_response()
+}
+
+/// GET /api/admin/cache-engines/stats
+///
+/// 引擎未启用时返回全零而非报错 —— 该端点用于仪表盘轮询，不该因此变红。
+pub async fn get_cache_engines_stats(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(super::types::CacheEnginesStatsResponse {
+        rust: state
+            .cache_meter
+            .as_ref()
+            .map(|m| m.stats())
+            .unwrap_or_default(),
+        go: state
+            .go_cache_tracker
+            .as_ref()
+            .map(|t| t.stats())
+            .unwrap_or_default(),
+    })
+}
+
 /// PUT /api/admin/config/token-inflation
 /// 设置 Token 膨胀倍率配置
 pub async fn set_token_inflation_config(
@@ -884,6 +954,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_read_tokens: k.total_cache_read_tokens,
         group: k.group.clone(),
         is_system: k.is_system,
+        cache_engine: k.cache_engine,
     }
 }
 
@@ -923,6 +994,7 @@ pub async fn create_client_key(
             .group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
+        payload.cache_engine,
     );
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -978,7 +1050,10 @@ pub async fn update_client_key(
             let t = g.trim();
             if t.is_empty() { None } else { Some(t.to_string()) }
         });
-    if state.client_keys.update_meta(id, payload.name, description, group) {
+    if state
+        .client_keys
+        .update_meta(id, payload.name, description, group, payload.cache_engine)
+    {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (

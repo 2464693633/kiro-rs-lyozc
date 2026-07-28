@@ -28,6 +28,8 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+    /// 该 Key 选择的缓存模拟引擎。老 Key 缺该字段时为 `Rust`（保持原行为）。
+    pub cache_engine: super::cache_engine::CacheEngineKind,
 }
 
 /// 应用共享状态
@@ -48,6 +50,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
+    /// 双缓存模拟引擎句柄。由客户端 Key 上的 `cacheEngine` 字段选择走哪一套。
+    pub cache_engines: super::cache_engine::CacheEngines,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -67,6 +71,7 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             cache_meter: None,
+            cache_engines: super::cache_engine::CacheEngines::default(),
             trace_store: None,
         }
     }
@@ -92,7 +97,18 @@ impl AppState {
 
     /// 注入缓存计量器
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
+        // 引擎 A 的句柄同时进 cache_engines，使接缝能路由到它。
+        self.cache_engines.rust = cache.clone();
         self.cache_meter = cache;
+        self
+    }
+
+    /// 注入引擎 B（go 缓存模拟引擎）。
+    pub fn with_go_cache_tracker(
+        mut self,
+        tracker: Option<std::sync::Arc<super::cache_metering_go::GoCacheTracker>>,
+    ) -> Self {
+        self.cache_engines.go = tracker;
         self
     }
 
@@ -123,10 +139,12 @@ pub async fn auth_middleware(
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
             let group = mgr.group_of(id);
+            let cache_engine = mgr.cache_engine_of(id);
             request.extensions_mut().insert(KeyContext {
                 key_id: id,
                 group,
                 key_source: TraceKeySource::ClientKey,
+                cache_engine,
             });
             return next.run(request).await;
         }

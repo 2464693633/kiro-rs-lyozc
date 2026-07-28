@@ -250,10 +250,25 @@ async fn main() {
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
-    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
-        cache_dir.join("cache_metering.json"),
-    )));
+    let cache_meter = std::sync::Arc::new(
+        anthropic::cache_metering::CacheMeter::new_with_config(
+            Some(cache_dir.join("cache_metering.json")),
+            config.cache_engine_rust,
+        ),
+    );
     cache_meter.clone().spawn_background();
+
+    // 引擎 B（go 缓存模拟引擎）。独立状态文件：与引擎 A 的哈希空间（u64 vs
+    // [u8;32]）和磁盘格式都不兼容，绝不可共用。`load()` 必须显式调用 ——
+    // 与引擎 A 的 `new` 自动载入不同。
+    let go_cache_tracker = std::sync::Arc::new(
+        anthropic::cache_metering_go::GoCacheTracker::new(
+            Some(cache_dir.join("cache_metering_go.json")),
+            config.cache_engine_go,
+        ),
+    );
+    go_cache_tracker.load();
+    go_cache_tracker.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
@@ -263,6 +278,7 @@ async fn main() {
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
+        Some(go_cache_tracker.clone()),
         trace_store.clone(),
     );
 
@@ -293,6 +309,10 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
+            )
+            .with_cache_engines(
+                Some(cache_meter.clone()),
+                Some(go_cache_tracker.clone()),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

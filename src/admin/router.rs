@@ -17,7 +17,8 @@ use super::{
         export_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool,
-        get_token_inflation_config, get_update_config,
+        get_cache_engines_config, get_cache_engines_stats, get_token_inflation_config,
+        get_update_config, set_cache_engines_config,
         list_client_keys, list_groups, list_traces, trace_failure_stats, poll_idc_login,
         poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
@@ -112,6 +113,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/token-inflation",
             get(get_token_inflation_config).put(set_token_inflation_config),
         )
+        .route(
+            "/config/cache-engines",
+            get(get_cache_engines_config).put(set_cache_engines_config),
+        )
+        .route("/cache-engines/stats", get(get_cache_engines_stats))
         .route(
             "/config/log-governance",
             get(get_log_governance_config).put(set_log_governance_config),

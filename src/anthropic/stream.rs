@@ -1383,8 +1383,14 @@ pub struct StreamContext {
     pub input_inflation_multiplier: f64,
     /// Output token 膨胀倍率
     pub output_inflation_multiplier: f64,
-    /// Cache token 膨胀倍率
+    /// `cache_read_input_tokens` 缩放倍率
     pub cache_inflation_multiplier: f64,
+    /// `cache_creation_input_tokens` 缩放倍率。
+    ///
+    /// 与 read 分开，是为了让 go 引擎对齐 Go 侧行为：Go 只缩放 input 与 cache_read，
+    /// creation 原样下发。若 creation 也跟着放大，两套引擎在「creation/read 划分」
+    /// 这个最关键的对比维度上就不可比了。引擎 A 两者取同值，行为不变。
+    pub cache_creation_inflation_multiplier: f64,
     /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
     /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
     /// 我们在文本出口处统计「同一短行连续重复了多少次」。
@@ -1453,6 +1459,7 @@ impl StreamContext {
             input_inflation_multiplier: 1.0,
             output_inflation_multiplier: 1.0,
             cache_inflation_multiplier: 1.0,
+            cache_creation_inflation_multiplier: 1.0,
             repeat_guard_last_line: String::new(),
             repeat_guard_run: 0,
             repeat_guard_tripped: false,
@@ -2466,7 +2473,8 @@ impl StreamContext {
         // 应用膨胀倍率（返回给客户端的值）
         let inflated_input = (final_input_tokens as f64 * self.input_inflation_multiplier).round() as i32;
         let inflated_output = (self.output_tokens as f64 * self.output_inflation_multiplier).round() as i32;
-        let inflated_cache_creation = (cache_creation as f64 * self.cache_inflation_multiplier).round() as i32;
+        let inflated_cache_creation =
+            (cache_creation as f64 * self.cache_creation_inflation_multiplier).round() as i32;
         let inflated_cache_read = (cache_read as f64 * self.cache_inflation_multiplier).round() as i32;
 
         // 生成最终事件（message_delta + message_stop）
@@ -2543,10 +2551,24 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
+    /// 设置缩放倍率。`cache` 同时作用于 creation 与 read（引擎 A 语义）。
+    /// go 引擎需要两者取不同值时用 [`Self::set_inflation_multipliers_split`]。
     pub fn set_inflation_multipliers(&mut self, input: f64, output: f64, cache: f64) {
+        self.set_inflation_multipliers_split(input, output, cache, cache);
+    }
+
+    /// 分别设置 creation / read 倍率。go 引擎传 `cache_creation = 1.0`（不缩放）。
+    pub fn set_inflation_multipliers_split(
+        &mut self,
+        input: f64,
+        output: f64,
+        cache_read: f64,
+        cache_creation: f64,
+    ) {
         self.inner.input_inflation_multiplier = input;
         self.inner.output_inflation_multiplier = output;
-        self.inner.cache_inflation_multiplier = cache;
+        self.inner.cache_inflation_multiplier = cache_read;
+        self.inner.cache_creation_inflation_multiplier = cache_creation;
     }
 
     /// 处理 Kiro 事件并缓冲结果

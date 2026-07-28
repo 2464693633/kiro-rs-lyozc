@@ -191,9 +191,188 @@ pub struct Config {
     #[serde(default = "default_inflation_multiplier")]
     pub cache_inflation_multiplier: f64,
 
+    /// rust 缓存模拟引擎参数（引擎 A，默认引擎）
+    #[serde(default)]
+    pub cache_engine_rust: CacheEngineRustConfig,
+
+    /// go 缓存模拟引擎参数（引擎 B，移植自 kiro-go）
+    #[serde(default)]
+    pub cache_engine_go: CacheEngineGoConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// rust 缓存模拟引擎（`anthropic::cache_metering`）参数。
+///
+/// 这些值原为源码内硬编码常量，提取为配置以便与 go 引擎独立调参。默认值与
+/// 提取前的常量完全一致，故缺省配置行为不变。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEngineRustConfig {
+    /// 条目上限，超出后按 `last_hit_at` 淘汰最旧
+    #[serde(default = "default_rust_cache_capacity")]
+    pub capacity: usize,
+    /// 单条目最长 TTL（秒），与 Anthropic `ttl="1h"` 对齐
+    #[serde(default = "default_rust_cache_max_ttl_secs")]
+    pub max_ttl_secs: i64,
+    /// 默认 TTL（秒），对应 ephemeral 缺省值
+    #[serde(default = "default_rust_cache_default_ttl_secs")]
+    pub default_ttl_secs: i64,
+}
+
+/// go 缓存模拟引擎（`anthropic::cache_metering_go`）参数。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEngineGoConfig {
+    /// 可缓存前缀占总 input 的上限比例，保证总有未缓存尾部（0, 1]
+    #[serde(default = "default_go_cache_max_ratio")]
+    pub max_ratio: f64,
+    /// 断点 TTL 上限（秒）。调小可让历史前缀更早过期，从而产出更多 creation
+    #[serde(default = "default_go_cache_ttl_seconds")]
+    pub ttl_seconds: i64,
+    /// 条目上限（LRU）
+    #[serde(default = "default_go_cache_max_entries")]
+    pub max_entries: usize,
+    /// 最小可缓存前缀 token 数，低于此值的断点不参与匹配 / 存储
+    #[serde(default = "default_go_min_cacheable_tokens")]
+    pub min_cacheable_tokens: i64,
+    /// Opus 系列的最小可缓存前缀 token 数
+    #[serde(default = "default_go_min_cacheable_tokens")]
+    pub opus_min_cacheable_tokens: i64,
+    /// 下发前对 `input_tokens` 的缩放倍率（go 引擎专属，不走全局膨胀倍率）
+    #[serde(default = "default_go_multiplier")]
+    pub input_token_multiplier: f64,
+    /// 下发前对 `cache_read_input_tokens` 的缩放倍率（go 引擎专属）
+    #[serde(default = "default_go_multiplier")]
+    pub cache_read_multiplier: f64,
+    /// 下发前对 `cache_creation_input_tokens` 的缩放倍率（go 引擎专属）。
+    ///
+    /// 默认 1.0（不缩放）= Go 原实现行为 —— Go 的 `buildClaudeUsageMap` 只缩放
+    /// `input_tokens` 与 `cache_read_input_tokens`，creation 原样下发。
+    ///
+    /// 调离 1.0 会偏离 Go 原实现，且会影响两套引擎在「creation/read 划分」这个
+    /// 维度上的可比性（数字差异将无法区分是引擎算法不同还是倍率不同造成的）。
+    #[serde(default = "default_go_multiplier")]
+    pub cache_creation_multiplier: f64,
+}
+
+fn default_rust_cache_capacity() -> usize {
+    4096
+}
+
+fn default_rust_cache_max_ttl_secs() -> i64 {
+    3600
+}
+
+fn default_rust_cache_default_ttl_secs() -> i64 {
+    300
+}
+
+fn default_go_cache_max_ratio() -> f64 {
+    0.85
+}
+
+fn default_go_cache_ttl_seconds() -> i64 {
+    300
+}
+
+fn default_go_cache_max_entries() -> usize {
+    131072
+}
+
+fn default_go_min_cacheable_tokens() -> i64 {
+    1024
+}
+
+fn default_go_multiplier() -> f64 {
+    1.0
+}
+
+impl Default for CacheEngineRustConfig {
+    fn default() -> Self {
+        Self {
+            capacity: default_rust_cache_capacity(),
+            max_ttl_secs: default_rust_cache_max_ttl_secs(),
+            default_ttl_secs: default_rust_cache_default_ttl_secs(),
+        }
+    }
+}
+
+impl Default for CacheEngineGoConfig {
+    fn default() -> Self {
+        Self {
+            max_ratio: default_go_cache_max_ratio(),
+            ttl_seconds: default_go_cache_ttl_seconds(),
+            max_entries: default_go_cache_max_entries(),
+            min_cacheable_tokens: default_go_min_cacheable_tokens(),
+            opus_min_cacheable_tokens: default_go_min_cacheable_tokens(),
+            input_token_multiplier: default_go_multiplier(),
+            cache_read_multiplier: default_go_multiplier(),
+            cache_creation_multiplier: default_go_multiplier(),
+        }
+    }
+}
+
+impl CacheEngineRustConfig {
+    /// 夹取到安全范围。0 / 负值一律回落默认，避免配置错误让缓存彻底失效。
+    pub fn sanitized(self) -> Self {
+        Self {
+            capacity: if self.capacity == 0 {
+                default_rust_cache_capacity()
+            } else {
+                self.capacity
+            },
+            max_ttl_secs: if self.max_ttl_secs <= 0 {
+                default_rust_cache_max_ttl_secs()
+            } else {
+                self.max_ttl_secs
+            },
+            default_ttl_secs: if self.default_ttl_secs <= 0 {
+                default_rust_cache_default_ttl_secs()
+            } else {
+                self.default_ttl_secs
+            },
+        }
+    }
+}
+
+impl CacheEngineGoConfig {
+    /// 夹取到安全范围（对齐 Go 侧 getter 的兜底逻辑）。
+    pub fn sanitized(self) -> Self {
+        Self {
+            // 命中率调节旋钮。范围对齐 Go admin 端点的 0.5–0.99：低于 0.5 会让
+            // 缓存几乎不起作用，等于 1.0 则整个 prompt 都可命中、下游永远看不到
+            // 未缓存尾部（不真实）。越界一律回落默认。
+            max_ratio: if self.max_ratio < 0.5 || self.max_ratio > 0.99 {
+                default_go_cache_max_ratio()
+            } else {
+                self.max_ratio
+            },
+            ttl_seconds: if self.ttl_seconds <= 0 {
+                default_go_cache_ttl_seconds()
+            } else {
+                self.ttl_seconds
+            },
+            // Go 侧有 256 下限，防止把缓存配到几乎不可用
+            max_entries: self.max_entries.max(256),
+            min_cacheable_tokens: self.min_cacheable_tokens.max(0),
+            opus_min_cacheable_tokens: self.opus_min_cacheable_tokens.max(0),
+            // Go 侧校验 `> 0`；NaN / inf 也一并挡掉，否则会污染整条下发口径。
+            input_token_multiplier: sanitize_multiplier(self.input_token_multiplier),
+            cache_read_multiplier: sanitize_multiplier(self.cache_read_multiplier),
+            cache_creation_multiplier: sanitize_multiplier(self.cache_creation_multiplier),
+        }
+    }
+}
+
+fn sanitize_multiplier(v: f64) -> f64 {
+    if v.is_finite() && v > 0.0 {
+        v
+    } else {
+        default_go_multiplier()
+    }
 }
 
 fn default_host() -> String {
@@ -311,6 +490,8 @@ impl Default for Config {
             input_inflation_multiplier: default_inflation_multiplier(),
             output_inflation_multiplier: default_inflation_multiplier(),
             cache_inflation_multiplier: default_inflation_multiplier(),
+            cache_engine_rust: CacheEngineRustConfig::default(),
+            cache_engine_go: CacheEngineGoConfig::default(),
             config_path: None,
         }
     }
@@ -374,5 +555,162 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cache_engine_config_tests {
+    use super::*;
+
+    /// 默认值必须等于引擎 A 迁移前的硬编码常量。这条与 `cache_metering.rs` 里的
+    /// `default_config_matches_legacy_constants` 互为两侧断言：任一侧改了默认值，
+    /// 都会被判为**行为变更**而非无害重构。
+    #[test]
+    fn rust_engine_defaults_match_legacy_constants() {
+        let c = CacheEngineRustConfig::default();
+        assert_eq!(c.capacity, 4096);
+        assert_eq!(c.max_ttl_secs, 3600);
+        assert_eq!(c.default_ttl_secs, 300);
+    }
+
+    #[test]
+    fn go_engine_defaults_match_go_source() {
+        let c = CacheEngineGoConfig::default();
+        assert_eq!(c.max_ratio, 0.85);
+        assert_eq!(c.ttl_seconds, 300);
+        assert_eq!(c.max_entries, 131072);
+        assert_eq!(c.min_cacheable_tokens, 1024);
+        // Go 侧两个常量当前同值，`minCacheableTokensForModel` 实为 no-op
+        assert_eq!(c.opus_min_cacheable_tokens, 1024);
+    }
+
+    /// 老配置文件完全没有这两个键时，必须反序列化成默认值而非报错。
+    #[test]
+    fn legacy_config_without_cache_engine_keys_deserializes() {
+        let json = r#"{"host":"127.0.0.1","port":8990,"region":"us-east-1"}"#;
+        let cfg: Config = serde_json::from_str(json).expect("老配置应可解析");
+        assert_eq!(cfg.cache_engine_rust.capacity, 4096);
+        assert_eq!(cfg.cache_engine_go.max_ratio, 0.85);
+    }
+
+    /// 嵌套结构存在但字段缺失时，逐字段回落默认。
+    #[test]
+    fn partial_cache_engine_config_falls_back_per_field() {
+        let json = r#"{
+            "host":"127.0.0.1","port":8990,"region":"us-east-1",
+            "cacheEngineGo": {"ttlSeconds": 60}
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.cache_engine_go.ttl_seconds, 60, "显式给的值应生效");
+        assert_eq!(cfg.cache_engine_go.max_ratio, 0.85, "缺失字段应回落默认");
+        assert_eq!(cfg.cache_engine_go.max_entries, 131072);
+    }
+
+    /// 非法值一律夹取回默认，避免误配把缓存彻底关掉（0 容量 = 永不命中）。
+    #[test]
+    fn sanitized_clamps_illegal_values() {
+        let bad_rust = CacheEngineRustConfig {
+            capacity: 0,
+            max_ttl_secs: 0,
+            default_ttl_secs: -5,
+        }
+        .sanitized();
+        assert_eq!(bad_rust.capacity, 4096);
+        assert_eq!(bad_rust.max_ttl_secs, 3600);
+        assert_eq!(bad_rust.default_ttl_secs, 300);
+
+        let bad_go = CacheEngineGoConfig {
+            max_ratio: 5.0,
+            ttl_seconds: 0,
+            max_entries: 1,
+            min_cacheable_tokens: -100,
+            opus_min_cacheable_tokens: -1,
+            input_token_multiplier: -3.0,
+            cache_read_multiplier: 0.0,
+            cache_creation_multiplier: f64::NAN,
+        }
+        .sanitized();
+        assert_eq!(bad_go.max_ratio, 0.85, "比例 > 1 非法");
+        assert_eq!(bad_go.ttl_seconds, 300);
+        assert_eq!(bad_go.max_entries, 256, "容量有 256 下限");
+        assert_eq!(bad_go.min_cacheable_tokens, 0, "负阈值夹到 0");
+        assert_eq!(bad_go.opus_min_cacheable_tokens, 0);
+    }
+
+    /// 命中率旋钮的合法区间是 [0.5, 0.99]，对齐 Go admin 端点的校验。
+    /// 两个端点值都必须被保留；越界（含 1.0）一律回落默认。
+    #[test]
+    fn ratio_range_matches_go_admin_validation() {
+        let at = |r: f64| {
+            CacheEngineGoConfig {
+                max_ratio: r,
+                ..CacheEngineGoConfig::default()
+            }
+            .sanitized()
+            .max_ratio
+        };
+        assert_eq!(at(0.5), 0.5, "下界应保留");
+        assert_eq!(at(0.99), 0.99, "上界应保留");
+        assert_eq!(at(0.7), 0.7);
+        // 1.0 意味着整个 prompt 都可命中、永无未缓存尾部 —— Go 也拒绝
+        assert_eq!(at(1.0), 0.85, "1.0 越界应回落默认");
+        assert_eq!(at(0.49), 0.85);
+        assert_eq!(at(0.0), 0.85);
+        assert_eq!(at(-1.0), 0.85);
+    }
+
+    /// go 引擎专属倍率：默认 1.0（不缩放），非法值回落。
+    #[test]
+    fn go_engine_multipliers_default_and_sanitize() {
+        let d = CacheEngineGoConfig::default();
+        assert_eq!(d.input_token_multiplier, 1.0);
+        assert_eq!(d.cache_read_multiplier, 1.0);
+
+        let ok = CacheEngineGoConfig {
+            input_token_multiplier: 2.5,
+            cache_read_multiplier: 0.3,
+            ..CacheEngineGoConfig::default()
+        }
+        .sanitized();
+        assert_eq!(ok.input_token_multiplier, 2.5, "合法倍率原样保留");
+        assert_eq!(ok.cache_read_multiplier, 0.3, "允许 < 1 缩小");
+
+        // Go 校验 `> 0`；NaN / inf 会污染整条下发口径，一并挡掉
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let c = CacheEngineGoConfig {
+                input_token_multiplier: bad,
+                cache_read_multiplier: bad,
+                ..CacheEngineGoConfig::default()
+            }
+            .sanitized();
+            assert_eq!(c.input_token_multiplier, 1.0, "非法值 {bad} 应回落");
+            assert_eq!(c.cache_read_multiplier, 1.0, "非法值 {bad} 应回落");
+        }
+    }
+
+    /// 合法值必须原样保留（`sanitized()` 不能顺手改动正常配置）。
+    #[test]
+    fn sanitized_preserves_legal_values() {
+        let c = CacheEngineGoConfig {
+            max_ratio: 0.5,
+            ttl_seconds: 1800,
+            max_entries: 4096,
+            min_cacheable_tokens: 2048,
+            opus_min_cacheable_tokens: 4096,
+            input_token_multiplier: 1.5,
+            cache_read_multiplier: 2.0,
+            cache_creation_multiplier: 0.5,
+        };
+        let s = c.sanitized();
+        // 幂等：再夹一次不应变化
+        assert_eq!(s.sanitized().max_ratio, s.max_ratio);
+        assert_eq!(s.sanitized().max_entries, s.max_entries);
+        assert_eq!(s.max_ratio, 0.5);
+        assert_eq!(s.ttl_seconds, 1800);
+        assert_eq!(s.max_entries, 4096);
+        assert_eq!(s.min_cacheable_tokens, 2048);
+        assert_eq!(s.opus_min_cacheable_tokens, 4096);
+        assert_eq!(s.input_token_multiplier, 1.5);
+        assert_eq!(s.cache_read_multiplier, 2.0);
     }
 }
