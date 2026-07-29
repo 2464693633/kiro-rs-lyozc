@@ -6,6 +6,7 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,7 +20,35 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
+use anyhow::anyhow;
 use parking_lot::Mutex;
+
+/// 将 Kiro 协议请求体转换为 Anthropic Messages API 格式。
+///
+/// 仅提取核心字段（model / messages / max_tokens），用于上游直通凭据在无
+/// anthropic_body 时的降级转换（如 admin 模型测试）。
+fn convert_kiro_to_anthropic_body(kiro_body: &str) -> anyhow::Result<String> {
+    let v: Value = serde_json::from_str(kiro_body)
+        .map_err(|e| anyhow!("kiro_body 解析失败: {}", e))?;
+
+    let model_id = v["conversationState"]["currentMessage"]["userInput"]["modelId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("kiro_body 缺少 modelId"))?;
+
+    let content = v["conversationState"]["currentMessage"]["userInput"]["content"]
+        .as_str()
+        .unwrap_or("test");
+
+    let anthropic_req = json!({
+        "model": model_id,
+        "messages": [{"role": "user", "content": content}],
+        "max_tokens": 1024,
+        "stream": false,
+    });
+
+    serde_json::to_string(&anthropic_req)
+        .map_err(|e| anyhow!("Anthropic body 序列化失败: {}", e))
+}
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -558,11 +587,19 @@ impl KiroProvider {
                 let body = match anthropic_body {
                     Some(b) => b.to_string(),
                     None => {
-                        // 没有提供 anthropic_body，无法走上游直通
-                        tracing::warn!("上游凭据 #{} 被选中但无 anthropic_body，跳过", ctx.id);
-                        self.token_manager.report_failure(ctx.id);
-                        last_error = Some(anyhow::anyhow!("上游凭据缺少 anthropic_body"));
-                        continue;
+                        // 没有 anthropic_body 时尝试从 kiro_body 转换（admin测试等场景）
+                        match convert_kiro_to_anthropic_body(request_body) {
+                            Ok(converted) => converted,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "上游凭据 #{} 无 anthropic_body 且 kiro_body 转换失败: {}",
+                                    ctx.id, e
+                                );
+                                self.token_manager.report_failure(ctx.id);
+                                last_error = Some(e);
+                                continue;
+                            }
+                        }
                     }
                 };
 
