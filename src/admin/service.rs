@@ -32,7 +32,8 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AddCredentialResponse, AssignProxyRequest,
     AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
     BatchAddProxyRequest, BatchImportEvent, CheckRateLimitRequest, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, EnableOverageAllResult, ExportedAccount,
@@ -40,7 +41,8 @@ use super::types::{
     LogGovernanceConfigResponse, ModelSelectionMode, ModelTestRequest, ModelTestResponse,
     PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
     ProxyPoolResponse, QuotaExceededResult, SelfHealConfigResponse,
-    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse,
     StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse,
     UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -2065,6 +2067,30 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取单账号 RPM 限流配置
+    pub fn get_account_rpm_limit_config(&self) -> AccountRpmLimitConfigResponse {
+        let (enabled, limit) = self.token_manager.get_account_rpm_limit_config();
+        AccountRpmLimitConfigResponse { enabled, limit }
+    }
+
+    /// 更新单账号 RPM 限流配置
+    pub fn set_account_rpm_limit_config(
+        &self,
+        req: SetAccountRpmLimitConfigRequest,
+    ) -> Result<AccountRpmLimitConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.limit.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 limit 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_rpm_limit_config(req.enabled, req.limit)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_rpm_limit_config())
     }
 
     /// 获取自愈治理配置
