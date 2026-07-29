@@ -5,8 +5,8 @@
 //!
 //! - 指纹取**结构化 wrapper 的 canonical JSON** 哈希，而非签名字符串
 //! - token 估算喂的是 canonical JSON，**结构噪声计入**
-//! - **无会话隔离**：全局共享指纹表，不同客户端 Key 的相同前缀会互相命中
-//!   （忠实移植 Go 行为；引擎 A 有隔离种子且主 Key 无 session 时拒绝模拟）
+//! - 按实际 Kiro credential 隔离缓存；同一账号的不同客户端 Key 共享前缀
+//!   （引擎 A 仍有额外的会话隔离规则）
 //! - **两阶段**：`compute` 只查、`update` 才写且只在请求成功后调用
 //!
 //! 不复刻 Go 的 HTML 转义：Go 逐字符串调 `json.Marshal` 会把 `<>&` 转成
@@ -609,7 +609,8 @@ pub struct GoCacheUsage {
 /// **无会话隔离**：`entries` 是全局表（忠实移植 Go 的 `C1: cross-account sharing`），
 /// 不同客户端 Key 的相同前缀会互相命中。这是与引擎 A 唯一的可观测行为差异。
 pub struct GoCacheTracker {
-    inner: Mutex<TrackerInner>,
+    /// Cache state is partitioned by the actual Kiro credential.
+    inner: Mutex<HashMap<u64, TrackerInner>>,
     persist_path: Option<std::path::PathBuf>,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -635,7 +636,7 @@ impl GoCacheTracker {
         config: crate::model::config::CacheEngineGoConfig,
     ) -> Self {
         let tracker = Self {
-            inner: Mutex::new(TrackerInner::default()),
+            inner: Mutex::new(HashMap::new()),
             persist_path,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -681,7 +682,7 @@ impl GoCacheTracker {
         );
     }
 
-    /// go 引擎专属倍率 `(input, cache_read, cache_creation)`。
+/// go 引擎专属倍率 `(input, cache_read, cache_creation)`。
     ///
     /// 这三个值**取代**全局膨胀倍率作用在 go 路径上：两套引擎各用自己的一组，
     /// 使各自下发口径可独立调参。`cache_creation` 默认 1.0（= Go 原实现只缩放
@@ -700,8 +701,9 @@ impl GoCacheTracker {
     }
 
     pub fn stats(&self) -> GoCacheStats {
+        let inner = self.inner.lock();
         GoCacheStats {
-            entries: self.inner.lock().entries.len(),
+            entries: inner.values().map(|state| state.entries.len()).sum(),
             capacity: self.max_entries.load(Ordering::Relaxed),
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -747,6 +749,15 @@ impl GoCacheTracker {
     /// 它覆盖的「本轮新内容」必然落进 cache_creation。若改成一次性先写后查，首轮
     /// 就会因刚写入的 `len-2` 断点而报出 cache_read —— 那是伪造读数。
     pub fn compute(&self, profile: &PromptCacheProfile) -> GoCacheUsage {
+        self.compute_for_account(0, profile)
+    }
+
+    /// Compute against the namespace of the actual Kiro credential.
+    pub fn compute_for_account(
+        &self,
+        account_id: u64,
+        profile: &PromptCacheProfile,
+    ) -> GoCacheUsage {
         if profile.breakpoints.is_empty() {
             return GoCacheUsage::default();
         }
@@ -756,8 +767,9 @@ impl GoCacheTracker {
         let last = profile.breakpoints.last().unwrap();
         let mut last_tokens = last.cumulative_tokens.min(profile.total_input_tokens);
 
-        let mut inner = self.inner.lock();
-        self.prune_expired_locked(&mut inner, now);
+        let mut all = self.inner.lock();
+        let inner = all.entry(account_id).or_default();
+        self.prune_expired_locked(inner, now);
 
         // 首个请求（表空）：只可能是 creation，且**不套 0.85 封顶**（对齐 Go）。
         if inner.entries.is_empty() {
@@ -824,23 +836,29 @@ impl GoCacheTracker {
 
     /// Go `Update`：把本轮断点写入表。**只应在请求成功后调用**，使失败请求不污染缓存。
     pub fn update(&self, profile: &PromptCacheProfile) {
+        self.update_for_account(0, profile)
+    }
+
+    /// Update the namespace of the actual Kiro credential after success.
+    pub fn update_for_account(&self, account_id: u64, profile: &PromptCacheProfile) {
         if profile.breakpoints.is_empty() {
             return;
         }
         let min_tokens = self.min_tokens_for(&profile.model);
         let now = self.now_ms();
 
-        let mut inner = self.inner.lock();
-        self.prune_expired_locked(&mut inner, now);
+        let mut all = self.inner.lock();
+        let inner = all.entry(account_id).or_default();
+        self.prune_expired_locked(inner, now);
 
         for bp in &profile.breakpoints {
             if bp.cumulative_tokens < min_tokens {
                 continue;
             }
-            self.put_locked(&mut inner, bp.fingerprint, now + bp.ttl_ms, bp.ttl_ms);
+            self.put_locked(inner, bp.fingerprint, now + bp.ttl_ms, bp.ttl_ms);
         }
         inner.dirty = true;
-        self.evict_overflow_locked(&mut inner);
+        self.evict_overflow_locked(inner);
     }
 
     fn put_locked(
@@ -911,9 +929,18 @@ impl GoCacheTracker {
             tracing::warn!("GoCacheTracker 状态文件损坏，按空表启动: {}", path.display());
             return;
         };
+        // Version 1 had one global namespace and cannot be safely attributed to
+        // credentials. Drop it rather than allowing a legacy cross-account hit.
+        if disk.version < 2 {
+            tracing::info!(
+                "忽略旧版 GoCacheTracker 状态文件（缺少账号隔离）: {}",
+                path.display()
+            );
+            return;
+        }
 
         let now = self.now_ms();
-        let mut inner = self.inner.lock();
+        let mut all = self.inner.lock();
         let mut loaded = 0usize;
         for e in disk.entries {
             if e.expires_at_ms <= now {
@@ -922,16 +949,19 @@ impl GoCacheTracker {
             let Some(fp) = decode_fingerprint(&e.fingerprint) else {
                 continue;
             };
-            self.put_locked(&mut inner, fp, e.expires_at_ms, e.ttl_ms);
+            let inner = all.entry(e.account_id).or_default();
+            self.put_locked(inner, fp, e.expires_at_ms, e.ttl_ms);
             loaded += 1;
         }
-        self.evict_overflow_locked(&mut inner);
-        inner.dirty = false;
+        for inner in all.values_mut() {
+            self.evict_overflow_locked(inner);
+            inner.dirty = false;
+        }
         if loaded > 0 {
             tracing::info!(
                 "GoCacheTracker 重建：从 {} 加载 {} 条有效记录",
                 path.display(),
-                inner.entries.len()
+                all.values().map(|state| state.entries.len()).sum::<usize>()
             );
         }
     }
@@ -943,25 +973,27 @@ impl GoCacheTracker {
         };
         let now = self.now_ms();
         let snapshot = {
-            let mut inner = self.inner.lock();
-            if !inner.dirty {
+            let mut all = self.inner.lock();
+            if !all.values().any(|state| state.dirty) {
                 return;
             }
-            inner.dirty = false;
-            inner
-                .entries
-                .iter()
-                .filter(|(_, e)| e.expires_at_ms > now)
-                .map(|(fp, e)| GoCacheDiskEntry {
-                    fingerprint: encode_fingerprint(fp),
-                    expires_at_ms: e.expires_at_ms,
-                    ttl_ms: e.ttl_ms,
-                })
-                .collect::<Vec<_>>()
+            let mut snapshot = Vec::new();
+            for (account_id, inner) in all.iter_mut() {
+                inner.dirty = false;
+                snapshot.extend(inner.entries.iter()
+                    .filter(|(_, e)| e.expires_at_ms > now)
+                    .map(|(fp, e)| GoCacheDiskEntry {
+                        account_id: *account_id,
+                        fingerprint: encode_fingerprint(fp),
+                        expires_at_ms: e.expires_at_ms,
+                        ttl_ms: e.ttl_ms,
+                    }));
+            }
+            snapshot
         };
 
         let disk = GoCacheDisk {
-            version: 1,
+            version: 2,
             entries: snapshot,
         };
         let json = match serde_json::to_vec(&disk) {
@@ -979,8 +1011,10 @@ impl GoCacheTracker {
     /// 清理过期条目（对外，供后台任务调用）。
     pub fn prune_expired(&self) {
         let now = self.now_ms();
-        let mut inner = self.inner.lock();
-        self.prune_expired_locked(&mut inner, now);
+        let mut all = self.inner.lock();
+        for inner in all.values_mut() {
+            self.prune_expired_locked(inner, now);
+        }
     }
 
     /// 启动后台周期任务：每分钟清过期 + 落盘。与引擎 A 各自独立一个任务，
@@ -1010,6 +1044,8 @@ struct GoCacheDisk {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GoCacheDiskEntry {
+    #[serde(default)]
+    account_id: u64,
     fingerprint: String,
     expires_at_ms: i64,
     ttl_ms: i64,
@@ -1766,27 +1802,32 @@ mod tests {
         assert_eq!(s.entries, 2, "应被夹到容量 2");
         assert_eq!(s.evictions, 1);
         // 保留的是后写入（序号更大）的两个。
-        let inner = t.inner.lock();
+        let all = t.inner.lock();
+        let inner = all.get(&0).unwrap();
         assert!(!inner.entries.contains_key(&p.breakpoints[0].fingerprint));
         assert!(inner.entries.contains_key(&p.breakpoints[1].fingerprint));
         assert!(inner.entries.contains_key(&p.breakpoints[2].fingerprint));
     }
 
-    /// 全局共享（无会话隔离）：这是与引擎 A 的刻意差异，非 bug。
-    /// 引擎 A 会因隔离种子不同而不命中；go 引擎按 Go 原行为互相命中。
+    /// 同一账号的不同客户端共享，相邻账号不共享。
     #[test]
-    fn fingerprints_are_globally_shared_across_keys() {
+    fn fingerprints_are_shared_within_account_only() {
         let t = tracker();
         // profile 不含任何 key 维度信息 —— 同内容必然同指纹。
         let a = profile_of(&convo(5), &t);
         let b = profile_of(&convo(5), &t);
         assert_eq!(a.breakpoints[0].fingerprint, b.breakpoints[0].fingerprint);
 
-        t.compute(&a);
-        t.update(&a);
+        t.compute_for_account(11, &a);
+        t.update_for_account(11, &a);
         assert!(
-            t.compute(&b).cache_read > 0,
-            "相同前缀跨 Key 互相命中（忠实移植 Go 的全局表）"
+            t.compute_for_account(11, &b).cache_read > 0,
+            "同一账号的不同客户端应共享前缀"
+        );
+        assert_eq!(
+            t.compute_for_account(12, &b).cache_read,
+            0,
+            "不同 Kiro 账号不得共享前缀"
         );
     }
 

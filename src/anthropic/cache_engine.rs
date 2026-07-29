@@ -20,7 +20,7 @@ pub enum CacheEngineKind {
     /// 引擎 A（现有实现，带会话隔离）。老数据缺该字段时的默认值。
     #[default]
     Rust,
-    /// 引擎 B（移植自 kiro-go，全局共享指纹表）。
+    /// 引擎 B（移植自 kiro-go，按实际账号共享指纹表）。
     Go,
 }
 
@@ -90,6 +90,31 @@ pub enum PendingCache {
 }
 
 impl CacheEngines {
+    /// 返回费用对比所需的两套客户端 token 倍率。
+    ///
+    /// Rust 始终使用全局倍率；Go 使用自身配置的倍率。Go 未启用时退回
+    /// Rust/全局倍率，避免未启用的引擎凭空改变 token 数。
+    pub fn billing_multipliers(
+        &self,
+        global: (f64, f64, f64),
+    ) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+        let rust = UsageMultipliers::Global.resolve(global);
+        let go = self
+            .go
+            .as_ref()
+            .map(|tracker| {
+                let (input, cache_read, cache_creation) = tracker.multipliers();
+                UsageMultipliers::Go {
+                    input,
+                    cache_read,
+                    cache_creation,
+                }
+                .resolve(global)
+            })
+            .unwrap_or(rust);
+        (rust, go)
+    }
+
     /// 阶段一：算出本次请求的缓存覆盖情况。
     ///
     /// 返回的 [`CacheUsage`] 是 estimate 口径，由调用方在拿到真实 total 后用
@@ -131,24 +156,74 @@ impl CacheEngines {
                     // 无断点：无缓存，但 Key 选的仍是 go 引擎，倍率照其配置生效。
                     return (CacheUsage::default(), muls, PendingCache::None);
                 };
-                let go_usage = tracker.compute(&profile);
-                let usage = CacheUsage {
-                    cache_read: go_usage.cache_read as i32,
-                    cache_covered_est: (go_usage.cache_creation + go_usage.cache_read) as i32,
-                    prompt_total_est: profile.total_input_tokens as i32,
-                };
-                (usage, muls, PendingCache::Go(profile))
+                // Provider selects the credential inside call_api*. Compute only after
+                // that selection so failover cannot reuse another account's cache.
+                (CacheUsage::default(), muls, PendingCache::Go(profile))
             }
         }
     }
 
+    /// Compute a Go profile in the namespace of the selected credential.
+    pub fn compute_pending(&self, pending: &PendingCache, account_id: u64) -> CacheUsage {
+        let PendingCache::Go(profile) = pending else {
+            return CacheUsage::default();
+        };
+        let Some(tracker) = self.go.as_ref() else {
+            return CacheUsage::default();
+        };
+        let usage = tracker.compute_for_account(account_id, profile);
+        CacheUsage {
+            cache_read: usage.cache_read as i32,
+            cache_covered_est: (usage.cache_creation + usage.cache_read) as i32,
+            prompt_total_est: profile.total_input_tokens as i32,
+        }
+    }
+
+    /// Compute both simulated engines for the billing comparison snapshot.
+    pub fn compute_billing_usage(
+        &self,
+        req: &MessagesRequest,
+        key_id: u64,
+        account_id: u64,
+        skip: Option<CacheEngineKind>,
+    ) -> (CacheUsage, CacheUsage) {
+        let rust = if skip == Some(CacheEngineKind::Rust) {
+            CacheUsage::default()
+        } else {
+            self.rust
+                .as_ref()
+                .map(|cache| super::cache_metering::compute_cache_usage(cache, req, key_id))
+                .unwrap_or_default()
+        };
+        let go = if skip == Some(CacheEngineKind::Go) {
+            CacheUsage::default()
+        } else {
+            self.go
+                .as_ref()
+                .and_then(|tracker| {
+                    build_claude_profile(req, 0, tracker.effective_ttl_ms()).map(|profile| {
+                        let total = profile.total_input_tokens as i32;
+                        let usage = tracker.compute_for_account(account_id, &profile);
+                        (usage, total)
+                    })
+                })
+                .map(|(usage, total)| CacheUsage {
+                    cache_read: usage.cache_read as i32,
+                    cache_covered_est: (usage.cache_creation + usage.cache_read) as i32,
+                    prompt_total_est: total,
+                })
+                .unwrap_or_default()
+        };
+        (rust, go)
+    }
+
     /// 阶段二：**仅在请求成功后调用**。引擎 A 走空分支。
-    pub fn commit(&self, pending: PendingCache) {
+    pub fn commit(&self, pending: PendingCache, account_id: u64) {
         match pending {
             PendingCache::None => {}
             PendingCache::Go(profile) => {
                 if let Some(tracker) = self.go.as_ref() {
-                    tracker.update(&profile);
+                    tracker.update_for_account(account_id, &profile);
                 }
             }
         }
@@ -264,6 +339,21 @@ mod tests {
     }
 
     #[test]
+    fn billing_multipliers_keep_rust_and_go_independent() {
+        let eng = engines();
+        eng.go.as_ref().unwrap().apply_config(CacheEngineGoConfig {
+            input_token_multiplier: 1.5,
+            cache_read_multiplier: 2.5,
+            cache_creation_multiplier: 0.75,
+            ..go_cfg()
+        });
+
+        let (rust, go) = eng.billing_multipliers((2.0, 3.0, 4.0));
+        assert_eq!(rust, (2.0, 3.0, 4.0, 4.0));
+        assert_eq!(go, (1.5, 1.0, 2.5, 0.75));
+    }
+
+    #[test]
     fn engine_kind_defaults_to_rust() {
         assert_eq!(CacheEngineKind::default(), CacheEngineKind::Rust);
         assert!(CacheEngineKind::Rust.is_default());
@@ -312,7 +402,7 @@ mod tests {
         let req = convo(5);
         let (_, _, pending) = eng.begin(&req, 1, CacheEngineKind::Rust);
         let before = eng.rust.as_ref().unwrap().stats();
-        eng.commit(pending);
+        eng.commit(pending, 1);
         let after = eng.rust.as_ref().unwrap().stats();
         assert_eq!(before.entries, after.entries);
         assert_eq!(before.hits, after.hits);
@@ -325,7 +415,8 @@ mod tests {
         let eng = engines();
         let req = convo(5);
 
-        let (usage, muls, pending) = eng.begin(&req, 1, CacheEngineKind::Go);
+        let (_, muls, pending) = eng.begin(&req, 1, CacheEngineKind::Go);
+        let usage = eng.compute_pending(&pending, 1);
         assert_eq!(usage.cache_read, 0, "首轮不得有 read");
         assert!(
             matches!(muls, UsageMultipliers::Go { .. }),
@@ -338,7 +429,7 @@ mod tests {
             "begin 不应写入任何条目"
         );
 
-        eng.commit(pending);
+        eng.commit(pending, 1);
         assert!(
             eng.go.as_ref().unwrap().stats().entries > 0,
             "commit 后才应有条目"
@@ -351,11 +442,12 @@ mod tests {
         let eng = engines();
 
         let (_, _, p1) = eng.begin(&convo(3), 1, CacheEngineKind::Go);
-        eng.commit(p1);
+        eng.commit(p1, 1);
 
-        let (usage, _, p2) = eng.begin(&convo(5), 1, CacheEngineKind::Go);
+        let (_, _, p2) = eng.begin(&convo(5), 1, CacheEngineKind::Go);
+        let usage = eng.compute_pending(&p2, 1);
         assert!(usage.cache_read > 0, "第二轮应命中已提交前缀");
-        eng.commit(p2);
+        eng.commit(p2, 1);
 
         // 下游共用的分摊链路：三者互斥相加必等于 total。
         let real_total = 12_345;
@@ -376,7 +468,7 @@ mod tests {
             // 引擎未启用时不该凭空缩放，倍率回落全局
             assert_eq!(muls, UsageMultipliers::Global);
             assert_eq!(usage.split_against_total(500), (500, 0, 0));
-            empty.commit(pending); // 不得 panic
+            empty.commit(pending, 1); // 不得 panic
         }
     }
 
@@ -386,7 +478,8 @@ mod tests {
         let eng = engines();
         let req = convo(5);
         let (a, _, _) = eng.begin(&req, 1, CacheEngineKind::Rust);
-        let (b, _, _) = eng.begin(&req, 1, CacheEngineKind::Go);
+        let (_, _, pending) = eng.begin(&req, 1, CacheEngineKind::Go);
+        let b = eng.compute_pending(&pending, 1);
         assert!(a.prompt_total_est > 0 && b.prompt_total_est > 0);
         // 结构噪声计入 → go 引擎的 estimate 总量应更大。
         assert!(

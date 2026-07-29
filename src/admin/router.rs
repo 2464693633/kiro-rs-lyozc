@@ -17,6 +17,7 @@ use super::{
         export_credentials,
         force_refresh_token,
         get_account_throttle_config,
+        get_billing_config,
         get_all_credentials,
         get_cache_engines_config,
         get_cache_engines_stats,
@@ -44,6 +45,7 @@ use super::{
         rollback_image_update,
         rotate_client_key,
         set_account_throttle_config,
+        set_billing_config,
         set_cache_engines_config,
         set_client_key_disabled,
         set_credential_disabled,
@@ -60,6 +62,7 @@ use super::{
         start_social_login,
         start_social_relogin,
         stats_by_credential,
+        stats_billing,
         stats_by_model,
         stats_overview,
         stats_timeseries,
@@ -155,6 +158,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_token_inflation_config).put(set_token_inflation_config),
         )
         .route(
+            "/config/billing",
+            get(get_billing_config).put(set_billing_config),
+        )
+        .route(
             "/config/cache-engines",
             get(get_cache_engines_config).put(set_cache_engines_config),
         )
@@ -225,6 +232,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
+        .route("/stats/billing", get(stats_billing))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(

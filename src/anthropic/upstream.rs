@@ -14,6 +14,7 @@ use std::convert::Infallible;
 
 use super::cache_metering::CacheUsage;
 use super::types::ErrorResponse;
+use crate::admin::usage_stats::TokenUsageBreakdown;
 
 /// 上游流式响应结束后回传给 handler 的用量统计（膨胀前，供 hook.record 使用）
 #[derive(Debug, Default)]
@@ -22,6 +23,7 @@ pub struct UpstreamStreamUsage {
     pub output_tokens: i32,
     pub cache_creation_tokens: i32,
     pub cache_read_tokens: i32,
+    pub raw_usage: TokenUsageBreakdown,
 }
 
 /// 对 JSON 响应体中的 usage 对象应用膨胀倍率（非流式）
@@ -70,7 +72,7 @@ pub async fn handle_upstream_non_stream_response(
     cache_mul: f64,
     cache_creation_mul: f64,
     cache_usage: CacheUsage,
-) -> (Response, i32, i32, i32, i32) {
+) -> (Response, i32, i32, i32, i32, TokenUsageBreakdown) {
     let status = response.status();
     let body = match response.text().await {
         Ok(b) => b,
@@ -80,7 +82,7 @@ pub async fn handle_upstream_non_stream_response(
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new("api_error", format!("读取上游响应失败: {}", e))),
             ).into_response();
-            return (resp, 0, 0, 0, 0);
+            return (resp, 0, 0, 0, 0, TokenUsageBreakdown::default());
         }
     };
 
@@ -92,13 +94,19 @@ pub async fn handle_upstream_non_stream_response(
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(body))
                 .unwrap();
-            return (resp, 0, 0, 0, 0);
+            return (resp, 0, 0, 0, 0, TokenUsageBreakdown::default());
         }
     };
 
     // 提取真实 token 数，计算总 input（用于模拟缓存分摊）
     let (real_input, real_output, real_cc, real_cr) = extract_usage(&json);
     let total_input = real_input + real_cc + real_cr;
+    let raw_usage = TokenUsageBreakdown {
+        input_tokens: real_input.max(0) as u64,
+        output_tokens: real_output.max(0) as u64,
+        cache_creation_tokens: real_cc.max(0) as u64,
+        cache_read_tokens: real_cr.max(0) as u64,
+    };
 
     // 用模拟缓存替换上游真实 Anthropic 缓存（与 Kiro 账号路径一致）
     let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
@@ -118,7 +126,7 @@ pub async fn handle_upstream_non_stream_response(
         .unwrap();
 
     // 返回膨胀前的模拟值供 hook.record 记录
-    (resp, sim_input, real_output, sim_cc, sim_cr)
+    (resp, sim_input, real_output, sim_cc, sim_cr, raw_usage)
 }
 
 /// 对单条 SSE 事件文本应用膨胀倍率（模拟缓存）。
@@ -200,6 +208,9 @@ fn update_stream_stats(
                 let i  = u.and_then(|v| v.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
                 let cc = u.and_then(|v| v.get("cache_creation_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
                 let cr = u.and_then(|v| v.get("cache_read_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
+                stats.raw_usage.input_tokens = i.max(0) as u64;
+                stats.raw_usage.cache_creation_tokens = cc.max(0) as u64;
+                stats.raw_usage.cache_read_tokens = cr.max(0) as u64;
                 let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total((i + cc + cr) as i32);
                 stats.input_tokens = sim_input;
                 stats.cache_creation_tokens = sim_cc;
@@ -210,6 +221,7 @@ fn update_stream_stats(
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(v) = json.pointer("/usage/output_tokens").and_then(|v| v.as_i64()) {
                     stats.output_tokens = v as i32;
+                    stats.raw_usage.output_tokens = v.max(0) as u64;
                 }
             }
         }

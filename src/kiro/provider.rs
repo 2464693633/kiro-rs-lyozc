@@ -240,7 +240,9 @@ impl KiroProvider {
     ) -> anyhow::Result<()> {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
-        if ctx.credentials.is_api_key_credential() {
+        if ctx.credentials.is_api_key_credential()
+            || ctx.credentials.is_upstream_credential()
+        {
             return Ok(());
         }
         let needs = match ctx.credentials.profile_arn.as_deref() {
@@ -318,6 +320,25 @@ impl KiroProvider {
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         self.call_api_with_retry(request_body, anthropic_body, upstream_beta, false, sink, group).await
+    }
+
+    /// 发送指定凭据的双协议测试请求，不参与账号池切换。
+    pub async fn call_api_dual_for_credential(
+        &self,
+        credential_id: u64,
+        request_body: &str,
+        anthropic_body: &str,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry_for_credential(
+            request_body,
+            Some(anthropic_body),
+            None,
+            false,
+            None,
+            None,
+            Some(credential_id),
+        )
+        .await
     }
 
     /// 发送流式双路径 API 请求（支持上游凭据直通）
@@ -528,6 +549,22 @@ impl KiroProvider {
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry_for_credential(
+            request_body, anthropic_body, upstream_beta, is_stream, sink, group, None,
+        )
+        .await
+    }
+
+    async fn call_api_with_retry_for_credential(
+        &self,
+        request_body: &str,
+        anthropic_body: Option<&str>,
+        upstream_beta: Option<&str>,
+        is_stream: bool,
+        sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
+        forced_credential_id: Option<u64>,
+    ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -541,7 +578,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match if let Some(id) = forced_credential_id {
+                self.token_manager.acquire_context_for(id).await
+            } else {
+                self.token_manager.acquire_context(model.as_deref(), group).await
+            } {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(

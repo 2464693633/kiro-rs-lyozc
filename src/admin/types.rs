@@ -260,6 +260,12 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 上游 Anthropic API Base URL（仅上游凭据可修改）
+    #[serde(default)]
+    pub upstream_base_url: Option<String>,
+    /// 上游 Anthropic API Key；空字符串表示清除（仅上游凭据可修改）
+    #[serde(default)]
+    pub upstream_api_key: Option<String>,
 }
 
 /// 添加凭据成功响应
@@ -417,6 +423,9 @@ pub struct AvailableModelItem {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelTestRequest {
+    /// 要测试的具体凭据；为空时兼容旧行为，按账号池选择。
+    #[serde(default)]
+    pub credential_id: Option<u64>,
     pub model_id: String,
 }
 
@@ -886,6 +895,52 @@ pub struct CacheEnginesConfigPayload {
 pub struct CacheEnginesStatsResponse {
     pub rust: crate::anthropic::cache_metering::CacheMeterStats,
     pub go: crate::anthropic::cache_metering_go::GoCacheStats,
+}
+
+// ============ 费用对比 ============
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricingPayload {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_creation_per_million: f64,
+    pub cache_read_per_million: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingConfigPayload {
+    pub model_prices: std::collections::HashMap<String, ModelPricingPayload>,
+    pub upstream_multipliers: std::collections::HashMap<u64, f64>,
+    pub rust_multiplier: f64,
+    pub go_multiplier: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingUsagePoint {
+    pub ts: String,
+    pub upstream_cost: f64,
+    pub rust_cost: f64,
+    pub go_cost: f64,
+    pub upstream_tokens: u64,
+    pub rust_tokens: u64,
+    pub go_tokens: u64,
+    pub calls: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingComparisonResponse {
+    pub points: Vec<BillingUsagePoint>,
+    pub upstream_cost: f64,
+    pub rust_cost: f64,
+    pub go_cost: f64,
+    pub upstream_tokens: u64,
+    pub rust_tokens: u64,
+    pub go_tokens: u64,
+    pub calls: u64,
 }
 
 /// 更新客户端 Key 元数据

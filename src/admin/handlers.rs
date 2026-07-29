@@ -21,6 +21,7 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        BillingConfigPayload,
         ClientKeyItem,
         ClientKeysResponse,
         CompleteSocialLoginRequest,
@@ -602,12 +603,36 @@ pub async fn get_token_inflation_config(State(state): State<AdminState>) -> impl
     Json(state.service.get_token_inflation_config())
 }
 
+/// GET /api/admin/config/billing
+pub async fn get_billing_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_billing_config())
+}
+
+/// PUT /api/admin/config/billing
+pub async fn set_billing_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<BillingConfigPayload>,
+) -> impl IntoResponse {
+    match state.service.set_billing_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/cache-engines
 ///
 /// 返回磁盘配置经 `sanitized()` 后的值，即**运行时真正生效的参数**。直接回显原始
 /// 文件内容会在配置非法时误导运维（文件写 0，运行时其实用的是默认值）。
 pub async fn get_cache_engines_config(State(state): State<AdminState>) -> impl IntoResponse {
-    let config = state.service.token_manager().config();
+    // 配置接口保存后 tracker 会热更新，但 TokenManager 内的 Config 是启动快照；
+    // 优先从磁盘读取，避免重新打开弹窗时回显旧倍率并覆盖刚保存的值。
+    let loaded = state
+        .service
+        .token_manager()
+        .config()
+        .config_path()
+        .and_then(|path| crate::model::config::Config::load(path).ok());
+    let config = loaded.as_ref().unwrap_or_else(|| state.service.token_manager().config());
     Json(super::types::CacheEnginesConfigPayload {
         rust: config.cache_engine_rust.sanitized(),
         go: config.cache_engine_go.sanitized(),
@@ -1379,6 +1404,23 @@ pub async fn stats_by_credential(
         })
         .collect();
     Json(enriched).into_response()
+}
+
+/// GET /api/admin/stats/billing?range=24h|7d|30d&granularity=hour|day&keyId=...
+pub async fn stats_billing(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let config = state.service.current_billing_config();
+    let cred_ids = group_to_cred_ids(&state, parse_group_filter(&params).as_deref());
+    let (_, summary) = state
+        .usage_aggregator
+        .query_billing(window, key_id, cred_ids.as_ref(), &config);
+    Json(summary).into_response()
 }
 
 /// GET /api/admin/traces

@@ -179,6 +179,10 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 上游 API Base URL（仅上游凭据） */
+  upstreamBaseUrl?: string
+  /** 上游 API Key；空字符串表示清除 */
+  upstreamApiKey?: string
 }
 
 // 更新 refreshToken 请求
@@ -508,6 +512,42 @@ export interface CredentialDistribution {
   inputTokens: number
   outputTokens: number
   errors: number
+}
+
+export interface ModelPricing {
+  inputPerMillion: number
+  outputPerMillion: number
+  cacheCreationPerMillion: number
+  cacheReadPerMillion: number
+}
+
+export interface BillingConfig {
+  modelPrices: Record<string, ModelPricing>
+  upstreamMultipliers: Record<string, number>
+  rustMultiplier: number
+  goMultiplier: number
+}
+
+export interface BillingUsagePoint {
+  ts: string
+  upstreamCost: number
+  rustCost: number
+  goCost: number
+  upstreamTokens: number
+  rustTokens: number
+  goTokens: number
+  calls: number
+}
+
+export interface BillingComparisonResponse {
+  points: BillingUsagePoint[]
+  upstreamCost: number
+  rustCost: number
+  goCost: number
+  upstreamTokens: number
+  rustTokens: number
+  goTokens: number
+  calls: number
 }
 
 // ============ 请求链路追踪 ============

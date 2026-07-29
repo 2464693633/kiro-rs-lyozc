@@ -43,6 +43,8 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [upstreamBaseUrl, setUpstreamBaseUrl] = useState(credential.upstreamBaseUrl ?? '')
+  const [upstreamApiKey, setUpstreamApiKey] = useState('')
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -62,6 +64,8 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setUpstreamBaseUrl(credential.upstreamBaseUrl ?? '')
+      setUpstreamApiKey('')
       setManualMode(false)
     }
   }, [open, credential])
@@ -81,6 +85,12 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          ...(credential.isUpstream
+            ? {
+                upstreamBaseUrl,
+                ...(upstreamApiKey ? { upstreamApiKey } : {}),
+              }
+            : {}),
         },
       },
       {
@@ -165,6 +175,29 @@ export function EditCredentialDialog({
                 纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
               </p>
             </div>
+
+            {/* 代理配置 */}
+            {credential.isUpstream && (
+              <div className="space-y-3 rounded-lg border p-3">
+                <div className="text-sm font-medium">上游 Anthropic API</div>
+                <Input
+                  placeholder="https://api.anthropic.com"
+                  value={upstreamBaseUrl}
+                  onChange={(e) => setUpstreamBaseUrl(e.target.value)}
+                  disabled={isPending}
+                />
+                <Input
+                  type="password"
+                  placeholder="留空表示不修改 API Key"
+                  value={upstreamApiKey}
+                  onChange={(e) => setUpstreamApiKey(e.target.value)}
+                  disabled={isPending}
+                />
+                <p className="text-xs text-muted-foreground">
+                  保存后会清除该账号的模型缓存；API Key 不会回显。
+                </p>
+              </div>
+            )}
 
             {/* 代理配置 */}
             <div className="space-y-2">

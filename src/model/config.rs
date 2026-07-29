@@ -239,6 +239,9 @@ pub struct Config {
     /// go 缓存模拟引擎参数（引擎 B，移植自 kiro-go）
     #[serde(default)]
     pub cache_engine_go: CacheEngineGoConfig,
+    /// Billing comparison prices and source multipliers.
+    #[serde(default)]
+    pub billing: BillingConfig,
     /// 自定义模型映射表。
     ///
     /// 每条把一个客户端模型别名映射到 Kiro 后端模型 ID 并附带元数据。默认空数组
@@ -287,7 +290,7 @@ pub struct CacheEngineGoConfig {
     #[serde(default = "default_go_min_cacheable_tokens")]
     pub min_cacheable_tokens: i64,
     /// Opus 系列的最小可缓存前缀 token 数
-    #[serde(default = "default_go_min_cacheable_tokens")]
+    #[serde(default = "default_go_opus_min_cacheable_tokens")]
     pub opus_min_cacheable_tokens: i64,
     /// 下发前对 `input_tokens` 的缩放倍率（go 引擎专属，不走全局膨胀倍率）
     #[serde(default = "default_go_multiplier")]
@@ -334,6 +337,60 @@ fn default_go_min_cacheable_tokens() -> i64 {
     1024
 }
 
+/// Per-million-token model prices used by the billing comparison view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelPricing {
+    #[serde(default)]
+    pub input_per_million: f64,
+    #[serde(default)]
+    pub output_per_million: f64,
+    #[serde(default)]
+    pub cache_creation_per_million: f64,
+    #[serde(default)]
+    pub cache_read_per_million: f64,
+}
+
+impl Default for ModelPricing {
+    fn default() -> Self {
+        Self {
+            input_per_million: 0.0,
+            output_per_million: 0.0,
+            cache_creation_per_million: 0.0,
+            cache_read_per_million: 0.0,
+        }
+    }
+}
+
+/// Billing comparison configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BillingConfig {
+    #[serde(default)]
+    pub model_prices: HashMap<String, ModelPricing>,
+    #[serde(default)]
+    pub upstream_multipliers: HashMap<u64, f64>,
+    #[serde(default = "default_inflation_multiplier")]
+    pub rust_multiplier: f64,
+    #[serde(default = "default_inflation_multiplier")]
+    pub go_multiplier: f64,
+}
+
+impl Default for BillingConfig {
+    fn default() -> Self {
+        Self {
+            model_prices: HashMap::new(),
+            upstream_multipliers: HashMap::new(),
+            rust_multiplier: 1.0,
+            go_multiplier: 1.0,
+        }
+    }
+}
+
+fn default_go_opus_min_cacheable_tokens() -> i64 {
+    4096
+}
+
 fn default_go_multiplier() -> f64 {
     1.0
 }
@@ -355,7 +412,7 @@ impl Default for CacheEngineGoConfig {
             ttl_seconds: default_go_cache_ttl_seconds(),
             max_entries: default_go_cache_max_entries(),
             min_cacheable_tokens: default_go_min_cacheable_tokens(),
-            opus_min_cacheable_tokens: default_go_min_cacheable_tokens(),
+            opus_min_cacheable_tokens: default_go_opus_min_cacheable_tokens(),
             input_token_multiplier: default_go_multiplier(),
             cache_read_multiplier: default_go_multiplier(),
             cache_creation_multiplier: default_go_multiplier(),
@@ -545,6 +602,7 @@ impl Default for Config {
             cache_inflation_multiplier: default_inflation_multiplier(),
             cache_engine_rust: CacheEngineRustConfig::default(),
             cache_engine_go: CacheEngineGoConfig::default(),
+            billing: BillingConfig::default(),
             custom_models: Vec::new(),
             config_path: None,
         }
@@ -634,8 +692,7 @@ mod cache_engine_config_tests {
         assert_eq!(c.ttl_seconds, 300);
         assert_eq!(c.max_entries, 131072);
         assert_eq!(c.min_cacheable_tokens, 1024);
-        // Go 侧两个常量当前同值，`minCacheableTokensForModel` 实为 no-op
-        assert_eq!(c.opus_min_cacheable_tokens, 1024);
+        assert_eq!(c.opus_min_cacheable_tokens, 4096);
     }
 
     /// 老配置文件完全没有这两个键时，必须反序列化成默认值而非报错。

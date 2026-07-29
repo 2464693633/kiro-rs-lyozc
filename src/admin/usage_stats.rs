@@ -49,6 +49,34 @@ pub struct UsageRecord {
     pub duration_ms: u64,
     /// "success" 或 "error"
     pub status: String,
+    /// True only for direct upstream Anthropic credentials.
+    #[serde(default)]
+    pub is_upstream: bool,
+    /// Raw upstream usage and the two simulated client usage snapshots.
+    #[serde(default)]
+    pub upstream_usage: Option<TokenUsageBreakdown>,
+    #[serde(default)]
+    pub rust_usage: Option<TokenUsageBreakdown>,
+    #[serde(default)]
+    pub go_usage: Option<TokenUsageBreakdown>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageBreakdown {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+impl TokenUsageBreakdown {
+    pub fn total_tokens(self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_creation_tokens)
+            .saturating_add(self.cache_read_tokens)
+    }
 }
 
 /// 按天 rotate 的 JSONL writer
@@ -180,6 +208,10 @@ pub struct BucketStats {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
+    pub upstream_usage: TokenUsageBreakdown,
+    pub rust_usage: TokenUsageBreakdown,
+    pub go_usage: TokenUsageBreakdown,
+    pub upstream_calls: u64,
 }
 
 impl BucketStats {
@@ -193,6 +225,12 @@ impl BucketStats {
         if rec.status != "success" {
             self.errors += 1;
         }
+        if rec.is_upstream {
+            self.upstream_calls += 1;
+            if let Some(v) = rec.upstream_usage { add_usage(&mut self.upstream_usage, v); }
+            if let Some(v) = rec.rust_usage { add_usage(&mut self.rust_usage, v); }
+            if let Some(v) = rec.go_usage { add_usage(&mut self.go_usage, v); }
+        }
     }
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
@@ -204,7 +242,18 @@ impl BucketStats {
         self.credits += other.credits;
         self.calls += other.calls;
         self.errors += other.errors;
+        add_usage(&mut self.upstream_usage, other.upstream_usage);
+        add_usage(&mut self.rust_usage, other.rust_usage);
+        add_usage(&mut self.go_usage, other.go_usage);
+        self.upstream_calls += other.upstream_calls;
     }
+}
+
+fn add_usage(dst: &mut TokenUsageBreakdown, src: TokenUsageBreakdown) {
+    dst.input_tokens += src.input_tokens;
+    dst.output_tokens += src.output_tokens;
+    dst.cache_creation_tokens += src.cache_creation_tokens;
+    dst.cache_read_tokens += src.cache_read_tokens;
 }
 
 /// 单个时间桶含分组数据
@@ -218,6 +267,8 @@ struct BucketEntry {
     by_credential: HashMap<u64, BucketStats>,
     by_key_model: HashMap<u64, HashMap<String, BucketStats>>,
     by_key_credential: HashMap<u64, HashMap<u64, BucketStats>>,
+    by_credential_model: HashMap<u64, HashMap<String, BucketStats>>,
+    by_key_credential_model: HashMap<u64, HashMap<u64, HashMap<String, BucketStats>>>,
 }
 
 /// 时间维度聚合器
@@ -559,6 +610,69 @@ impl UsageAggregator {
         out
     }
 
+    /// Billing comparison aggregated by time bucket. Only direct upstream records
+    /// contribute; native Kiro credentials are intentionally excluded.
+    pub fn query_billing(
+        &self,
+        window: StatsQueryWindow,
+        key_id: Option<u64>,
+        cred_filter: Option<&std::collections::HashSet<u64>>,
+        config: &crate::model::config::BillingConfig,
+    ) -> (Vec<crate::admin::types::BillingUsagePoint>, crate::admin::types::BillingComparisonResponse) {
+        let inner = self.inner.read();
+        let buckets = select_buckets(&inner, window.granularity);
+        let mut points = Vec::new();
+        let mut total = (0.0, 0.0, 0.0, 0u64, 0u64, 0u64, 0u64);
+        for bucket in buckets.iter().filter(|b| bucket_in_window(b, window)) {
+            let models = match key_id {
+                Some(id) => bucket.by_key_credential_model.get(&id),
+                None => Some(&bucket.by_credential_model),
+            };
+            let Some(models) = models else { continue };
+            let mut row = (0.0, 0.0, 0.0, 0u64, 0u64, 0u64, 0u64);
+            for (credential_id, model_map) in models {
+                if let Some(allow) = cred_filter {
+                    if !allow.contains(credential_id) { continue; }
+                }
+                let upstream_mul = config.upstream_multipliers.get(credential_id).copied().unwrap_or(1.0);
+                for (model, stats) in model_map {
+                    row.3 += stats.upstream_usage.total_tokens();
+                    row.4 += stats.rust_usage.total_tokens();
+                    row.5 += stats.go_usage.total_tokens();
+                    row.6 += stats.upstream_calls;
+                    if let Some(price) = config.model_prices.get(model) {
+                        row.0 += cost(stats.upstream_usage, price, upstream_mul);
+                        row.1 += cost(stats.rust_usage, price, config.rust_multiplier);
+                        row.2 += cost(stats.go_usage, price, config.go_multiplier);
+                    }
+                }
+            }
+            total.0 += row.0; total.1 += row.1; total.2 += row.2;
+            total.3 += row.3; total.4 += row.4; total.5 += row.5; total.6 += row.6;
+            points.push(crate::admin::types::BillingUsagePoint {
+                ts: ts_to_rfc3339(bucket.ts),
+                upstream_cost: row.0,
+                rust_cost: row.1,
+                go_cost: row.2,
+                upstream_tokens: row.3,
+                rust_tokens: row.4,
+                go_tokens: row.5,
+                calls: row.6,
+            });
+        }
+        let summary = crate::admin::types::BillingComparisonResponse {
+            points: points.clone(),
+            upstream_cost: total.0,
+            rust_cost: total.1,
+            go_cost: total.2,
+            upstream_tokens: total.3,
+            rust_tokens: total.4,
+            go_tokens: total.5,
+            calls: total.6,
+        };
+        (points, summary)
+    }
+
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
         let inner = self.inner.read();
@@ -661,6 +775,34 @@ fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
         .entry(rec.credential_id)
         .or_default()
         .add(rec);
+    bucket
+        .by_credential_model
+        .entry(rec.credential_id)
+        .or_default()
+        .entry(rec.model.clone())
+        .or_default()
+        .add(rec);
+    bucket
+        .by_key_credential_model
+        .entry(rec.key_id)
+        .or_default()
+        .entry(rec.credential_id)
+        .or_default()
+        .entry(rec.model.clone())
+        .or_default()
+        .add(rec);
+}
+
+fn cost(
+    usage: TokenUsageBreakdown,
+    price: &crate::model::config::ModelPricing,
+    multiplier: f64,
+) -> f64 {
+    let raw = usage.input_tokens as f64 * price.input_per_million
+        + usage.output_tokens as f64 * price.output_per_million
+        + usage.cache_creation_tokens as f64 * price.cache_creation_per_million
+        + usage.cache_read_tokens as f64 * price.cache_read_per_million;
+    raw / 1_000_000.0 * multiplier
 }
 
 fn bucket_matches_key(bucket: &BucketEntry, key_id: Option<u64>) -> bool {
@@ -742,6 +884,10 @@ mod tests {
             credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         agg.ingest(&rec);
         agg.ingest(&rec);
@@ -780,6 +926,10 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         let rec_b = UsageRecord {
             ts: now,
@@ -793,6 +943,10 @@ mod tests {
             credits: 0.02,
             duration_ms: 200,
             status: "error".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         agg.ingest(&rec_a);
         agg.ingest(&rec_b);
@@ -847,6 +1001,10 @@ mod tests {
             credits: 0.01,
             duration_ms: 100,
             status: "success".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         let rec_today = UsageRecord {
             ts: today_noon,
@@ -860,6 +1018,10 @@ mod tests {
             credits: 0.02,
             duration_ms: 100,
             status: "success".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
@@ -909,9 +1071,50 @@ mod tests {
             credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
+            is_upstream: false,
+            upstream_usage: None,
+            rust_usage: None,
+            go_usage: None,
         };
         agg.ingest(&rec);
         let ov = agg.overview();
         assert_eq!(ov.today_errors, 1);
+    }
+
+    #[test]
+    fn billing_query_calculates_upstream_and_engine_costs() {
+        let agg = UsageAggregator::new();
+        let rec = UsageRecord {
+            ts: Utc::now().to_rfc3339(),
+            key_id: 1,
+            credential_id: 9,
+            model: "m".to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.0,
+            duration_ms: 0,
+            status: "success".to_string(),
+            is_upstream: true,
+            upstream_usage: Some(TokenUsageBreakdown { input_tokens: 1_000_000, ..Default::default() }),
+            rust_usage: Some(TokenUsageBreakdown { input_tokens: 2_000_000, ..Default::default() }),
+            go_usage: Some(TokenUsageBreakdown { input_tokens: 3_000_000, ..Default::default() }),
+        };
+        agg.ingest(&rec);
+        let mut config = crate::model::config::BillingConfig::default();
+        config.model_prices.insert(
+            "m".to_string(),
+            crate::model::config::ModelPricing { input_per_million: 5.0, ..Default::default() },
+        );
+        config.upstream_multipliers.insert(9, 2.0);
+        config.rust_multiplier = 1.5;
+        config.go_multiplier = 0.5;
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let (_, result) = agg.query_billing(window, None, None, &config);
+        assert_eq!(result.upstream_cost, 10.0);
+        assert_eq!(result.rust_cost, 15.0);
+        assert_eq!(result.go_cost, 7.5);
+        assert_eq!(result.calls, 1);
     }
 }

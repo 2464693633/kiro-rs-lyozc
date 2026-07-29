@@ -79,7 +79,10 @@ export function AvailableModelsDialog({
     })
 
     try {
-      const data = await testMutation.mutateAsync(modelId)
+      const data = await testMutation.mutateAsync({
+        modelId,
+        credentialId: fixedCredentialId,
+      })
       if (requestSequence.current !== sequence) return
       setTestResults((current) => ({
         ...current,

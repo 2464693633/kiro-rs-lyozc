@@ -1739,6 +1739,33 @@ impl MultiTokenManager {
             .map(|(context, _)| context)
     }
 
+    /// 获取指定凭据的调用上下文，供 Admin 的单凭据测试使用。
+    pub async fn acquire_context_for(&self, id: u64) -> anyhow::Result<CallContext> {
+        let (credentials, disabled, throttled) = {
+            let entries = self.entries.lock();
+            let entry = entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据 #{} 不存在", id))?;
+            (
+                entry.credentials.clone(),
+                entry.disabled,
+                entry.throttled_until
+                    .map(|until| until > Instant::now())
+                    .unwrap_or(false),
+            )
+        };
+
+        if disabled {
+            anyhow::bail!("凭据 #{} 已禁用", id);
+        }
+        if throttled {
+            anyhow::bail!("凭据 #{} 正在冷却中", id);
+        }
+
+        self.try_ensure_token(id, &credentials).await
+    }
+
     /// 获取 API 调用上下文，并返回本次选择是否使用了 balanced 模式。
     ///
     /// `update_current` 仅应在真实业务请求中开启。Admin 模型发现需要复用同一套
@@ -3428,39 +3455,66 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        upstream_base_url: Option<Option<String>>,
+        upstream_api_key: Option<Option<String>>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
-            proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
+            proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some()
+                || upstream_base_url.is_some() || upstream_api_key.is_some();
         {
             let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
+            let index = entries
+                .iter()
+                .position(|e| e.id == id)
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            let mut updated = entries[index].credentials.clone();
+            if (upstream_base_url.is_some() || upstream_api_key.is_some())
+                && !updated.is_upstream_credential()
+            {
+                anyhow::bail!("只有上游 API 凭据可以修改 upstreamBaseUrl/upstreamApiKey");
+            }
 
             if let Some(v) = email {
-                entry.credentials.email = v.filter(|s| !s.is_empty());
+                updated.email = v.filter(|s| !s.is_empty());
             }
             if let Some(v) = proxy_url {
-                entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
+                updated.proxy_url = v.filter(|s| !s.is_empty());
             }
             if let Some(v) = proxy_username {
-                entry.credentials.proxy_username = v.filter(|s| !s.is_empty());
+                updated.proxy_username = v.filter(|s| !s.is_empty());
             }
             if let Some(v) = proxy_password {
-                entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
+                updated.proxy_password = v.filter(|s| !s.is_empty());
             }
             if let Some(g) = groups {
-                entry.credentials.groups = g
+                updated.groups = g
                     .into_iter()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
             }
             if let Some(v) = source_channel {
-                entry.credentials.source_channel =
+                updated.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
             }
+            if let Some(ref v) = upstream_base_url {
+                updated.upstream_base_url = v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(ref v) = upstream_api_key {
+                updated.upstream_api_key = v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if upstream_base_url.is_some() || upstream_api_key.is_some() {
+                validate_upstream_credential(&updated)?;
+                if let Some(fingerprint) = credential_dedup_fingerprint(&updated) {
+                    if entries.iter().enumerate().any(|(i, entry)| {
+                        i != index && credential_dedup_fingerprint(&entry.credentials).as_deref()
+                            == Some(fingerprint.as_str())
+                    }) {
+                        anyhow::bail!("上游 API 凭据已存在（Base URL + API Key 重复）");
+                    }
+                }
+            }
+            entries[index].credentials = updated;
         }
         if invalidate_models {
             self.invalidate_model_cache(id);
@@ -5338,9 +5392,11 @@ mod tests {
                 Some(Some("http://127.0.0.1:8080".to_string())),
                 None,
                 None,
-                None,
-                None,
-            )
+            None,
+            None,
+            None,
+            None,
+        )
             .unwrap();
 
         assert_eq!(

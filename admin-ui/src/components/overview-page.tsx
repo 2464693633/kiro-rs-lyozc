@@ -19,6 +19,7 @@ import type {
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
+import { BillingComparison } from '@/components/billing-comparison'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
 import { Input } from '@/components/ui/input'
 import {
@@ -128,6 +129,9 @@ export function OverviewPage() {
         timeText={timeLabel(filters.timeFilter)}
         groupFilterActive={groupFilterActive}
       />
+      <div className="mt-4">
+        <BillingComparison timeFilter={filters.timeFilter} statsFilter={filters.statsFilter} />
+      </div>
     </div>
   )
 }

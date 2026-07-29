@@ -164,10 +164,13 @@ export async function getCurrentCredentialModels(): Promise<AvailableModelsRespo
 }
 
 // 对所选模型发送真实的最小请求；超时时间略长于服务端的 90 秒上限
-export async function testModel(modelId: string): Promise<ModelTestResponse> {
+export async function testModel(
+  modelId: string,
+  credentialId?: number | null,
+): Promise<ModelTestResponse> {
   const { data } = await api.post<ModelTestResponse>(
     '/models/test',
-    { modelId },
+    { modelId, ...(credentialId != null ? { credentialId } : {}) },
     { timeout: 100000 },
   )
   return data

@@ -38,6 +38,8 @@ use super::types::{
     AvailableModelItem,
     AvailableModelsResponse,
     BalanceResponse,
+    BillingConfigPayload,
+    ModelPricingPayload,
     BatchAddProxyRequest,
     BatchImportEvent,
     CheckRateLimitRequest,
@@ -142,6 +144,70 @@ fn validate_model_id(model_id: &str) -> Result<&str, AdminServiceError> {
         ));
     }
     Ok(model_id)
+}
+
+fn extract_anthropic_test_text(bytes: &[u8]) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|e| anyhow::anyhow!("Anthropic 响应 JSON 解析失败: {}", e))?;
+    let content = value
+        .get("content")
+        .and_then(|value| value.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Anthropic 响应缺少 content 字段"))?;
+
+    let text = content
+        .iter()
+        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+
+    if text.trim().is_empty() {
+        anyhow::bail!("Anthropic 响应没有文本内容");
+    }
+    Ok(text)
+}
+
+#[cfg(test)]
+mod model_test_response_tests {
+    #[test]
+    fn extracts_text_from_anthropic_json() {
+        let body = br#"{
+            "content": [
+                {"type":"thinking","thinking":"internal"},
+                {"type":"text","text":"OK"}
+            ]
+        }"#;
+        assert_eq!(super::extract_anthropic_test_text(body).unwrap(), "OK");
+    }
+
+    #[test]
+    fn rejects_anthropic_json_without_text() {
+        let body = br#"{"content":[{"type":"thinking","thinking":"internal"}]}"#;
+        assert!(super::extract_anthropic_test_text(body).is_err());
+    }
+}
+
+fn normalize_upstream_base_url(value: &str) -> Result<String, AdminServiceError> {
+    let raw = value.trim();
+    let parsed = reqwest::Url::parse(raw)
+        .map_err(|e| AdminServiceError::InvalidCredential(format!("上游 Base URL 无效: {}", e)))?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(AdminServiceError::InvalidCredential(
+            "上游 Base URL 必须是 http/https 地址，且不能包含账号密码、查询参数或 fragment".to_string(),
+        ));
+    }
+    if parsed.path() != "" && parsed.path() != "/" {
+        return Err(AdminServiceError::InvalidCredential(
+            "上游 Base URL 不要包含 /v1 路径，系统会自动请求 /v1/messages 和 /v1/models".to_string(),
+        ));
+    }
+    Ok(raw.trim_end_matches('/').to_string())
 }
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
@@ -935,7 +1001,7 @@ impl AdminService {
         Ok(available_models_response(id, selection_mode, response))
     }
 
-    /// 对指定模型发送真实、最小化的 Kiro 请求。
+    /// 对指定模型发送真实、最小化请求，按凭据类型解析 Kiro 或 Anthropic 响应。
     pub async fn test_model(
         &self,
         request: ModelTestRequest,
@@ -959,18 +1025,53 @@ impl AdminService {
             additional_model_request_fields: None,
         })
         .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        let anthropic_body = serde_json::to_string(&serde_json::json!({
+            "model": model_id,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+            "stream": false,
+        }))
+        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let started = std::time::Instant::now();
-        let (credential_id, bytes) =
+        let (credential_id, is_upstream, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = provider.call_api(&body, None, None).await?;
+                let call = if let Some(credential_id) = request.credential_id {
+                    provider
+                        .call_api_dual_for_credential(
+                            credential_id,
+                            &body,
+                            &anthropic_body,
+                        )
+                        .await?
+                } else {
+                    provider
+                        .call_api_dual(&body, Some(&anthropic_body), None, None, None)
+                        .await?
+                };
                 let credential_id = call.credential_id;
+                let is_upstream = call.is_upstream;
                 let bytes = call.response.bytes().await?;
-                Ok::<_, anyhow::Error>((credential_id, bytes))
+                Ok::<_, anyhow::Error>((credential_id, is_upstream, bytes))
             })
             .await
             .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
             .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
+
+        if is_upstream {
+            let response_text = strip_tool_use_xml_leaks(
+                &extract_anthropic_test_text(&bytes)
+                    .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?,
+            );
+            return Ok(ModelTestResponse {
+                model_id: model_id.to_string(),
+                credential_id,
+                latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                response_text,
+                credit_usage: None,
+                credit_unit: None,
+            });
+        }
 
         let mut decoder = EventStreamDecoder::new();
         decoder
@@ -1238,6 +1339,20 @@ impl AdminService {
         let auth_method =
             normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
 
+        let has_upstream_base = req
+            .upstream_base_url
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_upstream_key = req
+            .upstream_api_key
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        if has_upstream_base != has_upstream_key {
+            return Err(AdminServiceError::InvalidCredential(
+                "上游 API 凭据必须同时提供 Base URL 和 API Key".to_string(),
+            ));
+        }
+
         // 企业 SSO 导入校验（安全边界）：
         // - 必须同时具备 clientId 与 tokenEndpoint（refresh_external_idp_token 的前提）；
         // - tokenEndpoint / issuerUrl 必须过 Microsoft allow-list，防止把 refreshToken
@@ -1308,7 +1423,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
-            upstream_base_url: req.upstream_base_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            upstream_base_url: req.upstream_base_url.map(|s| normalize_upstream_base_url(&s)).transpose()?,
             upstream_api_key: req.upstream_api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         };
 
@@ -1323,8 +1438,18 @@ impl AdminService {
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
         if fetch_balance {
-            if let Err(e) = self.get_balance(credential_id).await {
-                tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+            let is_upstream = self.token_manager.snapshot().entries.iter()
+                .find(|entry| entry.id == credential_id)
+                .map(|entry| entry.is_upstream)
+                .unwrap_or(false);
+            let verification = if is_upstream {
+                self.get_available_models(credential_id).await.map(|_| ())
+            } else {
+                self.get_balance(credential_id).await.map(|_| ())
+            };
+            if let Err(e) = verification {
+                let _ = self.delete_credential(credential_id);
+                return Err(e);
             }
         }
 
@@ -1384,6 +1509,23 @@ impl AdminService {
 
         // 3. 验活路径：显式取余额验活（OAuth 正常路径命中 add 内缓存；
         //    API Key 无 token 刷新，余额拉取即真正的验活，失败则回滚）。
+        let is_upstream = self.token_manager.snapshot().entries.iter()
+            .find(|entry| entry.id == resp.credential_id)
+            .map(|entry| entry.is_upstream)
+            .unwrap_or(false);
+        if is_upstream {
+            return match self.get_available_models(resp.credential_id).await {
+                Ok(_) => ImportItemResult {
+                    status: ImportStatus::Verified, credential_id: Some(resp.credential_id),
+                    email: resp.email, balance: None, error: None, rolled_back: false,
+                },
+                Err(e) => {
+                    let rolled_back = self.delete_credential(resp.credential_id).is_ok();
+                    ImportItemResult { status: ImportStatus::Failed, credential_id: Some(resp.credential_id),
+                        email: resp.email, balance: None, error: Some(e.to_string()), rolled_back }
+                }
+            };
+        }
         match self.get_balance(resp.credential_id).await {
             Ok(balance) => ImportItemResult {
                 status: ImportStatus::Verified,
@@ -1421,6 +1563,13 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        let upstream_base_url = req.upstream_base_url.map(|v| {
+            if v.trim().is_empty() { Ok(None) } else { normalize_upstream_base_url(&v).map(Some) }
+        }).transpose()?;
+        let upstream_api_key = req.upstream_api_key.map(|v| {
+            let value = v.trim().to_string();
+            if value.is_empty() { None } else { Some(value) }
+        });
         self.token_manager
             .update_credential(
                 id,
@@ -1434,6 +1583,8 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                upstream_base_url,
+                upstream_api_key,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2561,6 +2712,8 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // upstream_base_url 不修改
+                None,            // upstream_api_key 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2630,7 +2783,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;
@@ -3332,6 +3485,105 @@ impl AdminService {
             expires_at: expires_at.to_rfc3339(),
             poll_interval,
         })
+    }
+
+    pub fn get_billing_config(&self) -> BillingConfigPayload {
+        let config = self
+            .token_manager
+            .config()
+            .config_path()
+            .and_then(|path| Config::load(path).ok())
+            .unwrap_or_else(|| self.token_manager.config().clone());
+        billing_config_payload(&config.billing)
+    }
+
+    pub fn current_billing_config(&self) -> crate::model::config::BillingConfig {
+        self
+            .token_manager
+            .config()
+            .config_path()
+            .and_then(|path| Config::load(path).ok())
+            .map(|config| config.billing)
+            .unwrap_or_else(|| self.token_manager.config().billing.clone())
+    }
+
+    pub fn set_billing_config(
+        &self,
+        payload: BillingConfigPayload,
+    ) -> Result<BillingConfigPayload, AdminServiceError> {
+        if !payload.rust_multiplier.is_finite()
+            || payload.rust_multiplier < 0.0
+            || !payload.go_multiplier.is_finite()
+            || payload.go_multiplier < 0.0
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "客户端计费倍率必须是非负有限数字".to_string(),
+            ));
+        }
+        for (id, value) in &payload.upstream_multipliers {
+            if !value.is_finite() || *value < 0.0 {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "上游凭据 #{} 的计费倍率无效",
+                    id
+                )));
+            }
+        }
+        for (model, price) in &payload.model_prices {
+            for value in [
+                price.input_per_million,
+                price.output_per_million,
+                price.cache_creation_per_million,
+                price.cache_read_per_million,
+            ] {
+                if !value.is_finite() || value < 0.0 {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "模型 {} 的价格必须是非负有限数字",
+                        model
+                    )));
+                }
+            }
+        }
+        let path = self
+            .token_manager
+            .config()
+            .config_path()
+            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?
+            .to_path_buf();
+        let mut config = Config::load(&path)
+            .map_err(|e| AdminServiceError::InternalError(format!("读取配置失败: {}", e)))?;
+        config.billing = billing_config_from_payload(&payload);
+        config
+            .save()
+            .map_err(|e| AdminServiceError::InternalError(format!("保存费用配置失败: {}", e)))?;
+        Ok(payload)
+    }
+}
+
+fn billing_config_payload(config: &crate::model::config::BillingConfig) -> BillingConfigPayload {
+    BillingConfigPayload {
+        model_prices: config.model_prices.iter().map(|(key, value)| (key.clone(), ModelPricingPayload {
+            input_per_million: value.input_per_million,
+            output_per_million: value.output_per_million,
+            cache_creation_per_million: value.cache_creation_per_million,
+            cache_read_per_million: value.cache_read_per_million,
+        })).collect(),
+        upstream_multipliers: config.upstream_multipliers.clone(),
+        rust_multiplier: config.rust_multiplier,
+        go_multiplier: config.go_multiplier,
+    }
+}
+
+fn billing_config_from_payload(payload: &BillingConfigPayload) -> crate::model::config::BillingConfig {
+    crate::model::config::BillingConfig {
+        model_prices: payload.model_prices.iter().map(|(key, value)| (key.clone(), crate::model::config::ModelPricing {
+            input_per_million: value.input_per_million,
+            output_per_million: value.output_per_million,
+            cache_creation_per_million: value.cache_creation_per_million,
+            cache_read_per_million: value.cache_read_per_million,
+        })).collect(),
+        upstream_multipliers: payload.upstream_multipliers.clone(),
+        rust_multiplier: payload.rust_multiplier,
+        go_multiplier: payload.go_multiplier,
     }
 }
 
