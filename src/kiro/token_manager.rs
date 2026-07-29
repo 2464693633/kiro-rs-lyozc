@@ -3104,6 +3104,15 @@ impl MultiTokenManager {
                 .kiro_api_key
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else if credentials.is_upstream_credential() {
+            // 上游直通凭据没有 refreshToken / accessToken / expiresAt。必须在过期判断
+            // **之前**早退：`is_token_expired` 对无 expiresAt 的凭据返回 true（unwrap_or(true)），
+            // 会把它误送进 OAuth 刷新链路，最终由 `validate_refresh_token` 报「缺少 refreshToken」。
+            // 与 `try_ensure_token` 的分流顺序保持一致。
+            credentials
+                .upstream_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("上游凭据缺少 upstreamApiKey"))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
             let _guard = self.refresh_lock.lock().await;
             let current_creds = {
@@ -4189,6 +4198,33 @@ mod tests {
         assert!(result.is_ok(), "upstream add should succeed: {result:?}");
         assert_eq!(manager.snapshot().total, 1);
         assert_eq!(manager.available_count(), 1);
+    }
+
+    /// 上游直通凭据取 token 时**不得**落入 OAuth 刷新链路。
+    ///
+    /// 回归防护：`prepare_request_token` 曾漏掉 `is_upstream_credential` 分流，而
+    /// `is_token_expired` 对无 expiresAt 的凭据返回 true（`unwrap_or(true)`），
+    /// 于是上游凭据被误送去刷新，由 `validate_refresh_token` 报「缺少 refreshToken」——
+    /// 表现为管理面板「可用模型」对上游 API 账号报该错。
+    #[tokio::test]
+    async fn upstream_credential_prepares_token_without_refresh_token() {
+        let config = Config::default();
+
+        let mut upstream = KiroCredentials::default();
+        upstream.upstream_base_url = Some("https://maxapi.example.xyz".to_string());
+        upstream.upstream_api_key = Some("sk-upstream-abc".to_string());
+        // 刻意不给 refresh_token / access_token / expires_at —— 上游凭据本就没有这些
+
+        let manager = MultiTokenManager::new(config, vec![upstream], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        let (token, creds) = manager
+            .prepare_request_token(id)
+            .await
+            .expect("上游凭据应能取到 token，而非报缺少 refreshToken");
+
+        assert_eq!(token, "sk-upstream-abc", "应直接返回 upstreamApiKey");
+        assert!(creds.is_upstream_credential());
     }
 
     #[tokio::test]
