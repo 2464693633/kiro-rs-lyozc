@@ -42,7 +42,7 @@
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
-- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
+- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key、**上游直通 API（Anthropic / 兼容 API）**。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
@@ -50,7 +50,7 @@
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
-- **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
+- **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop；上游直通凭据自动透传至 Anthropic 原生 WebSearch。
 - **图像处理**：入站图片按环境变量自动缩放 / 重编码，降低 AWS Q 单字段大小限制导致的 400 风险。
 - **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
@@ -483,6 +483,43 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 KIRO_API_KEY=ksk_xxx ./kiro-rs
 ```
 
+#### 上游直通 API
+
+```json
+{
+  "upstreamBaseUrl": "https://api.anthropic.com",
+  "upstreamApiKey": "sk-ant-xxx"
+}
+```
+
+**用途**：绕过 Kiro 协议，直接透传请求到 Anthropic 官方 API 或其它兼容端点（如第三方中转 API）。适用于：
+
+- 混合部署：同时使用 Kiro 账号和官方 Anthropic API Key
+- 中转接入：通过 kiro-rs 统一管理多个第三方 API 提供商
+- 功能测试：对比 Kiro 协议与原生 Anthropic 协议的行为差异
+
+**工作机制**：
+
+- 请求路径：客户端 → kiro-rs `/v1/messages` → `upstreamBaseUrl/v1/messages`（原样透传 Anthropic Messages API 格式）
+- 凭据路由：与 Kiro 凭据共享同一个凭据池和故障转移机制，按优先级、可用性和模型支持自动选择
+- WebSearch：检测到 `tools: [{"type": "web_search_20250610"}]` 时，直接透传给上游（由 Anthropic 原生处理），不走 kiro-rs 的 MCP 搜索路径
+- 管理功能：支持查询可用模型、真实测试、余额查询（需上游 API 兼容对应端点）
+
+**字段说明**：
+
+- `upstreamBaseUrl`：上游 API 基础 URL（必填，仅到域名，如 `https://api.anthropic.com`，不要带 `/v1/messages` 路径）
+- `upstreamApiKey`：上游 API Key（必填，格式 `sk-ant-*` 或第三方格式）
+- 其它字段（`priority`、`proxyUrl`、`disabled` 等）与 Kiro 凭据通用
+
+**凭据判定**：同时存在 `upstreamBaseUrl` 和 `upstreamApiKey` 且均非空时识别为上游直通凭据。
+
+**注意事项**：
+
+- 上游凭据**不支持** Kiro 独有功能（如 `profileArn`、MCP 工具调用等）
+- 模型列表和可用性完全取决于上游 API，kiro-rs 不做额外过滤或映射
+- 请求体必须符合 Anthropic Messages API 格式（`model`、`messages`、`max_tokens` 等）
+- 上游 API 的限流、计费、错误码由上游控制，kiro-rs 只负责转发和重试
+
 ### 凭据字段
 
 | 字段 | 说明 |
@@ -645,7 +682,9 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 }
 ```
 
-纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
+**Kiro 凭据**：纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
+
+**上游直通凭据**：检测到请求带 `web_search` tool 且命中上游凭据时，kiro-rs 会将原始请求（包含 `tools` 字段）直接透传给上游 Anthropic API，由 Anthropic 原生处理 WebSearch（自 2025-06-10 起支持 `web_search_20250610` tool）。响应原样返回，不经过 kiro-rs 的 MCP 路径。这样上游凭据可以使用 Anthropic 的最新 WebSearch 能力，无需 kiro-rs 适配。
 
 <a id="images"></a>
 ## 图片处理
