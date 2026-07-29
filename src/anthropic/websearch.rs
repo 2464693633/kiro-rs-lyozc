@@ -560,6 +560,81 @@ pub async fn handle_websearch_request(
     input_tokens: i32,
     group: Option<&str>,
 ) -> Response {
+    // 上游凭据直通：Anthropic 原生支持 web_search_20250610 tool，直接透传请求。
+    // 提前 acquire 一次以判断凭据类型（后续 call_api_dual 内部会再 acquire，
+    // 但因为同一 group 且短时间内，走同一凭据的概率极高）。
+    match provider.token_manager().acquire_context(Some(&payload.model), group).await {
+        Ok(ctx) if ctx.credentials.is_upstream_credential() => {
+            tracing::info!(
+                credential_id = ctx.id,
+                "上游凭据的 WebSearch 请求直接透传至上游 Anthropic API"
+            );
+            let anthropic_body = match serde_json::to_string(payload) {
+                Ok(b) => b,
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ErrorResponse::new(
+                            "internal_error",
+                            &format!("序列化请求失败: {}", e),
+                        )),
+                    )
+                        .into_response();
+                }
+            };
+            // 透传给上游，由 Anthropic 原生处理 web_search tool
+            return match provider
+                .call_api_dual(&anthropic_body, Some(&anthropic_body), None, None, group)
+                .await
+            {
+                Ok(result) => {
+                    // 上游响应是 reqwest::Response，转为 axum Response
+                    let status = result.response.status();
+                    match result.response.bytes().await {
+                        Ok(body) => {
+                            let mut response = axum::response::Response::new(axum::body::Body::from(body));
+                            *response.status_mut() = status;
+                            response.headers_mut().insert(
+                                axum::http::header::CONTENT_TYPE,
+                                axum::http::HeaderValue::from_static("application/json"),
+                            );
+                            response
+                        }
+                        Err(e) => {
+                            tracing::warn!("读取上游 WebSearch 响应失败: {}", e);
+                            (
+                                StatusCode::BAD_GATEWAY,
+                                Json(ErrorResponse::new("upstream_error", &format!("读取响应失败: {}", e))),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("上游 WebSearch 请求失败: {}", e);
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(ErrorResponse::new("upstream_error", &e.to_string())),
+                    )
+                        .into_response()
+                }
+            };
+        }
+        Ok(_) => {
+            // Kiro 凭据走 MCP 路径（现有逻辑）
+        }
+        Err(e) => {
+            tracing::warn!("WebSearch acquire_context 失败: {}", e);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse::new("no_available_credentials", &e.to_string())),
+            )
+                .into_response();
+        }
+    }
+
+    // === 以下为 Kiro 凭据的 MCP WebSearch 路径（保持不变） ===
+
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
