@@ -31,11 +31,11 @@ fn convert_kiro_to_anthropic_body(kiro_body: &str) -> anyhow::Result<String> {
     let v: Value = serde_json::from_str(kiro_body)
         .map_err(|e| anyhow!("kiro_body 解析失败: {}", e))?;
 
-    let model_id = v["conversationState"]["currentMessage"]["userInput"]["modelId"]
+    let model_id = v["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
         .as_str()
         .ok_or_else(|| anyhow!("kiro_body 缺少 modelId"))?;
 
-    let content = v["conversationState"]["currentMessage"]["userInput"]["content"]
+    let content = v["conversationState"]["currentMessage"]["userInputMessage"]["content"]
         .as_str()
         .unwrap_or("test");
 
