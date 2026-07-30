@@ -658,6 +658,7 @@ impl AdminService {
                     source_channel: entry.source_channel,
                     balance,
                     balance_updated_at,
+                    created_at: entry.created_at,
                 }
             })
             .collect();
@@ -1290,6 +1291,8 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            // 创建时间由 token_manager.add_credential 在入库时统一写入
+            created_at: None,
         };
 
         // 调用 token_manager 添加凭据
