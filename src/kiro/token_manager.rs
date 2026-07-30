@@ -1141,6 +1141,20 @@ enum CachedModelSupport {
     Unsupported,
 }
 
+/// 比较模型支持情况时，兼容 Claude 版本号的两种写法：
+/// `claude-opus-4-8` 与 `claude-opus-4.8`。
+///
+/// 客户端模型会先经过 Anthropic -> Kiro 转换，而上游直通凭据的 `/v1/models`
+/// 可能返回另一种写法。如果这里精确比较，会在真正发起 HTTP 请求前错误跳过凭据。
+fn model_ids_match(left: &str, right: &str) -> bool {
+    let left = left.trim().to_ascii_lowercase();
+    let right = right.trim().to_ascii_lowercase();
+    left == right
+        || (left.starts_with("claude-")
+            && right.starts_with("claude-")
+            && left.replace('.', "-") == right.replace('.', "-"))
+}
+
 /// 多凭据 Token 管理器
 ///
 /// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
@@ -1480,7 +1494,7 @@ impl MultiTokenManager {
             .response
             .models
             .iter()
-            .any(|available| available.model_id.eq_ignore_ascii_case(model))
+            .any(|available| model_ids_match(&available.model_id, model))
         {
             CachedModelSupport::Confirmed
         } else {
@@ -4031,6 +4045,14 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_ids_match_claude_hyphen_and_dot_versions() {
+        assert!(model_ids_match("claude-opus-4-8", "claude-opus-4.8"));
+        assert!(model_ids_match("CLAUDE-SONNET-4.7", "claude-sonnet-4-7"));
+        assert!(!model_ids_match("claude-opus-4-8", "claude-sonnet-4-8"));
+        assert!(!model_ids_match("deepseek-v3.2", "deepseek-v3-2"));
+    }
     use std::sync::Arc;
 
     #[test]
