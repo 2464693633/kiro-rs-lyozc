@@ -60,6 +60,103 @@ pub fn estimate_approx_tokens(text: &str) -> i64 {
     if estimated < 1 { 1 } else { estimated }
 }
 
+/// Mirrors kiro-go's `estimateClaudeRequestInputTokens`.
+///
+/// This is intentionally separate from the canonical-JSON block estimate used
+/// for individual breakpoints. The Go implementation uses content-oriented
+/// request totals as the denominator when it later rescales cache coverage to
+/// the upstream's real input token count.
+pub fn estimate_claude_request_input_tokens(req: &MessagesRequest) -> i64 {
+    let mut total = 0;
+
+    if let Some(system) = &req.system {
+        for block in system {
+            total += estimate_approx_tokens(&block.text);
+        }
+    }
+
+    for message in &req.messages {
+        total += estimate_claude_value_tokens(&message.content);
+    }
+
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            total += estimate_approx_tokens(&tool.name);
+            total += estimate_approx_tokens(&tool.description);
+            let schema = serde_json::to_value(&tool.input_schema).unwrap_or(Value::Null);
+            total += estimate_json_tokens(&schema);
+        }
+    }
+
+    total
+}
+
+fn estimate_claude_value_tokens(value: &Value) -> i64 {
+    match value {
+        Value::Null => 0,
+        Value::String(text) => estimate_approx_tokens(text),
+        Value::Array(items) => items.iter().map(estimate_claude_value_tokens).sum(),
+        Value::Object(map) => {
+            let block_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+            match block_type {
+                "text" => {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        return estimate_approx_tokens(text);
+                    }
+                }
+                "thinking" => {
+                    if let Some(text) = map.get("thinking").and_then(Value::as_str) {
+                        return estimate_approx_tokens(text);
+                    }
+                }
+                "tool_use" => {
+                    let mut total = map
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(estimate_approx_tokens)
+                        .unwrap_or(0);
+                    if let Some(input) = map.get("input") {
+                        total += estimate_json_tokens(input);
+                    }
+                    if total > 0 {
+                        return total;
+                    }
+                }
+                "tool_result" => {
+                    if let Some(content) = map.get("content") {
+                        return estimate_claude_value_tokens(content);
+                    }
+                }
+                _ => {}
+            }
+
+            let mut total = map
+                .get("text")
+                .and_then(Value::as_str)
+                .map(estimate_approx_tokens)
+                .unwrap_or(0);
+            total += map
+                .get("thinking")
+                .and_then(Value::as_str)
+                .map(estimate_approx_tokens)
+                .unwrap_or(0);
+            if let Some(content) = map.get("content") {
+                total += estimate_claude_value_tokens(content);
+            }
+            if total > 0 {
+                total
+            } else {
+                estimate_json_tokens(value)
+            }
+        }
+        _ => estimate_json_tokens(value),
+    }
+}
+
+fn estimate_json_tokens(value: &Value) -> i64 {
+    estimate_approx_tokens(&canonicalize_cache_value(value))
+}
+
 /// Go `canonicalizeCacheValue` / `writeCanonicalJSON`。
 ///
 /// 紧凑输出、map key 按字典序、**每一层都跳过名为 `cache_control` 的 key**
@@ -1110,6 +1207,37 @@ mod tests {
         // "ab12!!中中" → regular=2, digits=2, symbols=2, nonASCII=2
         // 2/4.5 + 2/2 + 2/1.5 + 2/1.5 = 0.4444+1+1.3333+1.3333 = 4.111 → 5
         assert_eq!(estimate_approx_tokens("ab12!!中中"), 5);
+    }
+
+    #[test]
+    fn request_input_estimate_uses_content_not_canonical_wrappers() {
+        let request = MessagesRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            max_tokens: 128,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: json!([{"type": "text", "text": "hello world"}]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        assert_eq!(
+            estimate_claude_request_input_tokens(&request),
+            estimate_approx_tokens("hello world")
+        );
+        let canonical_total = build_claude_profile(&request, 0, DEFAULT_PROMPT_CACHE_TTL_MS)
+            .unwrap()
+            .total_input_tokens;
+        assert!(
+            canonical_total > estimate_claude_request_input_tokens(&request),
+            "profile total should include wrapper tokens only when no Go-compatible denominator is supplied"
+        );
     }
 
     /// 钉住「serde_json 未开 preserve_order」这一前提。若被开启，本测试失败，

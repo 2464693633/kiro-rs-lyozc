@@ -388,7 +388,8 @@ impl Default for BillingConfig {
 }
 
 fn default_go_opus_min_cacheable_tokens() -> i64 {
-    4096
+    // kiro-go's opusMinCacheableTokens is 1024.
+    1024
 }
 
 fn default_go_multiplier() -> f64 {
@@ -692,7 +693,7 @@ mod cache_engine_config_tests {
         assert_eq!(c.ttl_seconds, 300);
         assert_eq!(c.max_entries, 131072);
         assert_eq!(c.min_cacheable_tokens, 1024);
-        assert_eq!(c.opus_min_cacheable_tokens, 4096);
+        assert_eq!(c.opus_min_cacheable_tokens, 1024);
     }
 
     /// 老配置文件完全没有这两个键时，必须反序列化成默认值而非报错。

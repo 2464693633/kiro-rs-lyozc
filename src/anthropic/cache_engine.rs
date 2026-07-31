@@ -149,10 +149,10 @@ impl CacheEngines {
                     cache_read: cache_read_mul,
                     cache_creation: cache_creation_mul,
                 };
-                // total 传 0：`build_claude_profile` 会抬到累计值，使 prompt_total_est
-                // 等于「全部块的 canonical JSON token 之和」。Go 侧此处传的是另一个
-                // 估算器的结果，但分摊只用比例，故口径自洽即可。
-                let Some(profile) = build_claude_profile(req, 0, tracker.effective_ttl_ms()) else {
+                // 使用与 kiro-go 相同的内容型请求 token 估算作为分母；不能传 0，
+                // 否则 profile 会退化为 canonical wrapper 总量，导致缓存覆盖比例偏低。
+                let estimated_total = super::cache_metering_go::estimate_claude_request_input_tokens(req);
+                let Some(profile) = build_claude_profile(req, estimated_total, tracker.effective_ttl_ms()) else {
                     // 无断点：无缓存，但 Key 选的仍是 go 引擎，倍率照其配置生效。
                     return (CacheUsage::default(), muls, PendingCache::None);
                 };
@@ -201,7 +201,9 @@ impl CacheEngines {
             self.go
                 .as_ref()
                 .and_then(|tracker| {
-                    build_claude_profile(req, 0, tracker.effective_ttl_ms()).map(|profile| {
+                    let estimated_total =
+                        super::cache_metering_go::estimate_claude_request_input_tokens(req);
+                    build_claude_profile(req, estimated_total, tracker.effective_ttl_ms()).map(|profile| {
                         let total = profile.total_input_tokens as i32;
                         let usage = tracker.compute_for_account(account_id, &profile);
                         (usage, total)
