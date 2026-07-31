@@ -16,7 +16,14 @@ export function useSetBillingConfig() {
 
 export function useBillingComparison(time: StatsTimeFilter, filter?: StatsFilter) {
   return useQuery({
-    queryKey: ['stats', 'billing', time, filter?.keyId ?? 'all', filter?.group ?? 'all'],
+    queryKey: [
+      'stats',
+      'billing',
+      time,
+      filter?.keyId ?? 'all',
+      filter?.group ?? 'all',
+      filter?.credentialId ?? 'all',
+    ],
     queryFn: () => getBillingComparison(time, filter),
     staleTime: 25_000,
     refetchInterval: 30_000,

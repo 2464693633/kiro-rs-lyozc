@@ -59,6 +59,8 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
+import { useBillingComparison, useBillingConfig } from "@/hooks/use-billing";
+import type { StatsRange } from "@/types/api";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -99,6 +101,110 @@ function fmtNum(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+function formatMoney(value: number): string {
+  if (value > 0 && value < 0.0001) return "<$0.0001";
+  return `$${value.toFixed(4)}`;
+}
+
+function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
+  const [range, setRange] = useState<StatsRange>("7d");
+  const { data, isLoading, isFetching, isError } = useBillingComparison(
+    { range, granularity: range === "24h" ? "hour" : "day" },
+    { credentialId },
+  );
+  const { data: config } = useBillingConfig();
+  const rows = [
+    {
+      label: "上游真实",
+      tokens: data?.upstreamTokens ?? 0,
+      cost: data?.upstreamCost ?? 0,
+      multiplier: config?.upstreamMultipliers[String(credentialId)] ?? 1,
+      color: "bg-red-500",
+    },
+    {
+      label: "Rust 模拟",
+      tokens: data?.rustTokens ?? 0,
+      cost: data?.rustCost ?? 0,
+      multiplier: config?.rustMultiplier ?? 1,
+      color: "bg-blue-500",
+    },
+    {
+      label: "Go 模拟",
+      tokens: data?.goTokens ?? 0,
+      cost: data?.goCost ?? 0,
+      multiplier: config?.goMultiplier ?? 1,
+      color: "bg-emerald-500",
+    },
+  ];
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-secondary/30 p-3">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <div className="text-sm font-medium">费用对比</div>
+          <div className="text-[11px] text-muted-foreground">
+            {data?.calls ?? 0} 次调用 · 按模型价格计算
+          </div>
+        </div>
+        <div className="inline-flex rounded-md border bg-background p-0.5" aria-label="统计时间段">
+          {([
+            ["24h", "1天"],
+            ["7d", "7天"],
+            ["30d", "30天"],
+          ] as const).map(([value, label]) => (
+            <Button
+              key={value}
+              type="button"
+              size="sm"
+              variant={range === value ? "secondary" : "ghost"}
+              className="h-6 px-2 text-[11px]"
+              onClick={() => setRange(value)}
+            >
+              {label}
+            </Button>
+          ))}
+        </div>
+      </div>
+      <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-3 border-b border-border/50 pb-1 text-[10px] text-muted-foreground">
+        <span>计费来源</span>
+        <span className="text-right">Token</span>
+        <span className="text-right">金额 (USD)</span>
+      </div>
+      {isLoading ? (
+        <div className="flex h-[88px] items-center justify-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          加载计费数据…
+        </div>
+      ) : isError ? (
+        <div className="flex h-[88px] items-center justify-center text-xs text-destructive">
+          计费数据加载失败
+        </div>
+      ) : (
+        <div className={isFetching ? "opacity-60" : ""}>
+          {rows.map((row) => (
+            <div
+              key={row.label}
+              className="grid min-h-9 grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-x-3 border-b border-border/40 text-xs last:border-0"
+            >
+              <div className="flex min-w-0 items-center gap-1.5">
+                <span className={`h-2 w-2 shrink-0 rounded-full ${row.color}`} />
+                <span className="truncate">{row.label}</span>
+                <span className="text-[10px] tabular-nums text-muted-foreground">
+                  ×{row.multiplier.toFixed(2)}
+                </span>
+              </div>
+              <span className="text-right font-medium tabular-nums">{fmtNum(row.tokens)}</span>
+              <span className="min-w-16 text-right font-semibold tabular-nums">
+                {formatMoney(row.cost)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function formatResetDate(ts: number | null): string {
@@ -291,7 +397,7 @@ export function CredentialCard({
       {
         onSuccess: (res) => {
           toast.success(res.message);
-          if (willEnable) onRefreshBalance();
+          if (willEnable && !credential.isUpstream) onRefreshBalance();
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -365,12 +471,14 @@ export function CredentialCard({
     return credential.authMethod;
   })();
 
-  const isQuotaExceeded = balance
+  const isQuotaExceeded = !credential.isUpstream && balance
     ? balance.remaining <= 0 || balance.usagePercentage >= 100
     : false;
 
   const disabledByQuota =
-    credential.disabled && credential.disabledReason === "QuotaExceeded";
+    !credential.isUpstream &&
+    credential.disabled &&
+    credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
@@ -392,7 +500,7 @@ export function CredentialCard({
   // 订阅 / 状态 / 鉴权 / 分组等徽章 —— 卡片头部与列表行共用
   const badges = (
     <>
-      {balance?.subscriptionTitle && (
+      {!credential.isUpstream && balance?.subscriptionTitle && (
         <SubscriptionBadge
           title={balance.subscriptionTitle}
           className="max-w-full"
@@ -496,7 +604,8 @@ export function CredentialCard({
             解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
           </DropdownMenuItem>
         )}
-        {balance?.overageCapable === true &&
+        {!credential.isUpstream &&
+          balance?.overageCapable === true &&
           (balance.overageEnabled ? (
             <DropdownMenuItem
               onSelect={(e) => {
@@ -715,7 +824,7 @@ export function CredentialCard({
       </div>
 
       {/* 余额（大屏） */}
-      <div className="hidden w-44 shrink-0 xl:block">
+      {!credential.isUpstream && <div className="hidden w-44 shrink-0 xl:block">
         {loadingBalance ? (
           <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -748,7 +857,7 @@ export function CredentialCard({
             余额未查询
           </div>
         )}
-      </div>
+      </div>}
 
       {/* 最后调用（中大屏） */}
       <div className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block">
@@ -757,7 +866,7 @@ export function CredentialCard({
 
       {/* 操作区 */}
       <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
-        <Button
+        {!credential.isUpstream && <Button
           size="icon"
           variant="ghost"
           className="hidden h-9 w-9 sm:inline-flex"
@@ -778,8 +887,8 @@ export function CredentialCard({
           <RefreshCw
             className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
           />
-        </Button>
-        <Button
+        </Button>}
+        {!credential.isUpstream && <Button
           size="icon"
           variant="ghost"
           className="hidden h-9 w-9 sm:inline-flex"
@@ -792,7 +901,7 @@ export function CredentialCard({
           ) : (
             <Wallet className="h-4 w-4" />
           )}
-        </Button>
+        </Button>}
         <Switch
           checked={!credential.disabled}
           onCheckedChange={handleToggleDisabled}
@@ -989,7 +1098,7 @@ export function CredentialCard({
                 </dd>
               </div>
             )}
-            {credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
+            {!credential.isUpstream && credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
               <div className="min-[420px]:col-span-2 border-t border-border/50 pt-2">
                 <div className="mb-1 text-xs text-muted-foreground">Token 用量（近 7 天）</div>
                 <div className="grid grid-cols-3 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-5">
@@ -1018,7 +1127,9 @@ export function CredentialCard({
             )}
           </dl>
 
-          {/* 余额面板 */}
+          {credential.isUpstream ? (
+            <UpstreamBillingPanel credentialId={credential.id} />
+          ) : (
           <div
             className={`flex min-h-[138px] flex-col rounded-xl border p-3 transition-colors sm:min-h-[150px] sm:p-4 ${
               isQuotaExceeded || disabledByQuota
@@ -1088,6 +1199,7 @@ export function CredentialCard({
               </div>
             )}
           </div>
+          )}
 
           {/* 操作区 */}
           <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
@@ -1105,7 +1217,7 @@ export function CredentialCard({
                 <GripVertical className="h-4 w-4 text-muted-foreground" />
               </Button>
               <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
-              <Button
+              {!credential.isUpstream && <Button
                 size="sm"
                 variant="ghost"
                 className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
@@ -1127,8 +1239,8 @@ export function CredentialCard({
                   className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
                 />
                 <span className="hidden sm:inline">刷新 Token</span>
-              </Button>
-              <Button
+              </Button>}
+              {!credential.isUpstream && <Button
                 size="sm"
                 variant="ghost"
                 className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
@@ -1140,7 +1252,7 @@ export function CredentialCard({
                   className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
                 />
                 <span className="hidden sm:inline">刷新余额</span>
-              </Button>
+              </Button>}
             </div>
 
             <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:items-center">

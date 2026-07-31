@@ -471,6 +471,8 @@ export interface StatsFilter {
   keyId?: number
   /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
   group?: string
+  /** 按单个上游凭据筛选（仅费用对比接口使用） */
+  credentialId?: number
 }
 
 export interface OverviewStats {
@@ -567,6 +569,13 @@ export interface TraceAttempt {
   durationMs: number
 }
 
+export interface TraceBillingUsage {
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+}
+
 /** 一个外部请求的完整链路 */
 export interface TraceRecord {
   traceId: string
@@ -582,6 +591,7 @@ export interface TraceRecord {
   finalStatus: string
   finalCredentialId: number
   finalEmail?: string | null
+  finalCredentialIsUpstream?: boolean
   errorType: string | null
   errorMessage: string | null
   totalAttempts: number
@@ -602,6 +612,10 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
+  /** 上游 API 原始用量及两套客户端缓存模拟用量 */
+  upstreamUsage?: TraceBillingUsage | null
+  rustUsage?: TraceBillingUsage | null
+  goUsage?: TraceBillingUsage | null
   attempts: TraceAttempt[]
 }
 
@@ -615,6 +629,14 @@ export interface TraceQuery {
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string
+  /** 凭据来源 */
+  source?: 'upstream' | 'kiro'
+  /** Unix 秒，包含 */
+  fromTs?: number
+  /** Unix 秒，不包含 */
+  toTs?: number
+  billingStatus?: 'with' | 'unpriced'
+  sort?: 'newest' | 'oldest' | 'tokens' | 'duration' | 'attempts'
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean

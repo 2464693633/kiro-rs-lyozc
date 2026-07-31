@@ -33,6 +33,7 @@ export async function getBillingComparison(
       ...time,
       ...(filter?.keyId !== undefined ? { keyId: filter.keyId } : {}),
       ...(filter?.group ? { group: filter.group } : {}),
+      ...(filter?.credentialId !== undefined ? { credentialId: filter.credentialId } : {}),
     },
   })
   return data

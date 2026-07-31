@@ -253,7 +253,7 @@ function DesktopTabs({
   tab: Tab;
 }) {
   return (
-    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 xl:flex">
+    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 2xl:flex">
       {TABS.map((t) => (
         <TabButton
           key={t.key}
@@ -277,13 +277,13 @@ function HeaderActions({
 }) {
   return (
     <div className="flex shrink-0 items-center gap-1">
-      <div className="xl:hidden">
+      <div className="2xl:hidden">
         <TopbarTools compact />
       </div>
-      <div className="hidden items-center gap-1 xl:flex">
+      <div className="hidden items-center gap-1 2xl:flex">
         <TopbarTools />
       </div>
-      <span className="mx-1 hidden h-5 w-px bg-border/70 xl:inline-block" />
+      <span className="mx-1 hidden h-5 w-px bg-border/70 2xl:inline-block" />
       <GithubButton />
       <Button variant="ghost" size="icon" onClick={onToggleDarkMode} title="切换主题">
         {darkMode ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
@@ -302,7 +302,7 @@ function GithubButton() {
       size="icon"
       asChild
       title="GitHub 仓库"
-      className="hidden xl:inline-flex"
+      className="hidden 2xl:inline-flex"
     >
       <a
         href="https://github.com/ZyphrZero/kiro.rs"
@@ -324,7 +324,7 @@ function MobileTabs({
   tab: Tab;
 }) {
   return (
-    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+    <div className="mx-auto flex max-w-[1400px] items-center gap-1 overflow-x-auto px-3 pb-2 2xl:hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}

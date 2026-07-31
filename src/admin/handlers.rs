@@ -17,23 +17,16 @@ use std::sync::Arc;
 use super::{
     client_keys::mask_client_key,
     middleware::AdminState,
-    trace_db::TraceQuery,
+    trace_db::{TraceQuery, TraceSort},
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        BillingConfigPayload,
-        ClientKeyItem,
-        ClientKeysResponse,
-        CompleteSocialLoginRequest,
-        CreateClientKeyRequest,
-        CreateClientKeyResponse,
-        CredentialTokenUsage,
-        GlobalProxyResponse,
-        ModelTestRequest,
-        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
-        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
+        BillingConfigPayload, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
+        ModelTestRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
+        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+        SetPriorityRequest, SetTokenInflationConfigRequest, SetUpdateConfigRequest,
+        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
         UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
@@ -632,7 +625,9 @@ pub async fn get_cache_engines_config(State(state): State<AdminState>) -> impl I
         .config()
         .config_path()
         .and_then(|path| crate::model::config::Config::load(path).ok());
-    let config = loaded.as_ref().unwrap_or_else(|| state.service.token_manager().config());
+    let config = loaded
+        .as_ref()
+        .unwrap_or_else(|| state.service.token_manager().config());
     Json(super::types::CacheEnginesConfigPayload {
         rust: config.cache_engine_rust.sanitized(),
         go: config.cache_engine_go.sanitized(),
@@ -1406,6 +1401,24 @@ pub async fn stats_by_credential(
     Json(enriched).into_response()
 }
 
+fn billing_cred_ids(
+    state: &AdminState,
+    params: &HashMap<String, String>,
+) -> Result<Option<std::collections::HashSet<u64>>, String> {
+    let mut ids = group_to_cred_ids(state, parse_group_filter(params).as_deref());
+    let Some(raw_id) = params.get("credentialId") else {
+        return Ok(ids);
+    };
+    let credential_id = raw_id
+        .parse::<u64>()
+        .map_err(|_| "credentialId 必须是数字".to_string())?;
+    match &mut ids {
+        Some(group_ids) => group_ids.retain(|id| *id == credential_id),
+        None => ids = Some(std::iter::once(credential_id).collect()),
+    }
+    Ok(ids)
+}
+
 /// GET /api/admin/stats/billing?range=24h|7d|30d&granularity=hour|day&keyId=...
 pub async fn stats_billing(
     State(state): State<AdminState>,
@@ -1416,36 +1429,82 @@ pub async fn stats_billing(
         Err(message) => return stats_bad_request(message),
     };
     let config = state.service.current_billing_config();
-    let cred_ids = group_to_cred_ids(&state, parse_group_filter(&params).as_deref());
-    let (_, summary) = state
-        .usage_aggregator
-        .query_billing(window, key_id, cred_ids.as_ref(), &config);
+    let cred_ids = match billing_cred_ids(&state, &params) {
+        Ok(ids) => ids,
+        Err(message) => return stats_bad_request(message),
+    };
+    let (_, summary) =
+        state
+            .usage_aggregator
+            .query_billing(window, key_id, cred_ids.as_ref(), &config);
     Json(summary).into_response()
 }
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / source /
+/// fromTs / toTs / billingStatus / onlyFailed / sort / limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
+    let snapshot = state.service.get_all_credentials();
+
+    // 分组和凭据来源都转换为凭据 id 白名单，保证筛选发生在数据库分页之前。
     let group = params
         .get("group")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
-        state
-            .service
-            .get_all_credentials()
+        snapshot
             .credentials
             .iter()
             .filter(|c| c.groups.iter().any(|cg| cg == g))
             .map(|c| c.id)
             .collect()
     });
+    let source_ids: Option<Vec<u64>> = match params.get("source").map(String::as_str) {
+        Some("upstream") => Some(
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| c.is_upstream)
+                .map(|c| c.id)
+                .collect(),
+        ),
+        Some("kiro") => Some(
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| !c.is_upstream)
+                .map(|c| c.id)
+                .collect(),
+        ),
+        _ => None,
+    };
+    let credential_ids = match (credential_ids, source_ids) {
+        (Some(group_ids), Some(source_ids)) => Some(
+            group_ids
+                .into_iter()
+                .filter(|id| source_ids.contains(id))
+                .collect(),
+        ),
+        (Some(ids), None) | (None, Some(ids)) => Some(ids),
+        (None, None) => None,
+    };
+    let billing_status = params.get("billingStatus").map(String::as_str);
+    let priced_models = if billing_status == Some("unpriced") {
+        state
+            .service
+            .current_billing_config()
+            .model_prices
+            .keys()
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
@@ -1458,6 +1517,11 @@ pub async fn list_traces(
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
+        from_epoch: params.get("fromTs").and_then(|s| s.parse::<i64>().ok()),
+        to_epoch: params.get("toTs").and_then(|s| s.parse::<i64>().ok()),
+        billing_only: billing_status == Some("with"),
+        unpriced_only: billing_status == Some("unpriced"),
+        priced_models,
         only_failed: params
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
@@ -1472,15 +1536,26 @@ pub async fn list_traces(
             .get("offset")
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0),
+        sort: match params.get("sort").map(String::as_str) {
+            Some("oldest") => TraceSort::Oldest,
+            Some("tokens") => TraceSort::TokensDesc,
+            Some("duration") => TraceSort::DurationDesc,
+            Some("attempts") => TraceSort::AttemptsDesc,
+            _ => TraceSort::Newest,
+        },
     };
     let (records, total) = state.trace_store.query_paged(&query);
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
-    let snapshot = state.service.get_all_credentials();
     let email_map: HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
         .map(|c| (c.id, c.email.clone()))
+        .collect();
+    let upstream_map: HashMap<u64, bool> = snapshot
+        .credentials
+        .iter()
+        .map(|c| (c.id, c.is_upstream))
         .collect();
     let client_key_name_map: HashMap<u64, String> = state
         .client_keys
@@ -1501,6 +1576,10 @@ pub async fn list_traces(
         .into_iter()
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
+            let final_is_upstream = upstream_map
+                .get(&r.final_credential_id)
+                .copied()
+                .unwrap_or(r.upstream_usage.is_some());
             let key_name = key_label(r.key_id);
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
@@ -1531,6 +1610,7 @@ pub async fn list_traces(
                 "finalStatus": r.final_status,
                 "finalCredentialId": r.final_credential_id,
                 "finalEmail": final_email,
+                "finalCredentialIsUpstream": final_is_upstream,
                 "errorType": r.error_type,
                 "errorMessage": r.error_message,
                 "totalAttempts": r.total_attempts,
@@ -1543,6 +1623,9 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                "upstreamUsage": r.upstream_usage,
+                "rustUsage": r.rust_usage,
+                "goUsage": r.go_usage,
                 "attempts": attempts,
             })
         })

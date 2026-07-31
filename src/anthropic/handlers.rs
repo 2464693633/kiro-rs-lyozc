@@ -8,7 +8,9 @@ use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, TokenUsageBreakdown, UsageRecord};
+use crate::admin::usage_stats::{
+    SharedAggregator, SharedRecorder, TokenUsageBreakdown, UsageRecord,
+};
 use crate::kiro::model::available_models::{TokenLimits, UpstreamModel};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -66,8 +68,25 @@ pub(crate) struct UsageRecordHook {
     /// 个槽，否则某个克隆提交后其他克隆仍持有旧 profile 会重复写入。`take()`
     /// 使提交天然幂等 —— 同一请求多次调 `record` 也只写一次。
     pending_cache: std::sync::Arc<parking_lot::Mutex<Option<super::cache_engine::PendingCache>>>,
-    billing_usage: std::sync::Arc<parking_lot::Mutex<Option<(TokenUsageBreakdown, TokenUsageBreakdown, TokenUsageBreakdown)>>>,
-    billing_request: std::sync::Arc<parking_lot::Mutex<Option<(MessagesRequest, u64, super::cache_engine::CacheEngineKind, super::cache_metering::CacheUsage)>>>,
+    billing_usage: std::sync::Arc<
+        parking_lot::Mutex<
+            Option<(
+                TokenUsageBreakdown,
+                TokenUsageBreakdown,
+                TokenUsageBreakdown,
+            )>,
+        >,
+    >,
+    billing_request: std::sync::Arc<
+        parking_lot::Mutex<
+            Option<(
+                MessagesRequest,
+                u64,
+                super::cache_engine::CacheEngineKind,
+                super::cache_metering::CacheUsage,
+            )>,
+        >,
+    >,
 }
 
 fn scaled_billing_usage(
@@ -149,13 +168,19 @@ impl UsageRecordHook {
         credential_id: u64,
         upstream: TokenUsageBreakdown,
         global_multipliers: (f64, f64, f64),
-    ) {
-        let Some((request, key_id, kind, selected_usage)) = self.billing_request.lock().as_ref().cloned() else {
-            return;
+    ) -> Option<(
+        TokenUsageBreakdown,
+        TokenUsageBreakdown,
+        TokenUsageBreakdown,
+    )> {
+        let Some((request, key_id, kind, selected_usage)) =
+            self.billing_request.lock().as_ref().cloned()
+        else {
+            return None;
         };
-        let (rust, go) = self
-            .cache_engines
-            .compute_billing_usage(&request, key_id, credential_id, Some(kind));
+        let (rust, go) =
+            self.cache_engines
+                .compute_billing_usage(&request, key_id, credential_id, Some(kind));
         let (rust, go) = match kind {
             super::cache_engine::CacheEngineKind::Rust => (selected_usage, go),
             super::cache_engine::CacheEngineKind::Go => (rust, selected_usage),
@@ -164,11 +189,13 @@ impl UsageRecordHook {
             self.cache_engines.billing_multipliers(global_multipliers);
         // billing 对比应记录客户端实际看到的模拟 token，而不是倍率应用前的
         // 内部估算值。上游真实 usage 保持原始值，供真实费用对照。
-        self.set_billing_usage(
+        let usage = (
             upstream,
             scaled_billing_usage(rust, upstream, rust_multipliers),
             scaled_billing_usage(go, upstream, go_multipliers),
         );
+        self.set_billing_usage(usage.0, usage.1, usage.2);
+        Some(usage)
     }
 
     fn commit_pending_cache(&self, credential_id: u64) {
@@ -259,6 +286,13 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    billing_usage: parking_lot::Mutex<
+        Option<(
+            TokenUsageBreakdown,
+            TokenUsageBreakdown,
+            TokenUsageBreakdown,
+        )>,
+    >,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -297,7 +331,19 @@ impl RequestTracer {
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            billing_usage: parking_lot::Mutex::new(None),
         }
+    }
+
+    fn set_billing_usage(
+        &self,
+        usage: (
+            TokenUsageBreakdown,
+            TokenUsageBreakdown,
+            TokenUsageBreakdown,
+        ),
+    ) {
+        *self.billing_usage.lock() = Some(usage);
     }
 
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
@@ -325,6 +371,7 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        let billing_usage = self.billing_usage.lock().take();
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -345,6 +392,9 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            upstream_usage: billing_usage.map(|value| value.0),
+            rust_usage: billing_usage.map(|value| value.1),
+            go_usage: billing_usage.map(|value| value.2),
             attempts,
         };
         store.insert(&rec);
@@ -983,18 +1033,25 @@ async fn handle_stream_request(
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-        cache_multipliers.resolve(provider.get_inflation_multipliers());
+            cache_multipliers.resolve(provider.get_inflation_multipliers());
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
-            call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
+            call_result.response,
+            input_mul,
+            output_mul,
+            cache_mul,
+            cache_creation_mul,
+            cache_usage,
         );
         // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
-            hook.set_upstream_billing_usage(
+            if let Some(billing_usage) = hook.set_upstream_billing_usage(
                 credential_id,
                 usage.raw_usage,
                 provider.get_inflation_multipliers(),
-            );
+            ) {
+                tracer.set_billing_usage(billing_usage);
+            }
             hook.record(
                 credential_id,
                 usage.input_tokens,
@@ -1005,7 +1062,10 @@ async fn handle_stream_request(
                 "success",
             );
             tracer.finalize(
-                "success", None, None, None,
+                "success",
+                None,
+                None,
+                None,
                 TraceUsage {
                     input_tokens: usage.input_tokens.max(0) as u64,
                     output_tokens: usage.output_tokens.max(0) as u64,
@@ -1281,16 +1341,35 @@ async fn handle_non_stream_request(
         let credential_id = call_result.credential_id;
         let (resp, u_input, u_output, u_cache_creation, u_cache_read, raw_usage) =
             super::upstream::handle_upstream_non_stream_response(
-                call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
-            ).await;
-        hook.set_upstream_billing_usage(
+                call_result.response,
+                input_mul,
+                output_mul,
+                cache_mul,
+                cache_creation_mul,
+                cache_usage,
+            )
+            .await;
+        if let Some(billing_usage) = hook.set_upstream_billing_usage(
             credential_id,
             raw_usage,
             provider.get_inflation_multipliers(),
+        ) {
+            tracer.set_billing_usage(billing_usage);
+        }
+        hook.record(
+            credential_id,
+            u_input,
+            u_output,
+            u_cache_creation,
+            u_cache_read,
+            0.0,
+            "success",
         );
-        hook.record(credential_id, u_input, u_output, u_cache_creation, u_cache_read, 0.0, "success");
         tracer.finalize(
-            "success", None, None, None,
+            "success",
+            None,
+            None,
+            None,
             TraceUsage {
                 input_tokens: u_input.max(0) as u64,
                 output_tokens: u_output.max(0) as u64,
@@ -1964,17 +2043,24 @@ async fn handle_stream_request_buffered(
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-        cache_multipliers.resolve(provider.get_inflation_multipliers());
+            cache_multipliers.resolve(provider.get_inflation_multipliers());
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
-            call_result.response, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage,
+            call_result.response,
+            input_mul,
+            output_mul,
+            cache_mul,
+            cache_creation_mul,
+            cache_usage,
         );
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
-            hook.set_upstream_billing_usage(
+            if let Some(billing_usage) = hook.set_upstream_billing_usage(
                 credential_id,
                 usage.raw_usage,
                 provider.get_inflation_multipliers(),
-            );
+            ) {
+                tracer.set_billing_usage(billing_usage);
+            }
             hook.record(
                 credential_id,
                 usage.input_tokens,
@@ -1985,7 +2071,10 @@ async fn handle_stream_request_buffered(
                 "success",
             );
             tracer.finalize(
-                "success", None, None, None,
+                "success",
+                None,
+                None,
+                None,
                 TraceUsage {
                     input_tokens: usage.input_tokens.max(0) as u64,
                     output_tokens: usage.output_tokens.max(0) as u64,

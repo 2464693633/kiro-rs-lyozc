@@ -127,15 +127,15 @@ export function EditCredentialDialog({
 
         <form onSubmit={handleSubmit}>
           <div className="space-y-4 py-4">
-            {/* 邮箱 */}
+            {/* 显示标识 */}
             <div className="space-y-2">
-              <label htmlFor="email" className="text-sm font-medium">
-                邮箱（用于显示标识）
+              <label htmlFor="credential-display-name" className="text-sm font-medium">
+                {credential.isUpstream ? '名称（用于显示标识）' : '邮箱（用于显示标识）'}
               </label>
               <Input
-                id="email"
-                type="email"
-                placeholder="例: user@example.com"
+                id="credential-display-name"
+                type={credential.isUpstream ? 'text' : 'email'}
+                placeholder={credential.isUpstream ? '例: 上游中转 A' : '例: user@example.com'}
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 disabled={isPending}

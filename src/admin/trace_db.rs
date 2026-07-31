@@ -16,6 +16,8 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
+use crate::admin::usage_stats::TokenUsageBreakdown;
+
 /// trace 记录默认保留天数
 const DEFAULT_RETENTION_DAYS: u64 = 7;
 /// 上游错误体片段最大长度（字节）
@@ -125,6 +127,13 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
+    /// 上游 API 原始用量及两套客户端缓存模拟用量。非上游凭据为 None。
+    #[serde(default)]
+    pub upstream_usage: Option<TokenUsageBreakdown>,
+    #[serde(default)]
+    pub rust_usage: Option<TokenUsageBreakdown>,
+    #[serde(default)]
+    pub go_usage: Option<TokenUsageBreakdown>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -159,6 +168,25 @@ pub fn truncate_snippet(body: &str) -> Option<String> {
     Some(format!("{}…(truncated)", &trimmed[..end]))
 }
 
+fn serialize_usage(usage: Option<TokenUsageBreakdown>) -> rusqlite::Result<Option<String>> {
+    usage
+        .map(|value| serde_json::to_string(&value))
+        .transpose()
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+fn deserialize_usage(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<TokenUsageBreakdown>> {
+    value
+        .map(|json| serde_json::from_str(&json))
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+        })
+}
+
 /// 链路上报接收端：provider 在重试循环里每跳调用 [`Self::on_attempt`]
 pub trait TraceSink: Send + Sync {
     fn on_attempt(&self, attempt: TraceAttempt);
@@ -180,6 +208,16 @@ pub struct TraceQuery {
     pub failed_attempt_credential_id: Option<u64>,
     /// 模型名
     pub model: Option<String>,
+    /// 起始时间（Unix 秒，包含）。
+    pub from_epoch: Option<i64>,
+    /// 结束时间（Unix 秒，不包含）。
+    pub to_epoch: Option<i64>,
+    /// 仅返回带上游 API 三套计费快照的记录。
+    pub billing_only: bool,
+    /// 仅返回当前没有模型价格的上游 API 记录。
+    pub unpriced_only: bool,
+    /// 当前已配置价格的模型名，由 handler 层注入供未定价筛选使用。
+    pub priced_models: Vec<String>,
     /// 仅返回非 success
     pub only_failed: bool,
     /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
@@ -189,6 +227,32 @@ pub struct TraceQuery {
     pub limit: usize,
     /// 偏移量（分页用）
     pub offset: usize,
+    /// 排序方式。
+    pub sort: TraceSort,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum TraceSort {
+    #[default]
+    Newest,
+    Oldest,
+    TokensDesc,
+    DurationDesc,
+    AttemptsDesc,
+}
+
+impl TraceSort {
+    fn order_sql(self) -> &'static str {
+        match self {
+            Self::Newest => "ts_epoch DESC",
+            Self::Oldest => "ts_epoch ASC",
+            Self::TokensDesc => {
+                "(input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens) DESC, ts_epoch DESC"
+            }
+            Self::DurationDesc => "duration_ms DESC, ts_epoch DESC",
+            Self::AttemptsDesc => "total_attempts DESC, ts_epoch DESC",
+        }
+    }
 }
 
 /// SQLite 持久化存储
@@ -254,7 +318,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 7] = [
+        let columns: [(&str, &str); 10] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -262,14 +326,14 @@ impl TraceStore {
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("upstream_usage", "TEXT"),
+            ("rust_usage", "TEXT"),
+            ("go_usage", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
             if !existing.contains(name) {
-                conn.execute_batch(&format!(
-                    "ALTER TABLE traces ADD COLUMN {} {};",
-                    name, def
-                ))?;
+                conn.execute_batch(&format!("ALTER TABLE traces ADD COLUMN {} {};", name, def))?;
             }
         }
         // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
@@ -321,13 +385,16 @@ impl TraceStore {
             .map(|d| d.timestamp())
             .unwrap_or_else(|_| Utc::now().timestamp());
         let res = (|| -> rusqlite::Result<()> {
+            let upstream_usage = serialize_usage(rec.upstream_usage)?;
+            let rust_usage = serialize_usage(rec.rust_usage)?;
+            let go_usage = serialize_usage(rec.go_usage)?;
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 credits, first_token_ms, upstream_usage, rust_usage, go_usage) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -349,6 +416,9 @@ impl TraceStore {
                     rec.cache_read_tokens as i64,
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
+                    upstream_usage,
+                    rust_usage,
+                    go_usage,
                 ],
             )?;
             for a in &rec.attempts {
@@ -434,6 +504,24 @@ impl TraceStore {
             clauses.push("model = ?".to_string());
             params.push(Box::new(m.clone()));
         }
+        if let Some(from) = q.from_epoch {
+            clauses.push("ts_epoch >= ?".to_string());
+            params.push(Box::new(from));
+        }
+        if let Some(to) = q.to_epoch {
+            clauses.push("ts_epoch < ?".to_string());
+            params.push(Box::new(to));
+        }
+        if q.billing_only || q.unpriced_only {
+            clauses.push("upstream_usage IS NOT NULL".to_string());
+        }
+        if q.unpriced_only && !q.priced_models.is_empty() {
+            let placeholders: Vec<&str> = q.priced_models.iter().map(|_| "?").collect();
+            clauses.push(format!("model NOT IN ({})", placeholders.join(",")));
+            for model in &q.priced_models {
+                params.push(Box::new(model.clone()));
+            }
+        }
         if let Some(ids) = &q.credential_ids {
             if ids.is_empty() {
                 // 空白名单 = 该分组下无凭据 → 强制零匹配
@@ -479,9 +567,13 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
-             FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
-            where_sql, limit, q.offset
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
+             upstream_usage, rust_usage, go_usage \
+             FROM traces {} ORDER BY {} LIMIT {} OFFSET {}",
+            where_sql,
+            q.sort.order_sql(),
+            limit,
+            q.offset
         );
 
         let mut stmt = conn.prepare(&sql)?;
@@ -506,6 +598,9 @@ impl TraceStore {
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
+                upstream_usage: deserialize_usage(row.get(19)?, 19)?,
+                rust_usage: deserialize_usage(row.get(20)?, 20)?,
+                go_usage: deserialize_usage(row.get(21)?, 21)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -682,7 +777,10 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
-    first_token_ms    INTEGER
+    first_token_ms    INTEGER,
+    upstream_usage    TEXT,
+    rust_usage        TEXT,
+    go_usage          TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -742,6 +840,24 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            upstream_usage: Some(TokenUsageBreakdown {
+                input_tokens: 100,
+                output_tokens: 20,
+                cache_creation_tokens: 30,
+                cache_read_tokens: 400,
+            }),
+            rust_usage: Some(TokenUsageBreakdown {
+                input_tokens: 80,
+                output_tokens: 20,
+                cache_creation_tokens: 50,
+                cache_read_tokens: 420,
+            }),
+            go_usage: Some(TokenUsageBreakdown {
+                input_tokens: 70,
+                output_tokens: 20,
+                cache_creation_tokens: 40,
+                cache_read_tokens: 440,
+            }),
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -802,6 +918,30 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+        assert_eq!(out[0].upstream_usage.unwrap().cache_read_tokens, 400);
+        assert_eq!(out[0].rust_usage.unwrap().cache_creation_tokens, 50);
+        assert_eq!(out[0].go_usage.unwrap().input_tokens, 70);
+    }
+
+    #[test]
+    fn migration_adds_billing_usage_columns_to_existing_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (trace_id TEXT PRIMARY KEY, key_id INTEGER NOT NULL);",
+        )
+        .unwrap();
+
+        TraceStore::migrate(&conn).unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(traces)").unwrap();
+        let columns: std::collections::HashSet<String> = stmt
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(columns.contains("upstream_usage"));
+        assert!(columns.contains("rust_usage"));
+        assert!(columns.contains("go_usage"));
     }
 
     #[test]
@@ -917,6 +1057,113 @@ mod tests {
         });
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].trace_id, "cut");
+    }
+
+    #[test]
+    fn filters_time_billing_and_unpriced_models() {
+        let store = mem_store();
+        for (trace_id, model, credential_id) in [
+            ("early", "priced", 5),
+            ("middle", "priced", 6),
+            ("late", "unpriced", 7),
+        ] {
+            store.insert(&sample(TraceSample {
+                trace_id,
+                status: "success",
+                credential_id,
+                model,
+            }));
+        }
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE traces SET ts_epoch = 100 WHERE trace_id = 'early'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE traces SET ts_epoch = 200, upstream_usage = NULL WHERE trace_id = 'middle'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE traces SET ts_epoch = 300 WHERE trace_id = 'late'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let in_range = store.query(&TraceQuery {
+            from_epoch: Some(150),
+            to_epoch: Some(301),
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(in_range.len(), 2);
+
+        let billed = store.query(&TraceQuery {
+            billing_only: true,
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(billed.len(), 2);
+        assert!(billed.iter().all(|record| record.trace_id != "middle"));
+
+        let unpriced = store.query(&TraceQuery {
+            unpriced_only: true,
+            priced_models: vec!["priced".to_string()],
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(unpriced.len(), 1);
+        assert_eq!(unpriced[0].trace_id, "late");
+    }
+
+    #[test]
+    fn supports_whitelisted_trace_sorting() {
+        let store = mem_store();
+        for trace_id in ["small", "large"] {
+            store.insert(&sample(TraceSample {
+                trace_id,
+                status: "success",
+                credential_id: 5,
+                model: "m1",
+            }));
+        }
+        {
+            let conn = store.conn.lock();
+            conn.execute(
+                "UPDATE traces SET input_tokens = 10, duration_ms = 500, total_attempts = 1 WHERE trace_id = 'small'",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE traces SET input_tokens = 999999, duration_ms = 10, total_attempts = 3 WHERE trace_id = 'large'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let by_tokens = store.query(&TraceQuery {
+            sort: TraceSort::TokensDesc,
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(by_tokens[0].trace_id, "large");
+
+        let by_duration = store.query(&TraceQuery {
+            sort: TraceSort::DurationDesc,
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(by_duration[0].trace_id, "small");
+
+        let by_attempts = store.query(&TraceQuery {
+            sort: TraceSort::AttemptsDesc,
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(by_attempts[0].trace_id, "large");
     }
 
     #[test]

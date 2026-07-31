@@ -666,7 +666,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("当前页没有可查询的凭据");
       return;
     }
-    const ids = currentCredentials.filter((c) => !c.disabled).map((c) => c.id);
+    const ids = currentCredentials
+      .filter((c) => !c.disabled && !c.isUpstream)
+      .map((c) => c.id);
     if (ids.length === 0) {
       toast.error("当前页没有可查询的启用凭据");
       return;

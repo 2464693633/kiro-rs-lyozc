@@ -227,9 +227,15 @@ impl BucketStats {
         }
         if rec.is_upstream {
             self.upstream_calls += 1;
-            if let Some(v) = rec.upstream_usage { add_usage(&mut self.upstream_usage, v); }
-            if let Some(v) = rec.rust_usage { add_usage(&mut self.rust_usage, v); }
-            if let Some(v) = rec.go_usage { add_usage(&mut self.go_usage, v); }
+            if let Some(v) = rec.upstream_usage {
+                add_usage(&mut self.upstream_usage, v);
+            }
+            if let Some(v) = rec.rust_usage {
+                add_usage(&mut self.rust_usage, v);
+            }
+            if let Some(v) = rec.go_usage {
+                add_usage(&mut self.go_usage, v);
+            }
         }
     }
 
@@ -618,7 +624,10 @@ impl UsageAggregator {
         key_id: Option<u64>,
         cred_filter: Option<&std::collections::HashSet<u64>>,
         config: &crate::model::config::BillingConfig,
-    ) -> (Vec<crate::admin::types::BillingUsagePoint>, crate::admin::types::BillingComparisonResponse) {
+    ) -> (
+        Vec<crate::admin::types::BillingUsagePoint>,
+        crate::admin::types::BillingComparisonResponse,
+    ) {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
         let mut points = Vec::new();
@@ -632,9 +641,15 @@ impl UsageAggregator {
             let mut row = (0.0, 0.0, 0.0, 0u64, 0u64, 0u64, 0u64);
             for (credential_id, model_map) in models {
                 if let Some(allow) = cred_filter {
-                    if !allow.contains(credential_id) { continue; }
+                    if !allow.contains(credential_id) {
+                        continue;
+                    }
                 }
-                let upstream_mul = config.upstream_multipliers.get(credential_id).copied().unwrap_or(1.0);
+                let upstream_mul = config
+                    .upstream_multipliers
+                    .get(credential_id)
+                    .copied()
+                    .unwrap_or(1.0);
                 for (model, stats) in model_map {
                     row.3 += stats.upstream_usage.total_tokens();
                     row.4 += stats.rust_usage.total_tokens();
@@ -647,8 +662,13 @@ impl UsageAggregator {
                     }
                 }
             }
-            total.0 += row.0; total.1 += row.1; total.2 += row.2;
-            total.3 += row.3; total.4 += row.4; total.5 += row.5; total.6 += row.6;
+            total.0 += row.0;
+            total.1 += row.1;
+            total.2 += row.2;
+            total.3 += row.3;
+            total.4 += row.4;
+            total.5 += row.5;
+            total.6 += row.6;
             points.push(crate::admin::types::BillingUsagePoint {
                 ts: ts_to_rfc3339(bucket.ts),
                 upstream_cost: row.0,
@@ -1097,15 +1117,27 @@ mod tests {
             duration_ms: 0,
             status: "success".to_string(),
             is_upstream: true,
-            upstream_usage: Some(TokenUsageBreakdown { input_tokens: 1_000_000, ..Default::default() }),
-            rust_usage: Some(TokenUsageBreakdown { input_tokens: 2_000_000, ..Default::default() }),
-            go_usage: Some(TokenUsageBreakdown { input_tokens: 3_000_000, ..Default::default() }),
+            upstream_usage: Some(TokenUsageBreakdown {
+                input_tokens: 1_000_000,
+                ..Default::default()
+            }),
+            rust_usage: Some(TokenUsageBreakdown {
+                input_tokens: 2_000_000,
+                ..Default::default()
+            }),
+            go_usage: Some(TokenUsageBreakdown {
+                input_tokens: 3_000_000,
+                ..Default::default()
+            }),
         };
         agg.ingest(&rec);
         let mut config = crate::model::config::BillingConfig::default();
         config.model_prices.insert(
             "m".to_string(),
-            crate::model::config::ModelPricing { input_per_million: 5.0, ..Default::default() },
+            crate::model::config::ModelPricing {
+                input_per_million: 5.0,
+                ..Default::default()
+            },
         );
         config.upstream_multipliers.insert(9, 2.0);
         config.rust_multiplier = 1.5;
@@ -1116,5 +1148,15 @@ mod tests {
         assert_eq!(result.rust_cost, 15.0);
         assert_eq!(result.go_cost, 7.5);
         assert_eq!(result.calls, 1);
+
+        let mut other = rec.clone();
+        other.credential_id = 10;
+        agg.ingest(&other);
+        let credential_filter = std::collections::HashSet::from([9]);
+        let (_, filtered) = agg.query_billing(window, None, Some(&credential_filter), &config);
+        assert_eq!(filtered.upstream_cost, 10.0);
+        assert_eq!(filtered.rust_cost, 15.0);
+        assert_eq!(filtered.go_cost, 7.5);
+        assert_eq!(filtered.calls, 1);
     }
 }
