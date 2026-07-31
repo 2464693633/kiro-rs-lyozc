@@ -179,46 +179,6 @@ impl CacheEngines {
         }
     }
 
-    /// Compute both simulated engines for the billing comparison snapshot.
-    pub fn compute_billing_usage(
-        &self,
-        req: &MessagesRequest,
-        key_id: u64,
-        account_id: u64,
-        skip: Option<CacheEngineKind>,
-    ) -> (CacheUsage, CacheUsage) {
-        let rust = if skip == Some(CacheEngineKind::Rust) {
-            CacheUsage::default()
-        } else {
-            self.rust
-                .as_ref()
-                .map(|cache| super::cache_metering::compute_cache_usage(cache, req, key_id))
-                .unwrap_or_default()
-        };
-        let go = if skip == Some(CacheEngineKind::Go) {
-            CacheUsage::default()
-        } else {
-            self.go
-                .as_ref()
-                .and_then(|tracker| {
-                    let estimated_total =
-                        super::cache_metering_go::estimate_claude_request_input_tokens(req);
-                    build_claude_profile(req, estimated_total, tracker.effective_ttl_ms()).map(|profile| {
-                        let total = profile.total_input_tokens as i32;
-                        let usage = tracker.compute_for_account(account_id, &profile);
-                        (usage, total)
-                    })
-                })
-                .map(|(usage, total)| CacheUsage {
-                    cache_read: usage.cache_read as i32,
-                    cache_covered_est: (usage.cache_creation + usage.cache_read) as i32,
-                    prompt_total_est: total,
-                })
-                .unwrap_or_default()
-        };
-        (rust, go)
-    }
-
     /// 阶段二：**仅在请求成功后调用**。引擎 A 走空分支。
     pub fn commit(&self, pending: PendingCache, account_id: u64) {
         match pending {

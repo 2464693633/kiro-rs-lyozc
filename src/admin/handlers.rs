@@ -1858,3 +1858,31 @@ pub async fn delete_group(
     )))
     .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn custom_billing_window_includes_the_whole_end_date() {
+        let window = custom_stats_window("2026-07-01", "2026-07-07", StatsGranularity::Day)
+            .expect("valid custom date range");
+        let expected_start =
+            local_midnight_ts(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()).unwrap();
+        let expected_end = local_midnight_ts(NaiveDate::from_ymd_opt(2026, 7, 8).unwrap()).unwrap();
+
+        assert_eq!(window.start_ts, expected_start);
+        assert_eq!(window.end_ts, expected_end);
+        assert_eq!(window.granularity, StatsGranularity::Day);
+    }
+
+    #[test]
+    fn custom_billing_window_rejects_incomplete_or_reversed_dates() {
+        let incomplete = HashMap::from([
+            ("startDate".to_string(), "2026-07-01".to_string()),
+            ("granularity".to_string(), "day".to_string()),
+        ]);
+        assert!(parse_stats_window(&incomplete).is_err());
+        assert!(custom_stats_window("2026-07-08", "2026-07-01", StatsGranularity::Day).is_err());
+    }
+}

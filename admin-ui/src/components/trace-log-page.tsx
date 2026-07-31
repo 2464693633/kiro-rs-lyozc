@@ -183,7 +183,7 @@ interface TraceBillingRow {
 }
 
 function traceBillingRows(rec: TraceRecord, config?: BillingConfig): TraceBillingRow[] {
-  if (!rec.upstreamUsage || !rec.rustUsage || !rec.goUsage) return []
+  if (!rec.upstreamUsage) return []
   const price = config?.modelPrices[rec.model]
   const makeRow = (
     label: string,
@@ -201,7 +201,7 @@ function traceBillingRows(rec: TraceRecord, config?: BillingConfig): TraceBillin
     deltaCost: null,
     deltaPercent: null,
   })
-  const rows = [
+  const rows: TraceBillingRow[] = [
     makeRow(
       '上游真实',
       '上游',
@@ -209,8 +209,12 @@ function traceBillingRows(rec: TraceRecord, config?: BillingConfig): TraceBillin
       config?.upstreamMultipliers[String(rec.finalCredentialId)] ?? 1,
       'bg-zinc-500',
     ),
-    makeRow('Rust 模拟', 'Rust', rec.rustUsage, config?.rustMultiplier ?? 1, 'bg-blue-500'),
-    makeRow('Go 模拟', 'Go', rec.goUsage, config?.goMultiplier ?? 1, 'bg-emerald-500'),
+    ...(rec.rustUsage
+      ? [makeRow('Rust 模拟', 'Rust', rec.rustUsage, config?.rustMultiplier ?? 1, 'bg-blue-500')]
+      : []),
+    ...(rec.goUsage
+      ? [makeRow('Go 模拟', 'Go', rec.goUsage, config?.goMultiplier ?? 1, 'bg-emerald-500')]
+      : []),
   ]
   const baseline = rows[0].cost
   if (baseline != null) {
@@ -523,7 +527,7 @@ function ExpandedDetail({
             <span className="font-medium">单次计费对比</span>
             <span className="text-muted-foreground">按当前模型价格与倍率动态计算</span>
           </div>
-          <div className="grid divide-y divide-border/50 md:grid-cols-3 md:divide-x md:divide-y-0">
+          <div className="grid divide-y divide-border/50 md:grid-cols-2 md:divide-x md:divide-y-0 lg:grid-cols-3">
             {billingRows.map((row) => (
               <div key={row.label} className="min-w-0 p-3 text-[12px]">
                 <div className="flex items-center justify-between gap-2">
@@ -816,9 +820,9 @@ export function TraceLogPage() {
       ]
       const lines = exported.records.map((record) => {
         const billingRows = traceBillingRows(record, billingConfig)
-        const upstream = billingRows[0]
-        const rust = billingRows[1]
-        const go = billingRows[2]
+        const upstream = billingRows.find((row) => row.shortLabel === '上游')
+        const rust = billingRows.find((row) => row.shortLabel === 'Rust')
+        const go = billingRows.find((row) => row.shortLabel === 'Go')
         return [
           record.ts,
           record.traceId,

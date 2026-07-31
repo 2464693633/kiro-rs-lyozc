@@ -15,6 +15,7 @@ import {
   ScrollText,
   Boxes,
   Wallet,
+  CalendarDays,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -60,7 +61,7 @@ import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
 import { useBillingComparison, useBillingConfig } from "@/hooks/use-billing";
-import type { StatsRange } from "@/types/api";
+import type { StatsRange, StatsTimeFilter } from "@/types/api";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -108,13 +109,51 @@ function formatMoney(value: number): string {
   return `$${value.toFixed(4)}`;
 }
 
+function dateInputValue(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function presetStartDate(range: StatsRange, endDate: string): string {
+  const days = range === "24h" ? 0 : range === "7d" ? 6 : 29;
+  const date = new Date(`${endDate}T00:00:00`);
+  date.setDate(date.getDate() - days);
+  return dateInputValue(date);
+}
+
 function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
-  const [range, setRange] = useState<StatsRange>("7d");
+  const today = dateInputValue(new Date());
+  const [range, setRange] = useState<StatsRange | undefined>("7d");
+  const [customOpen, setCustomOpen] = useState(false);
+  const [startDate, setStartDate] = useState(() => presetStartDate("7d", today));
+  const [endDate, setEndDate] = useState(today);
+  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>({
+    range: "7d",
+    granularity: "day",
+  });
   const { data, isLoading, isFetching, isError } = useBillingComparison(
-    { range, granularity: range === "24h" ? "hour" : "day" },
+    timeFilter,
     { credentialId },
   );
   const { data: config } = useBillingConfig();
+  const selectPreset = (nextRange: StatsRange) => {
+    const currentEnd = dateInputValue(new Date());
+    setRange(nextRange);
+    setStartDate(presetStartDate(nextRange, currentEnd));
+    setEndDate(currentEnd);
+    setCustomOpen(false);
+    setTimeFilter({
+      range: nextRange,
+      granularity: nextRange === "24h" ? "hour" : "day",
+    });
+  };
+  const applyCustomRange = () => {
+    if (!startDate || !endDate || endDate < startDate) return;
+    setRange(undefined);
+    setTimeFilter({ startDate, endDate, granularity: "day" });
+  };
   const rows = [
     {
       label: "上游真实",
@@ -123,21 +162,32 @@ function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
       multiplier: config?.upstreamMultipliers[String(credentialId)] ?? 1,
       color: "bg-red-500",
     },
-    {
-      label: "Rust 模拟",
-      tokens: data?.rustTokens ?? 0,
-      cost: data?.rustCost ?? 0,
-      multiplier: config?.rustMultiplier ?? 1,
-      color: "bg-blue-500",
-    },
-    {
-      label: "Go 模拟",
-      tokens: data?.goTokens ?? 0,
-      cost: data?.goCost ?? 0,
-      multiplier: config?.goMultiplier ?? 1,
-      color: "bg-emerald-500",
-    },
+    ...((data?.rustTokens ?? 0) > 0 || (data?.rustCost ?? 0) > 0
+      ? [{
+          label: "Rust 模拟",
+          tokens: data?.rustTokens ?? 0,
+          cost: data?.rustCost ?? 0,
+          multiplier: config?.rustMultiplier ?? 1,
+          color: "bg-blue-500",
+        }]
+      : []),
+    ...((data?.goTokens ?? 0) > 0 || (data?.goCost ?? 0) > 0
+      ? [{
+          label: "Go 模拟",
+          tokens: data?.goTokens ?? 0,
+          cost: data?.goCost ?? 0,
+          multiplier: config?.goMultiplier ?? 1,
+          color: "bg-emerald-500",
+        }]
+      : []),
   ];
+  const timeText = timeFilter.range
+    ? timeFilter.range === "24h"
+      ? "近 1 天"
+      : timeFilter.range === "7d"
+        ? "近 7 天"
+        : "近 30 天"
+    : `${timeFilter.startDate} 至 ${timeFilter.endDate}`;
 
   return (
     <div className="rounded-lg border border-border/60 bg-secondary/30 p-3">
@@ -145,7 +195,7 @@ function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
         <div>
           <div className="text-sm font-medium">费用对比</div>
           <div className="text-[11px] text-muted-foreground">
-            {data?.calls ?? 0} 次调用 · 按模型价格计算
+            {data?.calls ?? 0} 次调用 · {timeText}
           </div>
         </div>
         <div className="inline-flex rounded-md border bg-background p-0.5" aria-label="统计时间段">
@@ -160,13 +210,55 @@ function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
               size="sm"
               variant={range === value ? "secondary" : "ghost"}
               className="h-6 px-2 text-[11px]"
-              onClick={() => setRange(value)}
+              onClick={() => selectPreset(value)}
             >
               {label}
             </Button>
           ))}
+          <Button
+            type="button"
+            size="icon"
+            variant={range === undefined || customOpen ? "secondary" : "ghost"}
+            className="h-6 w-7"
+            title="自定义日期"
+            aria-label="自定义日期"
+            onClick={() => setCustomOpen((open) => !open)}
+          >
+            <CalendarDays className="h-3.5 w-3.5" />
+          </Button>
         </div>
       </div>
+      {customOpen && (
+        <div className="mb-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[420px]:grid-cols-1">
+          <Input
+            type="date"
+            value={startDate}
+            max={endDate || today}
+            aria-label="统计开始日期"
+            className="h-8 min-w-0 text-xs"
+            onChange={(event) => setStartDate(event.target.value)}
+          />
+          <span className="text-center text-xs text-muted-foreground max-[420px]:hidden">至</span>
+          <Input
+            type="date"
+            value={endDate}
+            min={startDate}
+            max={today}
+            aria-label="统计结束日期"
+            className="h-8 min-w-0 text-xs"
+            onChange={(event) => setEndDate(event.target.value)}
+          />
+          <Button
+            type="button"
+            size="sm"
+            className="col-span-3 h-8 text-xs max-[420px]:col-span-1"
+            disabled={!startDate || !endDate || endDate < startDate}
+            onClick={applyCustomRange}
+          >
+            查询
+          </Button>
+        </div>
+      )}
       <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-3 border-b border-border/50 pb-1 text-[10px] text-muted-foreground">
         <span>计费来源</span>
         <span className="text-right">Token</span>

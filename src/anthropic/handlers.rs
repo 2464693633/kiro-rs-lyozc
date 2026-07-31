@@ -72,16 +72,14 @@ pub(crate) struct UsageRecordHook {
         parking_lot::Mutex<
             Option<(
                 TokenUsageBreakdown,
-                TokenUsageBreakdown,
-                TokenUsageBreakdown,
+                Option<TokenUsageBreakdown>,
+                Option<TokenUsageBreakdown>,
             )>,
         >,
     >,
     billing_request: std::sync::Arc<
         parking_lot::Mutex<
             Option<(
-                MessagesRequest,
-                u64,
                 super::cache_engine::CacheEngineKind,
                 super::cache_metering::CacheUsage,
             )>,
@@ -105,6 +103,38 @@ fn scaled_billing_usage(
         output_tokens: scale(upstream.output_tokens as i32, multipliers.1),
         cache_creation_tokens: scale(creation, multipliers.3),
         cache_read_tokens: scale(read, multipliers.2),
+    }
+}
+
+fn selected_billing_snapshot(
+    kind: super::cache_engine::CacheEngineKind,
+    selected_usage: super::cache_metering::CacheUsage,
+    upstream: TokenUsageBreakdown,
+    multipliers: ((f64, f64, f64, f64), (f64, f64, f64, f64)),
+) -> (
+    TokenUsageBreakdown,
+    Option<TokenUsageBreakdown>,
+    Option<TokenUsageBreakdown>,
+) {
+    match kind {
+        super::cache_engine::CacheEngineKind::Rust => (
+            upstream,
+            Some(scaled_billing_usage(
+                selected_usage,
+                upstream,
+                multipliers.0,
+            )),
+            None,
+        ),
+        super::cache_engine::CacheEngineKind::Go => (
+            upstream,
+            None,
+            Some(scaled_billing_usage(
+                selected_usage,
+                upstream,
+                multipliers.1,
+            )),
+        ),
     }
 }
 
@@ -132,6 +162,14 @@ impl UsageRecordHook {
     /// 提交缓存写入。只在 `status == "success"` 时调用，使失败请求不污染缓存
     /// （对齐 Go：`Update` 只在成功分支执行）。
     fn resolve_pending_cache(&self, credential_id: u64) -> super::cache_metering::CacheUsage {
+        let selected = self.billing_request.lock().as_ref().copied();
+        let Some((kind, begin_usage)) = selected else {
+            return super::cache_metering::CacheUsage::default();
+        };
+        if kind == super::cache_engine::CacheEngineKind::Rust {
+            return begin_usage;
+        }
+
         let pending = self.pending_cache.lock();
         match pending.as_ref() {
             Some(pending) => self.cache_engines.compute_pending(pending, credential_id),
@@ -142,58 +180,42 @@ impl UsageRecordHook {
     fn set_billing_usage(
         &self,
         upstream: TokenUsageBreakdown,
-        rust: TokenUsageBreakdown,
-        go: TokenUsageBreakdown,
+        rust: Option<TokenUsageBreakdown>,
+        go: Option<TokenUsageBreakdown>,
     ) {
         *self.billing_usage.lock() = Some((upstream, rust, go));
     }
 
     fn set_billing_request(
         &self,
-        request: MessagesRequest,
         kind: super::cache_engine::CacheEngineKind,
         usage: super::cache_metering::CacheUsage,
     ) {
-        *self.billing_request.lock() = Some((request, self.key_id, kind, usage));
+        *self.billing_request.lock() = Some((kind, usage));
     }
 
     fn set_selected_billing_usage(&self, usage: super::cache_metering::CacheUsage) {
-        if let Some((_, _, _, selected)) = self.billing_request.lock().as_mut() {
+        if let Some((_, selected)) = self.billing_request.lock().as_mut() {
             *selected = usage;
         }
     }
 
     fn set_upstream_billing_usage(
         &self,
-        credential_id: u64,
         upstream: TokenUsageBreakdown,
         global_multipliers: (f64, f64, f64),
     ) -> Option<(
         TokenUsageBreakdown,
-        TokenUsageBreakdown,
-        TokenUsageBreakdown,
+        Option<TokenUsageBreakdown>,
+        Option<TokenUsageBreakdown>,
     )> {
-        let Some((request, key_id, kind, selected_usage)) =
-            self.billing_request.lock().as_ref().cloned()
-        else {
+        let Some((kind, selected_usage)) = self.billing_request.lock().as_ref().copied() else {
             return None;
         };
-        let (rust, go) =
-            self.cache_engines
-                .compute_billing_usage(&request, key_id, credential_id, Some(kind));
-        let (rust, go) = match kind {
-            super::cache_engine::CacheEngineKind::Rust => (selected_usage, go),
-            super::cache_engine::CacheEngineKind::Go => (rust, selected_usage),
-        };
-        let (rust_multipliers, go_multipliers) =
-            self.cache_engines.billing_multipliers(global_multipliers);
-        // billing 对比应记录客户端实际看到的模拟 token，而不是倍率应用前的
-        // 内部估算值。上游真实 usage 保持原始值，供真实费用对照。
-        let usage = (
-            upstream,
-            scaled_billing_usage(rust, upstream, rust_multipliers),
-            scaled_billing_usage(go, upstream, go_multipliers),
-        );
+        let multipliers = self.cache_engines.billing_multipliers(global_multipliers);
+        // 只记录当前 Key 选中的模拟引擎。另一套引擎不参与本次请求的客户端计费，
+        // 也不应因为“对比”而额外修改缓存状态。
+        let usage = selected_billing_snapshot(kind, selected_usage, upstream, multipliers);
         self.set_billing_usage(usage.0, usage.1, usage.2);
         Some(usage)
     }
@@ -216,7 +238,7 @@ impl UsageRecordHook {
     ) {
         let billing_usage = self.billing_usage.lock().take();
         let (is_upstream, upstream_usage, rust_usage, go_usage) = match billing_usage {
-            Some((upstream, rust, go)) => (true, Some(upstream), Some(rust), Some(go)),
+            Some((upstream, rust, go)) => (true, Some(upstream), rust, go),
             None => (false, None, None, None),
         };
         let rec = UsageRecord {
@@ -289,8 +311,8 @@ pub(crate) struct RequestTracer {
     billing_usage: parking_lot::Mutex<
         Option<(
             TokenUsageBreakdown,
-            TokenUsageBreakdown,
-            TokenUsageBreakdown,
+            Option<TokenUsageBreakdown>,
+            Option<TokenUsageBreakdown>,
         )>,
     >,
 }
@@ -339,8 +361,8 @@ impl RequestTracer {
         &self,
         usage: (
             TokenUsageBreakdown,
-            TokenUsageBreakdown,
-            TokenUsageBreakdown,
+            Option<TokenUsageBreakdown>,
+            Option<TokenUsageBreakdown>,
         ),
     ) {
         *self.billing_usage.lock() = Some(usage);
@@ -392,9 +414,9 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
-            upstream_usage: billing_usage.map(|value| value.0),
-            rust_usage: billing_usage.map(|value| value.1),
-            go_usage: billing_usage.map(|value| value.2),
+            upstream_usage: billing_usage.as_ref().map(|value| value.0),
+            rust_usage: billing_usage.as_ref().and_then(|value| value.1),
+            go_usage: billing_usage.as_ref().and_then(|value| value.2),
             attempts,
         };
         store.insert(&rec);
@@ -920,7 +942,7 @@ pub async fn post_messages(
         state
             .cache_engines
             .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
-    hook.set_billing_request(payload.clone(), key_ctx.cache_engine, cache_usage);
+    hook.set_billing_request(key_ctx.cache_engine, cache_usage);
     hook.set_pending_cache(pending_cache);
 
     // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
@@ -1045,11 +1067,9 @@ async fn handle_stream_request(
         // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
-            if let Some(billing_usage) = hook.set_upstream_billing_usage(
-                credential_id,
-                usage.raw_usage,
-                provider.get_inflation_multipliers(),
-            ) {
+            if let Some(billing_usage) = hook
+                .set_upstream_billing_usage(usage.raw_usage, provider.get_inflation_multipliers())
+            {
                 tracer.set_billing_usage(billing_usage);
             }
             hook.record(
@@ -1349,11 +1369,9 @@ async fn handle_non_stream_request(
                 cache_usage,
             )
             .await;
-        if let Some(billing_usage) = hook.set_upstream_billing_usage(
-            credential_id,
-            raw_usage,
-            provider.get_inflation_multipliers(),
-        ) {
+        if let Some(billing_usage) =
+            hook.set_upstream_billing_usage(raw_usage, provider.get_inflation_multipliers())
+        {
             tracer.set_billing_usage(billing_usage);
         }
         hook.record(
@@ -1928,7 +1946,7 @@ pub async fn post_messages_cc(
         state
             .cache_engines
             .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
-    hook.set_billing_request(payload.clone(), key_ctx.cache_engine, cache_usage);
+    hook.set_billing_request(key_ctx.cache_engine, cache_usage);
     hook.set_pending_cache(pending_cache);
 
     // 序列化 Anthropic 格式请求体：使用 override_thinking 之前捕获的原始版本（上游直通时使用）
@@ -2054,11 +2072,9 @@ async fn handle_stream_request_buffered(
         );
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
-            if let Some(billing_usage) = hook.set_upstream_billing_usage(
-                credential_id,
-                usage.raw_usage,
-                provider.get_inflation_multipliers(),
-            ) {
+            if let Some(billing_usage) = hook
+                .set_upstream_billing_usage(usage.raw_usage, provider.get_inflation_multipliers())
+            {
                 tracer.set_billing_usage(billing_usage);
             }
             hook.record(
@@ -2282,6 +2298,63 @@ mod tests {
         assert_eq!(usage.cache_creation_tokens, 150);
         assert_eq!(usage.cache_read_tokens, 180);
         assert_eq!(upstream.input_tokens, 100, "上游原始 usage 不得被修改");
+    }
+
+    #[test]
+    fn billing_snapshot_only_keeps_the_selected_engine() {
+        let upstream = TokenUsageBreakdown {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_tokens: 20,
+            cache_read_tokens: 30,
+        };
+        let simulated = super::super::cache_metering::CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        let multipliers = ((2.0, 3.0, 4.0, 5.0), (1.5, 1.0, 2.5, 0.75));
+
+        let (_, rust, go) = super::selected_billing_snapshot(
+            super::super::cache_engine::CacheEngineKind::Rust,
+            simulated,
+            upstream,
+            multipliers,
+        );
+        assert!(rust.is_some(), "Rust Key 必须记录 Rust 模拟计费");
+        assert!(go.is_none(), "Rust Key 不得记录 Go 模拟计费");
+
+        let (_, rust, go) = super::selected_billing_snapshot(
+            super::super::cache_engine::CacheEngineKind::Go,
+            simulated,
+            upstream,
+            multipliers,
+        );
+        assert!(rust.is_none(), "Go Key 不得记录 Rust 模拟计费");
+        assert!(go.is_some(), "Go Key 必须记录 Go 模拟计费");
+    }
+
+    #[test]
+    fn rust_billing_keeps_the_usage_computed_at_begin() {
+        let state = AppState::new(
+            false,
+            crate::model::config::ToolCompatibilityMode::default(),
+        );
+        let hook = UsageRecordHook::from_state(&state, 7, "test-model".to_string());
+        let expected = super::super::cache_metering::CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+
+        hook.set_billing_request(super::super::cache_engine::CacheEngineKind::Rust, expected);
+        // Rust begin 返回 PendingCache::None，但该值仍会被包进外层 Option。
+        hook.set_pending_cache(super::super::cache_engine::PendingCache::None);
+
+        let actual = hook.resolve_pending_cache(42);
+        assert_eq!(actual.cache_read, expected.cache_read);
+        assert_eq!(actual.cache_covered_est, expected.cache_covered_est);
+        assert_eq!(actual.prompt_total_est, expected.prompt_total_est);
     }
 
     #[test]

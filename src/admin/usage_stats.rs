@@ -52,7 +52,7 @@ pub struct UsageRecord {
     /// True only for direct upstream Anthropic credentials.
     #[serde(default)]
     pub is_upstream: bool,
-    /// Raw upstream usage and the two simulated client usage snapshots.
+    /// Raw upstream usage and the simulated usage for the engine selected by this request.
     #[serde(default)]
     pub upstream_usage: Option<TokenUsageBreakdown>,
     #[serde(default)]
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn billing_query_calculates_upstream_and_engine_costs() {
         let agg = UsageAggregator::new();
-        let rec = UsageRecord {
+        let rust_rec = UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
             credential_id: 9,
@@ -1125,12 +1125,9 @@ mod tests {
                 input_tokens: 2_000_000,
                 ..Default::default()
             }),
-            go_usage: Some(TokenUsageBreakdown {
-                input_tokens: 3_000_000,
-                ..Default::default()
-            }),
+            go_usage: None,
         };
-        agg.ingest(&rec);
+        agg.ingest(&rust_rec);
         let mut config = crate::model::config::BillingConfig::default();
         config.model_prices.insert(
             "m".to_string(),
@@ -1146,17 +1143,31 @@ mod tests {
         let (_, result) = agg.query_billing(window, None, None, &config);
         assert_eq!(result.upstream_cost, 10.0);
         assert_eq!(result.rust_cost, 15.0);
-        assert_eq!(result.go_cost, 7.5);
+        assert_eq!(result.go_cost, 0.0, "Rust 请求不得累计 Go 引擎费用");
         assert_eq!(result.calls, 1);
 
-        let mut other = rec.clone();
+        let mut other = rust_rec.clone();
         other.credential_id = 10;
         agg.ingest(&other);
         let credential_filter = std::collections::HashSet::from([9]);
         let (_, filtered) = agg.query_billing(window, None, Some(&credential_filter), &config);
         assert_eq!(filtered.upstream_cost, 10.0);
         assert_eq!(filtered.rust_cost, 15.0);
-        assert_eq!(filtered.go_cost, 7.5);
+        assert_eq!(filtered.go_cost, 0.0);
         assert_eq!(filtered.calls, 1);
+
+        let mut go_rec = rust_rec;
+        go_rec.rust_usage = None;
+        go_rec.go_usage = Some(TokenUsageBreakdown {
+            input_tokens: 3_000_000,
+            ..Default::default()
+        });
+        agg.ingest(&go_rec);
+
+        let (_, mixed) = agg.query_billing(window, None, Some(&credential_filter), &config);
+        assert_eq!(mixed.upstream_cost, 20.0);
+        assert_eq!(mixed.rust_cost, 15.0, "Go 请求不得再次累计 Rust 引擎费用");
+        assert_eq!(mixed.go_cost, 7.5);
+        assert_eq!(mixed.calls, 2);
     }
 }
