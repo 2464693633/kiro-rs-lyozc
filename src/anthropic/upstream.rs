@@ -9,7 +9,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
-use futures::{stream, StreamExt};
+use futures::StreamExt;
 use std::convert::Infallible;
 
 use super::cache_metering::CacheUsage;
@@ -71,6 +71,7 @@ pub async fn handle_upstream_non_stream_response(
     output_mul: f64,
     cache_mul: f64,
     cache_creation_mul: f64,
+    simulated_total_input: i32,
     cache_usage: CacheUsage,
 ) -> (Response, i32, i32, i32, i32, TokenUsageBreakdown) {
     let status = response.status();
@@ -98,9 +99,8 @@ pub async fn handle_upstream_non_stream_response(
         }
     };
 
-    // 提取真实 token 数，计算总 input（用于模拟缓存分摊）
+    // 提取真实 token 数，仅用于上游真实计费快照；客户端模拟不依赖这组 input/cache 值。
     let (real_input, real_output, real_cc, real_cr) = extract_usage(&json);
-    let total_input = real_input + real_cc + real_cr;
     let raw_usage = TokenUsageBreakdown {
         input_tokens: real_input.max(0) as u64,
         output_tokens: real_output.max(0) as u64,
@@ -108,15 +108,31 @@ pub async fn handle_upstream_non_stream_response(
         cache_read_tokens: real_cr.max(0) as u64,
     };
 
-    // 用模拟缓存替换上游真实 Anthropic 缓存（与 Kiro 账号路径一致）
-    let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
+    // 像 kiro-go 一样，用当前缓存引擎的模拟总输入生成客户端 usage。
+    let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(simulated_total_input);
 
-    // 应用膨胀倍率并写回 usage 字段
-    if let Some(usage) = json.get_mut("usage") {
-        usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
-        usage["output_tokens"] = serde_json::json!((real_output as f64 * output_mul).round() as i64);
-        usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_creation_mul).round() as i64);
-        usage["cache_read_input_tokens"] = serde_json::json!((sim_cr as f64 * cache_mul).round() as i64);
+    // 重建标准 Anthropic usage。上游没有 usage 时也补齐，避免客户端拿到原始/缺失口径。
+    let usage = json
+        .as_object_mut()
+        .map(|object| object.entry("usage").or_insert_with(|| serde_json::json!({})))
+        .and_then(|value| value.as_object_mut());
+    if let Some(usage) = usage {
+        usage.insert(
+            "input_tokens".to_string(),
+            serde_json::json!((sim_input as f64 * input_mul).round() as i64),
+        );
+        usage.insert(
+            "output_tokens".to_string(),
+            serde_json::json!((real_output as f64 * output_mul).round() as i64),
+        );
+        usage.insert(
+            "cache_creation_input_tokens".to_string(),
+            serde_json::json!((sim_cc as f64 * cache_creation_mul).round() as i64),
+        );
+        usage.insert(
+            "cache_read_input_tokens".to_string(),
+            serde_json::json!((sim_cr as f64 * cache_mul).round() as i64),
+        );
     }
 
     let resp = Response::builder()
@@ -139,6 +155,7 @@ fn inflate_sse_event(
     output_mul: f64,
     cache_mul: f64,
     cache_creation_mul: f64,
+    simulated_total_input: i32,
     cache_usage: CacheUsage,
 ) -> String {
     let mut event_type: Option<&str> = None;
@@ -155,16 +172,9 @@ fn inflate_sse_event(
     match (event_type, data_line) {
         (Some("message_start"), Some(data)) => {
             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(data) {
-                // 计算总 input（含真实缓存字段）用于模拟缓存分摊
-                let total_input = {
-                    let u = json.pointer("/message/usage");
-                    let i = u.and_then(|v| v.get("input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-                    let cc = u.and_then(|v| v.get("cache_creation_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-                    let cr = u.and_then(|v| v.get("cache_read_input_tokens")).and_then(|v| v.as_i64()).unwrap_or(0);
-                    (i + cc + cr) as i32
-                };
-                // 用模拟缓存分摊替换真实 Anthropic 缓存
-                let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(total_input);
+                // 用当前缓存引擎的模拟总输入分摊 usage，不读取上游 input/cache 作为客户端口径。
+                let (sim_input, sim_cc, sim_cr) =
+                    cache_usage.split_against_total(simulated_total_input);
                 if let Some(usage) = json.pointer_mut("/message/usage") {
                     usage["input_tokens"] = serde_json::json!((sim_input as f64 * input_mul).round() as i64);
                     usage["cache_creation_input_tokens"] = serde_json::json!((sim_cc as f64 * cache_creation_mul).round() as i64);
@@ -193,6 +203,7 @@ fn inflate_sse_event(
 fn update_stream_stats(
     event_text: &str,
     stats: &mut UpstreamStreamUsage,
+    simulated_total_input: i32,
     cache_usage: CacheUsage,
 ) {
     let mut event_type: Option<&str> = None;
@@ -211,7 +222,8 @@ fn update_stream_stats(
                 stats.raw_usage.input_tokens = i.max(0) as u64;
                 stats.raw_usage.cache_creation_tokens = cc.max(0) as u64;
                 stats.raw_usage.cache_read_tokens = cr.max(0) as u64;
-                let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total((i + cc + cr) as i32);
+                let (sim_input, sim_cc, sim_cr) =
+                    cache_usage.split_against_total(simulated_total_input);
                 stats.input_tokens = sim_input;
                 stats.cache_creation_tokens = sim_cc;
                 stats.cache_read_tokens = sim_cr;
@@ -240,6 +252,7 @@ pub fn handle_upstream_stream_response_with_inflation(
     output_mul: f64,
     cache_mul: f64,
     cache_creation_mul: f64,
+    simulated_total_input: i32,
     cache_usage: CacheUsage,
 ) -> (Response, tokio::sync::oneshot::Receiver<UpstreamStreamUsage>) {
     let (usage_tx, usage_rx) = tokio::sync::oneshot::channel::<UpstreamStreamUsage>();
@@ -270,8 +283,21 @@ pub fn handle_upstream_stream_response_with_inflation(
                 let event_text = buffer[..pos + 2].to_string();
                 buffer = buffer[pos + 2..].to_string();
                 // 提取膨胀前用量（在 inflate 之前）
-                update_stream_stats(&event_text, &mut stats, cache_usage);
-                let inflated = inflate_sse_event(&event_text, input_mul, output_mul, cache_mul, cache_creation_mul, cache_usage);
+                update_stream_stats(
+                    &event_text,
+                    &mut stats,
+                    simulated_total_input,
+                    cache_usage,
+                );
+                let inflated = inflate_sse_event(
+                    &event_text,
+                    input_mul,
+                    output_mul,
+                    cache_mul,
+                    cache_creation_mul,
+                    simulated_total_input,
+                    cache_usage,
+                );
                 if bytes_tx.send(Bytes::from(inflated)).await.is_err() {
                     // 客户端已断开
                     return;
@@ -330,4 +356,76 @@ fn extract_usage(json: &serde_json::Value) -> (i32, i32, i32, i32) {
     let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
     (input, output, cache_creation, cache_read)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_usage_uses_simulated_total_instead_of_upstream_total() {
+        let cache_usage = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 100,
+            prompt_total_est: 200,
+        };
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"usage\":{\"input_tokens\":10,",
+            "\"cache_creation_input_tokens\":20,\"cache_read_input_tokens\":30}}}\n\n"
+        );
+
+        let rendered = inflate_sse_event(
+            event,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            200,
+            cache_usage,
+        );
+        let data = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("message_start 必须包含 data");
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["message"]["usage"];
+
+        // 模拟总量为 200，缓存覆盖率为 50%，所以客户端应看到
+        // input=100、cache_creation=50、cache_read=50，而不是上游的 60 总量。
+        assert_eq!(usage["input_tokens"], serde_json::json!(100));
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(50));
+        assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(50));
+    }
+
+    #[test]
+    fn json_usage_uses_simulated_total_and_preserves_real_output() {
+        let mut json = serde_json::json!({
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 7,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 30
+            }
+        });
+        let cache_usage = CacheUsage {
+            cache_read: 25,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+        };
+        let (input, creation, read) = cache_usage.split_against_total(300);
+
+        // 直接验证实际响应重写使用的是 split_against_total 的模拟口径；
+        // 上游原始 input/cache 总量 60 不应参与分摊。
+        assert_eq!((input, creation, read), (150, 75, 75));
+        let usage = json["usage"].as_object_mut().unwrap();
+        usage.insert("input_tokens".into(), serde_json::json!(input));
+        usage.insert("output_tokens".into(), serde_json::json!(7));
+        usage.insert("cache_creation_input_tokens".into(), serde_json::json!(creation));
+        usage.insert("cache_read_input_tokens".into(), serde_json::json!(read));
+        assert_eq!(json["usage"]["input_tokens"], serde_json::json!(150));
+        assert_eq!(json["usage"]["cache_creation_input_tokens"], serde_json::json!(75));
+        assert_eq!(json["usage"]["cache_read_input_tokens"], serde_json::json!(75));
+        assert_eq!(json["usage"]["output_tokens"], serde_json::json!(7));
+    }
 }

@@ -232,15 +232,23 @@ pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResul
 }
 
 /// 生成 WebSearch SSE 响应流
+#[allow(clippy::too_many_arguments)]
 pub fn create_websearch_sse_stream(
     model: String,
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events =
-        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
+    let events = generate_websearch_events(
+        &model,
+        &query,
+        &tool_use_id,
+        search_results,
+        input_tokens,
+        cache_usage,
+    );
 
     stream::iter(
         events
@@ -256,12 +264,18 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
     );
+
+    // 缓存模拟：与其它路径同口径，用 split_against_total 把估算分摊到
+    // input / cache_creation / cache_read，保证三者之和 == input_tokens。
+    // 此前这三项硬编码 input_tokens/0/0，WebSearch 的模拟缓存全部丢失。
+    let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(input_tokens);
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -276,10 +290,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": input_tokens,
+                    "input_tokens": sim_input,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_creation_input_tokens": sim_cc,
+                    "cache_read_input_tokens": sim_cr
                 }
             }
         }),
@@ -526,6 +540,7 @@ fn finish_mcp_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_websearch_response(
     stream_response: bool,
     model: String,
@@ -533,10 +548,17 @@ fn render_websearch_response(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
 ) -> Response {
     if stream_response {
-        let stream =
-            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
+        let stream = create_websearch_sse_stream(
+            model,
+            query,
+            tool_use_id,
+            search_results,
+            input_tokens,
+            cache_usage,
+        );
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -548,8 +570,26 @@ fn render_websearch_response(
         let content = build_websearch_content(&query, &tool_use_id, &search_results);
         let summary = generate_search_summary(&query, &search_results);
         let output_tokens = (summary.len() as i32 + 3) / 4;
-        // 本地 WebSearch 不走上游，不会收到 meteringEvent，因此也不带 credit_* 字段。
-        super::websearch_loop::render_json(&model, content, "end_turn", input_tokens, output_tokens, "", None)
+        // 缓存模拟：与流式分支同口径分摊。不复用 websearch_loop::render_json，
+        // 因为它把 cache_* 硬编码为 0 且被 mixed-tools loop 共用，改签名会牵连
+        // 那条路径。本地 WebSearch 不走上游、收不到 meteringEvent，故无 credit_* 字段。
+        let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(input_tokens);
+        let body = serde_json::json!({
+            "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
+            "type": "message",
+            "role": "assistant",
+            "content": content,
+            "model": model,
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": sim_input,
+                "output_tokens": output_tokens,
+                "cache_creation_input_tokens": sim_cc,
+                "cache_read_input_tokens": sim_cr
+            }
+        });
+        (StatusCode::OK, Json(body)).into_response()
     }
 }
 
@@ -559,6 +599,7 @@ pub async fn handle_websearch_request(
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
+    cache_usage: super::cache_metering::CacheUsage,
 ) -> Response {
     // 上游凭据直通：Anthropic 原生支持 web_search_20250610 tool，直接透传请求。
     // 提前 acquire 一次以判断凭据类型（后续 call_api_dual 内部会再 acquire，
@@ -669,6 +710,7 @@ pub async fn handle_websearch_request(
         tool_use_id,
         search_results,
         input_tokens,
+        cache_usage,
     )
 }
 
@@ -713,6 +755,50 @@ mod tests {
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
     }
 
+    /// WebSearch 路径必须下发模拟缓存 token，且三项之和 == input_tokens。
+    ///
+    /// 回归防护：此前 WebSearch 分支在 `cache_engines.begin()` 之前就 return，
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0，
+    /// 且请求不进缓存表 —— 会话中间夹一次 WebSearch 会断掉后续的前缀链。
+    #[tokio::test]
+    async fn websearch_non_stream_carries_simulated_cache_tokens() {
+        // 造一个「有缓存命中」的场景：估算总量 100，被覆盖 80，其中 60 是读命中
+        // （余下 20 记为 creation），未覆盖的 20 记为 input。
+        let usage = super::super::cache_metering::CacheUsage {
+            cache_read: 60,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+        };
+
+        let response = render_websearch_response(
+            false,
+            "claude-sonnet-4".to_string(),
+            "rust".to_string(),
+            "srvtoolu_test".to_string(),
+            None,
+            100,
+            usage,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let u = &v["usage"];
+
+        let input = u["input_tokens"].as_i64().unwrap();
+        let cc = u["cache_creation_input_tokens"].as_i64().unwrap();
+        let cr = u["cache_read_input_tokens"].as_i64().unwrap();
+
+        assert_eq!(cr, 60, "读缓存应下发模拟值而非 0");
+        assert_eq!(
+            input + cc + cr,
+            100,
+            "三项之和必须等于 input_tokens（互斥分摊）"
+        );
+    }
+
     #[tokio::test]
     async fn test_non_stream_websearch_response_is_json() {
         let response = render_websearch_response(
@@ -722,6 +808,7 @@ mod tests {
             "srvtoolu_test".to_string(),
             None,
             12,
+            super::super::cache_metering::CacheUsage::default(),
         );
 
         assert_eq!(response.status(), StatusCode::OK);

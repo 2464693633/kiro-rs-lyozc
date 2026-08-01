@@ -9,9 +9,11 @@
 //!   （引擎 A 仍有额外的会话隔离规则）
 //! - **两阶段**：`compute` 只查、`update` 才写且只在请求成功后调用
 //!
-//! 不复刻 Go 的 HTML 转义：Go 逐字符串调 `json.Marshal` 会把 `<>&` 转成
-//! `<` 等，serde_json 不会。两个项目永不共享缓存文件，故只需保证 Rust 侧
-//! **自一致**（同一前缀恒哈希成同一值），该差异仅轻微影响 token 计数。
+//! 复刻 Go 的 HTML 转义：Go 的 `json.Marshal` 默认把 `<` `>` `&` 转成
+//! `<` `>` `&`，serde_json 不转。此前未对齐时，含这三个字符的
+//! 内容（HTML / 代码 / XML）在两侧算出**不同指纹**——虽然 Rust 侧仍自一致，
+//! 但 canonical JSON 的字节长度不同，喂给估算器的 token 数随之偏移，
+//! 且与 kiro-go 的实测数值无法对照。现由 [`push_go_escaped_string`] 对齐。
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -167,15 +169,33 @@ pub fn canonicalize_cache_value(value: &Value) -> String {
     buf
 }
 
+/// 按 Go `json.Marshal` 的口径写入 JSON 字符串字面量。
+///
+/// Go 的 `encoding/json` 默认开启 HTML 转义（`SetEscapeHTML(true)` 是默认值），
+/// 把 `<` `>` `&` 编码成 `<` `>` `&`；serde_json 不做这层转换。
+/// 这三个字符在 HTML / 代码 / XML 内容里极常见，不对齐会让 canonical JSON
+/// 的字节长度与 Go 侧不同，进而影响指纹与 token 估算。
+///
+/// 其余转义（引号、反斜杠、控制字符、Unicode）沿用 serde_json，两侧一致。
+fn push_go_escaped_string(buf: &mut String, s: &str) {
+    let encoded = serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string());
+    for ch in encoded.chars() {
+        match ch {
+            '<' => buf.push_str("\\u003c"),
+            '>' => buf.push_str("\\u003e"),
+            '&' => buf.push_str("\\u0026"),
+            other => buf.push(other),
+        }
+    }
+}
+
 fn write_canonical_json(buf: &mut String, value: &Value) {
     match value {
         Value::Null => buf.push_str("null"),
         Value::Bool(true) => buf.push_str("true"),
         Value::Bool(false) => buf.push_str("false"),
         Value::Number(n) => buf.push_str(&n.to_string()),
-        Value::String(s) => {
-            buf.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
-        }
+        Value::String(s) => push_go_escaped_string(buf, s),
         Value::Array(items) => {
             buf.push('[');
             for (i, item) in items.iter().enumerate() {
@@ -200,7 +220,7 @@ fn write_canonical_json(buf: &mut String, value: &Value) {
                     buf.push(',');
                 }
                 first = false;
-                buf.push_str(&serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string()));
+                push_go_escaped_string(buf, key);
                 buf.push(':');
                 write_canonical_json(buf, val);
             }
@@ -1249,6 +1269,59 @@ mod tests {
             canonicalize_cache_value(&v),
             r#"{"alpha":2,"mid":3,"zeta":1}"#
         );
+    }
+
+    /// 对齐 Go `json.Marshal` 的 HTML 转义（`<` `>` `&` → `<` `>` `&`）。
+    ///
+    /// 期望值取自 kiro-go 侧 `json.Marshal` 的**实测输出**，非推测。含这三个字符的
+    /// 内容（HTML / 代码 / XML）此前会算出与 Go 不同的 canonical JSON，导致
+    /// 字节长度和 token 估算偏移。非 ASCII 两侧都不转义。
+    #[test]
+    fn canonical_matches_go_html_escaping() {
+        let cases = [
+            ("a<b>c&d", "\"a\\u003cb\\u003ec\\u0026d\""),
+            (
+                "<div class=\"x\">Hello & bye</div>",
+                "\"\\u003cdiv class=\\\"x\\\"\\u003eHello \\u0026 bye\\u003c/div\\u003e\"",
+            ),
+            (
+                "if a < b && c > d { }",
+                "\"if a \\u003c b \\u0026\\u0026 c \\u003e d { }\"",
+            ),
+            ("plain ascii", "\"plain ascii\""),
+            // Go 不转义非 ASCII，与 serde_json 一致
+            ("中文 <tag>", "\"中文 \\u003ctag\\u003e\""),
+            // 其余转义沿用 serde_json，两侧本就一致
+            (
+                "quote \" and backslash \\",
+                "\"quote \\\" and backslash \\\\\"",
+            ),
+            ("newline\nhere", "\"newline\\nhere\""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                canonicalize_cache_value(&Value::String(input.to_string())),
+                expected,
+                "input={input:?}"
+            );
+        }
+    }
+
+    /// 对象 key 同样要转义——Go 对 key 也走 `json.Marshal`。
+    #[test]
+    fn canonical_escapes_object_keys_too() {
+        let v = json!({"a<b": 1});
+        assert_eq!(canonicalize_cache_value(&v), "{\"a\\u003cb\":1}");
+    }
+
+    /// 转义改变了指纹：含 `<>&` 的内容与不含的必须哈希成不同值，且转义后的
+    /// 字节长度进入 `write_hash_chunk` 的长度前缀，故两者不可能碰撞。
+    #[test]
+    fn html_escaping_affects_fingerprint_length_prefix() {
+        let with = canonicalize_cache_value(&Value::String("a<b".to_string()));
+        let without = canonicalize_cache_value(&Value::String("aXb".to_string()));
+        assert_ne!(with, without);
+        assert!(with.len() > without.len(), "转义后应更长: {with}");
     }
 
     #[test]

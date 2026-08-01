@@ -90,13 +90,10 @@ pub(crate) struct UsageRecordHook {
 fn scaled_billing_usage(
     usage: super::cache_metering::CacheUsage,
     upstream: TokenUsageBreakdown,
+    simulated_total_input: i32,
     multipliers: (f64, f64, f64, f64),
 ) -> TokenUsageBreakdown {
-    let total = upstream
-        .input_tokens
-        .saturating_add(upstream.cache_creation_tokens)
-        .saturating_add(upstream.cache_read_tokens) as i32;
-    let (input, creation, read) = usage.split_against_total(total);
+    let (input, creation, read) = usage.split_against_total(simulated_total_input);
     let scale = |value: i32, multiplier: f64| (value.max(0) as f64 * multiplier).round() as u64;
     TokenUsageBreakdown {
         input_tokens: scale(input, multipliers.0),
@@ -110,6 +107,7 @@ fn selected_billing_snapshot(
     kind: super::cache_engine::CacheEngineKind,
     selected_usage: super::cache_metering::CacheUsage,
     upstream: TokenUsageBreakdown,
+    simulated_total_input: i32,
     multipliers: ((f64, f64, f64, f64), (f64, f64, f64, f64)),
 ) -> (
     TokenUsageBreakdown,
@@ -122,6 +120,7 @@ fn selected_billing_snapshot(
             Some(scaled_billing_usage(
                 selected_usage,
                 upstream,
+                simulated_total_input,
                 multipliers.0,
             )),
             None,
@@ -132,6 +131,7 @@ fn selected_billing_snapshot(
             Some(scaled_billing_usage(
                 selected_usage,
                 upstream,
+                simulated_total_input,
                 multipliers.1,
             )),
         ),
@@ -203,6 +203,7 @@ impl UsageRecordHook {
     fn set_upstream_billing_usage(
         &self,
         upstream: TokenUsageBreakdown,
+        simulated_total_input: i32,
         global_multipliers: (f64, f64, f64),
     ) -> Option<(
         TokenUsageBreakdown,
@@ -215,7 +216,13 @@ impl UsageRecordHook {
         let multipliers = self.cache_engines.billing_multipliers(global_multipliers);
         // 只记录当前 Key 选中的模拟引擎。另一套引擎不参与本次请求的客户端计费，
         // 也不应因为“对比”而额外修改缓存状态。
-        let usage = selected_billing_snapshot(kind, selected_usage, upstream, multipliers);
+        let usage = selected_billing_snapshot(
+            kind,
+            selected_usage,
+            upstream,
+            simulated_total_input,
+            multipliers,
+        );
         self.set_billing_usage(usage.0, usage.1, usage.2);
         Some(usage)
     }
@@ -829,11 +836,22 @@ pub async fn post_messages(
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
+        // 缓存模拟：WebSearch 也要走 begin()，否则这条路径的请求既拿不到模拟
+        // 缓存（cache_* 恒为 0），也不进缓存表 —— 会话中间夹一次 WebSearch 就
+        // 断掉后续请求的前缀链。引擎 B 的写入在下面 record("success") 时提交。
+        let (ws_cache_usage, _ws_multipliers, ws_pending) =
+            state
+                .cache_engines
+                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+        hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
+        hook.set_pending_cache(ws_pending);
+
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            ws_cache_usage,
         )
         .await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
@@ -842,7 +860,9 @@ pub async fn post_messages(
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        // 记账口径与下发给客户端的 usage 保持一致（同一 split 结果）
+        let (rec_input, rec_cc, rec_cr) = ws_cache_usage.split_against_total(input_tokens);
+        hook.record(0, rec_input, 0, rec_cc, rec_cr, 0.0, status);
         return resp;
     }
 
@@ -1050,6 +1070,7 @@ async fn handle_stream_request(
     };
     let cache_usage = hook.resolve_pending_cache(call_result.credential_id);
     hook.set_selected_billing_usage(cache_usage);
+    let simulated_total_input = cache_usage.prompt_total_est.max(1);
 
     // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
@@ -1062,13 +1083,18 @@ async fn handle_stream_request(
             output_mul,
             cache_mul,
             cache_creation_mul,
+            simulated_total_input,
             cache_usage,
         );
         // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
             if let Some(billing_usage) = hook
-                .set_upstream_billing_usage(usage.raw_usage, provider.get_inflation_multipliers())
+                .set_upstream_billing_usage(
+                    usage.raw_usage,
+                    simulated_total_input,
+                    provider.get_inflation_multipliers(),
+                )
             {
                 tracer.set_billing_usage(billing_usage);
             }
@@ -1355,6 +1381,7 @@ async fn handle_non_stream_request(
     };
     let cache_usage = hook.resolve_pending_cache(call_result.credential_id);
     hook.set_selected_billing_usage(cache_usage);
+    let simulated_total_input = cache_usage.prompt_total_est.max(1);
 
     // 上游凭据直通：解析 JSON，用模拟缓存替换真实 Anthropic 缓存，应用膨胀倍率
     if call_result.is_upstream {
@@ -1366,11 +1393,16 @@ async fn handle_non_stream_request(
                 output_mul,
                 cache_mul,
                 cache_creation_mul,
+                simulated_total_input,
                 cache_usage,
             )
             .await;
         if let Some(billing_usage) =
-            hook.set_upstream_billing_usage(raw_usage, provider.get_inflation_multipliers())
+            hook.set_upstream_billing_usage(
+                raw_usage,
+                simulated_total_input,
+                provider.get_inflation_multipliers(),
+            )
         {
             tracer.set_billing_usage(billing_usage);
         }
@@ -1837,11 +1869,20 @@ pub async fn post_messages_cc(
             payload.messages.clone(),
             payload.tools.clone(),
         ) as i32;
+        // 与 /v1/messages 同处理：WebSearch 也要走 begin()，见该处注释。
+        let (ws_cache_usage, _ws_multipliers, ws_pending) =
+            state
+                .cache_engines
+                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+        hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
+        hook.set_pending_cache(ws_pending);
+
         let resp = websearch::handle_websearch_request(
             provider,
             &payload,
             input_tokens,
             key_ctx.group.as_deref(),
+            ws_cache_usage,
         )
         .await;
         let status = if resp.status().is_success() {
@@ -1849,7 +1890,8 @@ pub async fn post_messages_cc(
         } else {
             "error"
         };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
+        let (rec_input, rec_cc, rec_cr) = ws_cache_usage.split_against_total(input_tokens);
+        hook.record(0, rec_input, 0, rec_cc, rec_cr, 0.0, status);
         return resp;
     }
 
@@ -2056,6 +2098,7 @@ async fn handle_stream_request_buffered(
     };
     let cache_usage = hook.resolve_pending_cache(call_result.credential_id);
     hook.set_selected_billing_usage(cache_usage);
+    let simulated_total_input = cache_usage.prompt_total_est.max(1);
 
     // 上游凭据直通：应用膨胀倍率 + 模拟缓存，流结束后回调 hook.record
     if call_result.is_upstream {
@@ -2068,12 +2111,17 @@ async fn handle_stream_request_buffered(
             output_mul,
             cache_mul,
             cache_creation_mul,
+            simulated_total_input,
             cache_usage,
         );
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
             if let Some(billing_usage) = hook
-                .set_upstream_billing_usage(usage.raw_usage, provider.get_inflation_multipliers())
+                .set_upstream_billing_usage(
+                    usage.raw_usage,
+                    simulated_total_input,
+                    provider.get_inflation_multipliers(),
+                )
             {
                 tracer.set_billing_usage(billing_usage);
             }
@@ -2289,7 +2337,12 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        let usage = super::scaled_billing_usage(simulated, upstream, (2.0, 3.0, 4.0, 5.0));
+        let usage = super::scaled_billing_usage(
+            simulated,
+            upstream,
+            150,
+            (2.0, 3.0, 4.0, 5.0),
+        );
 
         // total prompt tokens = 150; the simulated 50% cache coverage is
         // split into 30 creation and 45 read tokens.
@@ -2314,11 +2367,13 @@ mod tests {
             prompt_total_est: 100,
         };
         let multipliers = ((2.0, 3.0, 4.0, 5.0), (1.5, 1.0, 2.5, 0.75));
+        let simulated_total_input = 150;
 
         let (_, rust, go) = super::selected_billing_snapshot(
             super::super::cache_engine::CacheEngineKind::Rust,
             simulated,
             upstream,
+            simulated_total_input,
             multipliers,
         );
         assert!(rust.is_some(), "Rust Key 必须记录 Rust 模拟计费");
@@ -2328,6 +2383,7 @@ mod tests {
             super::super::cache_engine::CacheEngineKind::Go,
             simulated,
             upstream,
+            simulated_total_input,
             multipliers,
         );
         assert!(rust.is_none(), "Go Key 不得记录 Rust 模拟计费");
