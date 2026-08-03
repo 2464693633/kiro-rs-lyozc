@@ -336,4 +336,34 @@ mod tests {
         let request: MessagesRequest = serde_json::from_value(request_json(Some(4096))).unwrap();
         assert_eq!(request.max_tokens, 4096);
     }
+
+    /// 记录「往返序列化会实体化 serde 默认值」这一事实 —— 它是
+    /// [`super::middleware::RawBody`] 存在的理由。
+    ///
+    /// 客户端发 `thinking:{"type":"disabled"}`，往返后凭空多出
+    /// `budget_tokens:20000`，而 Anthropic 对 `disabled` 不接受该字段，直接 400
+    /// `thinking.budget_tokens is not supported when thinking.type is disabled`。
+    /// 同理还会多出 `max_tokens` 与一串显式 `null`。
+    ///
+    /// **本测试断言注入确实发生**，不是在断言"这样是对的"。它是一道守卫：若有人
+    /// 把 `budget_tokens` 改成 `Option` + `skip_serializing_if`，本测试会失败并把人
+    /// 引到这段注释 —— 那时才该重新评估上游直通是否仍需转发原始字节。在此之前，
+    /// 直通路径**不得**使用 `serde_json::to_string(&payload)`。
+    #[test]
+    fn roundtrip_materializes_serde_defaults() {
+        let mut value = request_json(None);
+        value["thinking"] = serde_json::json!({"type": "disabled"});
+        let request: MessagesRequest = serde_json::from_value(value).unwrap();
+        let out = serde_json::to_string(&request).unwrap();
+
+        assert!(
+            out.contains(r#""budget_tokens":20000"#),
+            "往返应实体化 budget_tokens 默认值（若已不再注入，见本测试文档）: {out}"
+        );
+        assert!(
+            out.contains(r#""max_tokens":32000"#),
+            "往返应实体化 max_tokens 默认值: {out}"
+        );
+        assert!(out.contains(r#""system":null"#), "往返应写出显式 null: {out}");
+    }
 }

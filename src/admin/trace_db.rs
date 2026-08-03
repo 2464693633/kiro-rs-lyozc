@@ -127,15 +127,49 @@ pub struct TraceRecord {
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
-    /// 上游 API 原始用量及两套客户端缓存模拟用量。非上游凭据为 None。
+    /// 本次请求所用的缓存模拟引擎（`rust` / `go` / `real` / `nocache`）。
+    ///
+    /// `None` = v1 老行（引擎靠 `rust_usage` / `go_usage` 哪个非空隐式表达），
+    /// 或非上游凭据。用 `String` 而非枚举：老库里可能存着本二进制不认识的引擎名。
+    #[serde(default)]
+    pub engine: Option<String>,
+    /// 上游 API 真实上报的用量。非上游凭据为 None。
     #[serde(default)]
     pub upstream_usage: Option<TokenUsageBreakdown>,
+    /// 客户端被计费的用量（已乘该引擎倍率），与 `upstream_usage` 一一对应。
+    #[serde(default)]
+    pub client_usage: Option<TokenUsageBreakdown>,
+    /// v1 兼容列：仅供读取老行，新行一律写 `engine` + `client_usage`。
+    /// 归一化见 [`TraceRecord::normalized`]。
     #[serde(default)]
     pub rust_usage: Option<TokenUsageBreakdown>,
     #[serde(default)]
     pub go_usage: Option<TokenUsageBreakdown>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
+}
+
+impl TraceRecord {
+    /// 把 v1 的 `rust_usage` / `go_usage` 折叠进 `engine` + `client_usage`。
+    ///
+    /// 老行里「哪个引擎」是靠哪个列非空隐式表达的，v2 改为显式一列。**必须在读取
+    /// 路径调用**：不调的话升级前的历史 trace 在界面上会显示成"无客户端计费"，
+    /// 因为新界面只读 `client_usage`，而老行那一列是 NULL。
+    ///
+    /// 已是 v2 的行（`client_usage` 非空）原样返回。
+    pub fn normalized(mut self) -> Self {
+        if self.client_usage.is_some() {
+            return self;
+        }
+        if let Some(rust) = self.rust_usage.take() {
+            self.engine = Some("rust".to_string());
+            self.client_usage = Some(rust);
+        } else if let Some(go) = self.go_usage.take() {
+            self.engine = Some("go".to_string());
+            self.client_usage = Some(go);
+        }
+        self
+    }
 }
 
 /// 失败分类（attempt.outcome / record.error_type 取值）
@@ -318,7 +352,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 10] = [
+        let columns: [(&str, &str); 12] = [
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -329,6 +363,11 @@ impl TraceStore {
             ("upstream_usage", "TEXT"),
             ("rust_usage", "TEXT"),
             ("go_usage", "TEXT"),
+            // v2 逐引擎配对：engine 标识 + 该引擎的客户端计费用量。
+            // 老库靠上面两列隐式表达引擎，读取时由 `TraceRecord::normalized` 归一化，
+            // 故这两列可为 NULL 而不影响历史行的展示。
+            ("engine", "TEXT"),
+            ("client_usage", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -388,13 +427,15 @@ impl TraceStore {
             let upstream_usage = serialize_usage(rec.upstream_usage)?;
             let rust_usage = serialize_usage(rec.rust_usage)?;
             let go_usage = serialize_usage(rec.go_usage)?;
+            let client_usage = serialize_usage(rec.client_usage)?;
             tx.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, upstream_usage, rust_usage, go_usage) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                 credits, first_token_ms, upstream_usage, rust_usage, go_usage, \
+                 engine, client_usage) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -419,6 +460,8 @@ impl TraceStore {
                     upstream_usage,
                     rust_usage,
                     go_usage,
+                    rec.engine.as_deref(),
+                    client_usage,
                 ],
             )?;
             for a in &rec.attempts {
@@ -568,7 +611,7 @@ impl TraceStore {
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
              input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, \
-             upstream_usage, rust_usage, go_usage \
+             upstream_usage, rust_usage, go_usage, engine, client_usage \
              FROM traces {} ORDER BY {} LIMIT {} OFFSET {}",
             where_sql,
             q.sort.order_sql(),
@@ -601,6 +644,8 @@ impl TraceStore {
                 upstream_usage: deserialize_usage(row.get(19)?, 19)?,
                 rust_usage: deserialize_usage(row.get(20)?, 20)?,
                 go_usage: deserialize_usage(row.get(21)?, 21)?,
+                engine: row.get(22)?,
+                client_usage: deserialize_usage(row.get(23)?, 23)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -780,7 +825,9 @@ CREATE TABLE IF NOT EXISTS traces (
     first_token_ms    INTEGER,
     upstream_usage    TEXT,
     rust_usage        TEXT,
-    go_usage          TEXT
+    go_usage          TEXT,
+    engine            TEXT,
+    client_usage      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -840,6 +887,13 @@ mod tests {
             cache_read_tokens: 101760,
             credits: 0.0,
             first_token_ms: None,
+            engine: Some("rust".to_string()),
+            client_usage: Some(TokenUsageBreakdown {
+                input_tokens: 80,
+                output_tokens: 20,
+                cache_creation_tokens: 50,
+                cache_read_tokens: 320,
+            }),
             upstream_usage: Some(TokenUsageBreakdown {
                 input_tokens: 100,
                 output_tokens: 20,

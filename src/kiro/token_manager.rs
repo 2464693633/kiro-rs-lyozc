@@ -4011,6 +4011,8 @@ impl MultiTokenManager {
         &self,
         rust: crate::model::config::CacheEngineRustConfig,
         go: crate::model::config::CacheEngineGoConfig,
+        real: crate::model::config::CacheEngineRealConfig,
+        nocache: crate::model::config::CacheEngineNoCacheConfig,
     ) -> anyhow::Result<()> {
         use anyhow::Context;
 
@@ -4026,6 +4028,8 @@ impl MultiTokenManager {
             .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
         config.cache_engine_rust = rust.sanitized();
         config.cache_engine_go = go.sanitized();
+        config.cache_engine_real = real.sanitized();
+        config.cache_engine_nocache = nocache.sanitized();
         config
             .save()
             .with_context(|| format!("持久化缓存引擎配置失败: {}", config_path.display()))?;

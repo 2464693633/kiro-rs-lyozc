@@ -34,7 +34,7 @@ use tokio::time::interval;
 use uuid::Uuid;
 
 use super::converter::{ConversionError, convert_request_with_mode};
-use super::middleware::{AppState, KeyContext};
+use super::middleware::{AppState, KeyContext, RawBody};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
@@ -68,15 +68,7 @@ pub(crate) struct UsageRecordHook {
     /// 个槽，否则某个克隆提交后其他克隆仍持有旧 profile 会重复写入。`take()`
     /// 使提交天然幂等 —— 同一请求多次调 `record` 也只写一次。
     pending_cache: std::sync::Arc<parking_lot::Mutex<Option<super::cache_engine::PendingCache>>>,
-    billing_usage: std::sync::Arc<
-        parking_lot::Mutex<
-            Option<(
-                TokenUsageBreakdown,
-                Option<TokenUsageBreakdown>,
-                Option<TokenUsageBreakdown>,
-            )>,
-        >,
-    >,
+    billing_usage: std::sync::Arc<parking_lot::Mutex<Option<BillingSnapshot>>>,
     billing_request: std::sync::Arc<
         parking_lot::Mutex<
             Option<(
@@ -87,54 +79,71 @@ pub(crate) struct UsageRecordHook {
     >,
 }
 
+/// 本次请求的计费快照：**上游真实**与**客户端被计费**一一配对。
+///
+/// 取代此前的 `(upstream, Option<rust>, Option<go>)` 三元组。那个形状把「哪个引擎」
+/// 编码在「哪个 Option 非空」里，于是引擎 C / D 无处安放（两槽都得留空），而
+/// `upstream` 只有一个槽 —— 混合流量聚合后它是各引擎之和，与单个引擎的 client 值
+/// 不可比。改成显式带 `engine` 的配对后，四引擎一律平等，且两个口径**必然同源**。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BillingSnapshot {
+    /// 本次请求所用引擎。
+    pub engine: super::cache_engine::CacheEngineKind,
+    /// 上游 API 真实上报的用量。
+    pub upstream: TokenUsageBreakdown,
+    /// 客户端实际被计费的用量（已乘该引擎倍率）。
+    pub client: TokenUsageBreakdown,
+}
+
+/// 本次请求下发给客户端的**膨胀前**四元组，口径已由 [`UsageMode`] 定完。
+///
+/// 上游路径两条分支都已算出这四个数（非流式取响应体、流式取 `message_start` +
+/// 累积输出），故计费快照直接复用，不再自行推导 —— 见 [`scaled_billing_usage`]。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ClientTokens {
+    pub input: i32,
+    pub output: i32,
+    pub cache_creation: i32,
+    pub cache_read: i32,
+}
+
+/// 把「客户端被计费的膨胀前口径」套上倍率，得到计费快照。
+///
+/// **不再自行调 `resolve_tokens`**：口径分歧（模拟分摊 / 上游真值 / 本地估算）已在
+/// 下发给客户端时定完，这里只负责乘倍率。此前本函数从 `upstream` + `mode` 重新推
+/// 导一遍，等于同一套规则写两处 —— 而引擎 D 的本地估算值在这里根本取不到（它不
+/// 读上游 usage），重导必然得出与客户端所见不同的数。改成传入已解析值后，
+/// 「计费记录 == 客户端所见 × 倍率」由构造保证，不依赖两处逻辑保持同步。
 fn scaled_billing_usage(
-    usage: super::cache_metering::CacheUsage,
-    upstream: TokenUsageBreakdown,
-    simulated_total_input: i32,
+    client: ClientTokens,
     multipliers: (f64, f64, f64, f64),
 ) -> TokenUsageBreakdown {
-    let (input, creation, read) = usage.split_against_total(simulated_total_input);
     let scale = |value: i32, multiplier: f64| (value.max(0) as f64 * multiplier).round() as u64;
     TokenUsageBreakdown {
-        input_tokens: scale(input, multipliers.0),
-        output_tokens: scale(upstream.output_tokens as i32, multipliers.1),
-        cache_creation_tokens: scale(creation, multipliers.3),
-        cache_read_tokens: scale(read, multipliers.2),
+        input_tokens: scale(client.input, multipliers.0),
+        output_tokens: scale(client.output, multipliers.1),
+        cache_creation_tokens: scale(client.cache_creation, multipliers.3),
+        cache_read_tokens: scale(client.cache_read, multipliers.2),
     }
 }
 
+/// 算出本次请求的「上游真实 ↔ 客户端被计费」配对快照。
+///
+/// 每个请求只跑一个引擎，故只解析该引擎的倍率。**不再做槽位分配** —— v1 要在
+/// `rust_usage` / `go_usage` 里挑一个槽填，这既让 C / D 无处安放，又使「上游真实」
+/// 成了所有引擎共用的一个槽（混合流量下它累加的是全部引擎之和，与单引擎的客户端
+/// 计费不可比）。改成带 `engine` 标签的配对后，四引擎一视同仁，且任意聚合层级上
+/// 两个口径都来自同一批请求。
 fn selected_billing_snapshot(
     kind: super::cache_engine::CacheEngineKind,
-    selected_usage: super::cache_metering::CacheUsage,
+    client_tokens: ClientTokens,
     upstream: TokenUsageBreakdown,
-    simulated_total_input: i32,
-    multipliers: ((f64, f64, f64, f64), (f64, f64, f64, f64)),
-) -> (
-    TokenUsageBreakdown,
-    Option<TokenUsageBreakdown>,
-    Option<TokenUsageBreakdown>,
-) {
-    match kind {
-        super::cache_engine::CacheEngineKind::Rust => (
-            upstream,
-            Some(scaled_billing_usage(
-                selected_usage,
-                upstream,
-                simulated_total_input,
-                multipliers.0,
-            )),
-            None,
-        ),
-        super::cache_engine::CacheEngineKind::Go => (
-            upstream,
-            None,
-            Some(scaled_billing_usage(
-                selected_usage,
-                upstream,
-                simulated_total_input,
-                multipliers.1,
-            )),
-        ),
+    multipliers: (f64, f64, f64, f64),
+) -> BillingSnapshot {
+    BillingSnapshot {
+        engine: kind,
+        upstream,
+        client: scaled_billing_usage(client_tokens, multipliers),
     }
 }
 
@@ -177,13 +186,8 @@ impl UsageRecordHook {
         }
     }
 
-    fn set_billing_usage(
-        &self,
-        upstream: TokenUsageBreakdown,
-        rust: Option<TokenUsageBreakdown>,
-        go: Option<TokenUsageBreakdown>,
-    ) {
-        *self.billing_usage.lock() = Some((upstream, rust, go));
+    fn set_billing_usage(&self, snapshot: BillingSnapshot) {
+        *self.billing_usage.lock() = Some(snapshot);
     }
 
     fn set_billing_request(
@@ -200,31 +204,26 @@ impl UsageRecordHook {
         }
     }
 
+    /// 记录本次请求的「上游真实 / 客户端被计费」快照。
+    ///
+    /// `client` 是**已解析、未膨胀**的客户端口径四元组，由上游响应处理函数算出
+    /// （`UpstreamStreamUsage` 或 `handle_upstream_non_stream_response` 的返回值）。
+    /// 此处不再自行解析 —— 见 [`scaled_billing_usage`] 的文档注释。
     fn set_upstream_billing_usage(
         &self,
         upstream: TokenUsageBreakdown,
-        simulated_total_input: i32,
+        client: ClientTokens,
         global_multipliers: (f64, f64, f64),
-    ) -> Option<(
-        TokenUsageBreakdown,
-        Option<TokenUsageBreakdown>,
-        Option<TokenUsageBreakdown>,
-    )> {
-        let Some((kind, selected_usage)) = self.billing_request.lock().as_ref().copied() else {
+    ) -> Option<BillingSnapshot> {
+        let Some((kind, _)) = self.billing_request.lock().as_ref().copied() else {
             return None;
         };
-        let multipliers = self.cache_engines.billing_multipliers(global_multipliers);
-        // 只记录当前 Key 选中的模拟引擎。另一套引擎不参与本次请求的客户端计费，
-        // 也不应因为“对比”而额外修改缓存状态。
-        let usage = selected_billing_snapshot(
-            kind,
-            selected_usage,
-            upstream,
-            simulated_total_input,
-            multipliers,
-        );
-        self.set_billing_usage(usage.0, usage.1, usage.2);
-        Some(usage)
+        let multipliers = self.cache_engines.multipliers_for(kind, global_multipliers);
+        // 只解析本次请求所用引擎的倍率。另外三套不参与本次计费，也不该因为「对比」
+        // 而被凭空填数 —— 逐引擎配对存储后，每条记录只属于一个引擎。
+        let snapshot = selected_billing_snapshot(kind, client, upstream, multipliers);
+        self.set_billing_usage(snapshot);
+        Some(snapshot)
     }
 
     fn commit_pending_cache(&self, credential_id: u64) {
@@ -243,9 +242,15 @@ impl UsageRecordHook {
         credits: f64,
         status: &str,
     ) {
-        let billing_usage = self.billing_usage.lock().take();
-        let (is_upstream, upstream_usage, rust_usage, go_usage) = match billing_usage {
-            Some((upstream, rust, go)) => (true, Some(upstream), rust, go),
+        // 有快照即为上游请求：快照只在上游路径产生（见 set_upstream_billing_usage）。
+        let snapshot = self.billing_usage.lock().take();
+        let (is_upstream, engine, upstream_usage, client_usage) = match snapshot {
+            Some(s) => (
+                true,
+                Some(s.engine.as_str().to_string()),
+                Some(s.upstream),
+                Some(s.client),
+            ),
             None => (false, None, None, None),
         };
         let rec = UsageRecord {
@@ -265,9 +270,12 @@ impl UsageRecordHook {
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
             is_upstream: credential_id != 0 && is_upstream,
+            engine,
             upstream_usage,
-            rust_usage,
-            go_usage,
+            client_usage,
+            // v2 一律写 engine + client_usage；这两个字段只为读老 JSONL 保留。
+            rust_usage: None,
+            go_usage: None,
         };
         if let Some(r) = &self.recorder {
             r.record(&rec);
@@ -315,13 +323,7 @@ pub(crate) struct RequestTracer {
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
-    billing_usage: parking_lot::Mutex<
-        Option<(
-            TokenUsageBreakdown,
-            Option<TokenUsageBreakdown>,
-            Option<TokenUsageBreakdown>,
-        )>,
-    >,
+    billing_usage: parking_lot::Mutex<Option<BillingSnapshot>>,
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
@@ -364,14 +366,7 @@ impl RequestTracer {
         }
     }
 
-    fn set_billing_usage(
-        &self,
-        usage: (
-            TokenUsageBreakdown,
-            Option<TokenUsageBreakdown>,
-            Option<TokenUsageBreakdown>,
-        ),
-    ) {
+    fn set_billing_usage(&self, usage: BillingSnapshot) {
         *self.billing_usage.lock() = Some(usage);
     }
 
@@ -421,9 +416,16 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
-            upstream_usage: billing_usage.as_ref().map(|value| value.0),
-            rust_usage: billing_usage.as_ref().and_then(|value| value.1),
-            go_usage: billing_usage.as_ref().and_then(|value| value.2),
+            // 逐引擎配对：engine + (upstream, client) 三者同源同写，使 trace 行里
+            // 「上游真实 ↔ 客户端被计费」始终属于同一次请求、同一个引擎。
+            engine: billing_usage
+                .as_ref()
+                .map(|snapshot| snapshot.engine.as_str().to_string()),
+            upstream_usage: billing_usage.as_ref().map(|snapshot| snapshot.upstream),
+            client_usage: billing_usage.as_ref().map(|snapshot| snapshot.client),
+            // v1 兼容列不再写入：新行一律用上面那对。老行由 normalized() 折叠。
+            rust_usage: None,
+            go_usage: None,
             attempts,
         };
         store.insert(&rec);
@@ -604,6 +606,32 @@ fn validate_max_tokens(max_tokens: i32) -> Result<(), ErrorResponse> {
     }
 }
 
+/// 上游直通的请求体：客户端原文，仅在缺 `max_tokens` 时补上该字段。
+///
+/// Anthropic Messages API 的 `max_tokens` 是必填项，而 [`MessagesRequest`] 给它挂了
+/// `default = 32000` —— 客户端不发时解析照样能过，但**原文里确实没有这个键**，直接
+/// 转发会被上游以 `max_tokens: field required` 拒掉。
+///
+/// **只补这一个字段**：它是 API 强制要求的最小集。往返序列化会把所有缺省字段一并
+/// 实体化（`thinking.budget_tokens` 被补成 20000、`system`/`tools` 写成显式 `null`），
+/// 那才是上游报错的成因 —— 见 [`super::middleware::RawBody`]。
+///
+/// 原文已带 `max_tokens` 时**原样返回，逐字节不变**，这是绝大多数请求走的路径。只有
+/// 需要注入时才重新序列化，此时键序会被 serde_json 的 `BTreeMap` 重排（本 crate 未开
+/// `preserve_order`）；JSON 对象的键序无语义，可接受。
+fn ensure_max_tokens(raw: String, fallback: i32) -> String {
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(&raw)
+    else {
+        // 不是 JSON 对象：原样转发。这种请求本就不合法，交给上游报错，不在这里加工。
+        return raw;
+    };
+    if map.contains_key("max_tokens") {
+        return raw;
+    }
+    map.insert("max_tokens".to_string(), serde_json::json!(fallback));
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or(raw)
+}
+
 fn merge_token_limits(target: &mut Option<TokenLimits>, incoming: Option<TokenLimits>) {
     let Some(incoming) = incoming else {
         return;
@@ -774,6 +802,7 @@ pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
     headers: axum::http::HeaderMap,
+    raw_body: Option<Extension<RawBody>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
@@ -816,8 +845,18 @@ pub async fn post_messages(
         }
     };
 
-    // 在 override_thinking 之前捕获原始 body，确保上游（kiro.rs）收到的是未经修改的请求
-    let anthropic_body_raw = serde_json::to_string(&payload).unwrap_or_default();
+    // 上游凭据直通转发的是客户端原文，不能用 `to_string(&payload)`：往返序列化会把
+    // serde 默认值实体化进 body（最典型的是 `thinking.budget_tokens` 被补成 20000，
+    // 客户端发 `disabled` 时上游直接 400）。见 [`RawBody`]。
+    let anthropic_body_raw = raw_body
+        .and_then(|Extension(RawBody(bytes))| String::from_utf8(bytes.to_vec()).ok())
+        .map(|raw| ensure_max_tokens(raw, payload.max_tokens))
+        .unwrap_or_else(|| {
+            // 取不到原文说明 capture_raw_body 未挂载，或 body 非 UTF-8。退回往返序列化
+            // 保可用性，但上游直通仍可能因默认值注入被拒 —— 故留一条 warn 便于定位。
+            tracing::warn!("未取到请求体原文，退回往返序列化（上游直通可能被拒）");
+            serde_json::to_string(&payload).unwrap_or_default()
+        });
     // 提取客户端 anthropic-beta 头，透传给上游（kiro.rs 需要它启用扩展思考等功能）
     let upstream_beta = headers
         .get("anthropic-beta")
@@ -839,10 +878,15 @@ pub async fn post_messages(
         // 缓存模拟：WebSearch 也要走 begin()，否则这条路径的请求既拿不到模拟
         // 缓存（cache_* 恒为 0），也不进缓存表 —— 会话中间夹一次 WebSearch 就
         // 断掉后续请求的前缀链。引擎 B 的写入在下面 record("success") 时提交。
-        let (ws_cache_usage, _ws_multipliers, ws_pending) =
+        let (ws_cache_usage, _ws_multipliers, ws_pending, _ws_mode) =
             state
                 .cache_engines
-                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+                .begin(
+                    &payload,
+                    key_ctx.key_id,
+                    key_ctx.cache_engine,
+                    provider.get_inflation_multipliers(),
+                );
         hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
         hook.set_pending_cache(ws_pending);
 
@@ -958,10 +1002,15 @@ pub async fn post_messages(
     //
     // 引擎 B 是两阶段的：此处只查，写入意图存进 hook，待 `record("success")` 时提交。
     // 引擎 A 在 begin 内已完成查+写，其 pending 为 None、commit 是空操作。
-    let (cache_usage, cache_multipliers, pending_cache) =
+    let (cache_usage, cache_multipliers, pending_cache, usage_mode) =
         state
             .cache_engines
-            .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+            .begin(
+                    &payload,
+                    key_ctx.key_id,
+                    key_ctx.cache_engine,
+                    provider.get_inflation_multipliers(),
+                );
     hook.set_billing_request(key_ctx.cache_engine, cache_usage);
     hook.set_pending_cache(pending_cache);
 
@@ -990,6 +1039,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             cache_multipliers,
+            usage_mode,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -1018,6 +1068,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             cache_multipliers,
+            usage_mode,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -1039,6 +1090,7 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     _cache_usage: super::cache_metering::CacheUsage,
     cache_multipliers: super::cache_engine::UsageMultipliers,
+    usage_mode: super::cache_engine::UsageMode,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
@@ -1076,7 +1128,7 @@ async fn handle_stream_request(
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-            cache_multipliers.resolve(provider.get_inflation_multipliers());
+            cache_multipliers.resolve();
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
             call_result.response,
             input_mul,
@@ -1085,6 +1137,10 @@ async fn handle_stream_request(
             cache_creation_mul,
             simulated_total_input,
             cache_usage,
+            usage_mode,
+            // 引擎 D 的 input 口径：客户端请求的本地估算（token::count_all_tokens），
+            // 与上游报的 usage 无关 —— 上游可能是另一个反代，其 usage 已被加工过。
+            input_tokens,
         );
         // 流结束后在后台任务里记录真实用量（不阻塞客户端响应）
         tokio::spawn(async move {
@@ -1092,7 +1148,12 @@ async fn handle_stream_request(
             if let Some(billing_usage) = hook
                 .set_upstream_billing_usage(
                     usage.raw_usage,
-                    simulated_total_input,
+                    ClientTokens {
+                        input: usage.input_tokens,
+                        output: usage.output_tokens,
+                        cache_creation: usage.cache_creation_tokens,
+                        cache_read: usage.cache_read_tokens,
+                    },
                     provider.get_inflation_multipliers(),
                 )
             {
@@ -1138,7 +1199,7 @@ async fn handle_stream_request(
     ctx.cache_usage = cache_usage;
     // 设置膨胀倍率
     let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-        cache_multipliers.resolve(provider.get_inflation_multipliers());
+        cache_multipliers.resolve();
     ctx.input_inflation_multiplier = input_mul;
     ctx.output_inflation_multiplier = output_mul;
     ctx.cache_inflation_multiplier = cache_mul;
@@ -1347,13 +1408,14 @@ async fn handle_non_stream_request(
     hook: UsageRecordHook,
     _cache_usage: super::cache_metering::CacheUsage,
     cache_multipliers: super::cache_engine::UsageMultipliers,
+    usage_mode: super::cache_engine::UsageMode,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
 ) -> Response {
     // 获取膨胀倍率（用于上游非流式和正常路径）
     let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-        cache_multipliers.resolve(provider.get_inflation_multipliers());
+        cache_multipliers.resolve();
 
     // 调用 Kiro API（支持多凭据故障转移 + 上游直通）
     let call_result = match provider
@@ -1395,12 +1457,19 @@ async fn handle_non_stream_request(
                 cache_creation_mul,
                 simulated_total_input,
                 cache_usage,
+                usage_mode,
+                input_tokens,
             )
             .await;
         if let Some(billing_usage) =
             hook.set_upstream_billing_usage(
                 raw_usage,
-                simulated_total_input,
+                ClientTokens {
+                    input: u_input,
+                    output: u_output,
+                    cache_creation: u_cache_creation,
+                    cache_read: u_cache_read,
+                },
                 provider.get_inflation_multipliers(),
             )
         {
@@ -1818,6 +1887,7 @@ pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
     headers: axum::http::HeaderMap,
+    raw_body: Option<Extension<RawBody>>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1849,8 +1919,19 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 在 override_thinking 之前捕获原始 body，确保上游（kiro.rs）收到的是未经修改的请求
-    let anthropic_body_raw = serde_json::to_string(&payload).unwrap_or_default();
+    // 上游凭据直通要转发的请求体：优先客户端原文，绝不用 `to_string(&payload)`。
+    // 后者会把 serde 默认值实体化进去（`thinking.budget_tokens`、`max_tokens`、
+    // 一串显式 `null`），上游会 400。见 middleware::RawBody。
+    let anthropic_body_raw = raw_body
+        .and_then(|Extension(RawBody(bytes))| String::from_utf8(bytes.to_vec()).ok())
+        .map(|raw| ensure_max_tokens(raw, payload.max_tokens))
+        .unwrap_or_else(|| {
+            // 兜底：路由未挂 capture_raw_body，或 body 非 UTF-8（JSON 必须是 UTF-8，
+            // 故后者意味着请求本就不合法）。回退往返序列化 —— 会带上默认值注入，
+            // 但比发空 body 好。
+            tracing::warn!("无客户端原始 body，回退往返序列化（上游直通可能因默认值注入被拒）");
+            serde_json::to_string(&payload).unwrap_or_default()
+        });
     // 提取客户端 anthropic-beta 头，透传给上游
     let upstream_beta = headers
         .get("anthropic-beta")
@@ -1870,10 +1951,15 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
         // 与 /v1/messages 同处理：WebSearch 也要走 begin()，见该处注释。
-        let (ws_cache_usage, _ws_multipliers, ws_pending) =
+        let (ws_cache_usage, _ws_multipliers, ws_pending, _ws_mode) =
             state
                 .cache_engines
-                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+                .begin(
+                    &payload,
+                    key_ctx.key_id,
+                    key_ctx.cache_engine,
+                    provider.get_inflation_multipliers(),
+                );
         hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
         hook.set_pending_cache(ws_pending);
 
@@ -1984,10 +2070,15 @@ pub async fn post_messages_cc(
 
     // 缓存模拟：按客户端 Key 选中的引擎查缓存覆盖情况（estimate 口径）。
     // 引擎 B 两阶段，写入意图存进 hook，待 `record("success")` 时提交。
-    let (cache_usage, cache_multipliers, pending_cache) =
+    let (cache_usage, cache_multipliers, pending_cache, usage_mode) =
         state
             .cache_engines
-            .begin(&payload, key_ctx.key_id, key_ctx.cache_engine);
+            .begin(
+                    &payload,
+                    key_ctx.key_id,
+                    key_ctx.cache_engine,
+                    provider.get_inflation_multipliers(),
+                );
     hook.set_billing_request(key_ctx.cache_engine, cache_usage);
     hook.set_pending_cache(pending_cache);
 
@@ -2016,6 +2107,7 @@ pub async fn post_messages_cc(
             total_input_tokens,
             cache_usage,
             cache_multipliers,
+            usage_mode,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -2044,6 +2136,7 @@ pub async fn post_messages_cc(
             hook,
             cache_usage,
             cache_multipliers,
+            usage_mode,
             tracer,
             upstream_beta,
             key_ctx.group.clone(),
@@ -2068,6 +2161,7 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     _cache_usage: super::cache_metering::CacheUsage,
     cache_multipliers: super::cache_engine::UsageMultipliers,
+    usage_mode: super::cache_engine::UsageMode,
     tracer: std::sync::Arc<RequestTracer>,
     upstream_beta: Option<String>,
     group: Option<String>,
@@ -2104,7 +2198,7 @@ async fn handle_stream_request_buffered(
     if call_result.is_upstream {
         let credential_id = call_result.credential_id;
         let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-            cache_multipliers.resolve(provider.get_inflation_multipliers());
+            cache_multipliers.resolve();
         let (resp, usage_rx) = super::upstream::handle_upstream_stream_response_with_inflation(
             call_result.response,
             input_mul,
@@ -2113,13 +2207,22 @@ async fn handle_stream_request_buffered(
             cache_creation_mul,
             simulated_total_input,
             cache_usage,
+            usage_mode,
+            // 引擎 D 的 input 口径：客户端请求的本地估算（token::count_all_tokens），
+            // 与上游报的 usage 无关 —— 上游可能是另一个反代，其 usage 已被加工过。
+            fallback_input_tokens,
         );
         tokio::spawn(async move {
             let usage = usage_rx.await.unwrap_or_default();
             if let Some(billing_usage) = hook
                 .set_upstream_billing_usage(
                     usage.raw_usage,
-                    simulated_total_input,
+                    ClientTokens {
+                        input: usage.input_tokens,
+                        output: usage.output_tokens,
+                        cache_creation: usage.cache_creation_tokens,
+                        cache_read: usage.cache_read_tokens,
+                    },
                     provider.get_inflation_multipliers(),
                 )
             {
@@ -2164,7 +2267,7 @@ async fn handle_stream_request_buffered(
     );
     ctx.set_cache_usage(cache_usage);
     let (input_mul, output_mul, cache_mul, cache_creation_mul) =
-        cache_multipliers.resolve(provider.get_inflation_multipliers());
+        cache_multipliers.resolve();
     ctx.set_inflation_multipliers_split(input_mul, output_mul, cache_mul, cache_creation_mul);
 
     // 创建缓冲 SSE 流
@@ -2337,20 +2440,23 @@ mod tests {
             prompt_total_est: 100,
         };
 
-        let usage = super::scaled_billing_usage(
-            simulated,
-            upstream,
-            150,
-            (2.0, 3.0, 4.0, 5.0),
-        );
+        // 口径已由 UsageMode 定完（此处等价于 Simulated 对 total=150 的分摊结果），
+        // scaled_billing_usage 只负责乘倍率。
+        let client = super::ClientTokens {
+            input: 75,
+            output: 10,
+            cache_creation: 30,
+            cache_read: 45,
+        };
+        let usage = super::scaled_billing_usage(client, (2.0, 3.0, 4.0, 5.0));
 
-        // total prompt tokens = 150; the simulated 50% cache coverage is
-        // split into 30 creation and 45 read tokens.
+        // 逐项独立乘：input×2、output×3、read×4、creation×5。
         assert_eq!(usage.input_tokens, 150);
         assert_eq!(usage.output_tokens, 30);
         assert_eq!(usage.cache_creation_tokens, 150);
         assert_eq!(usage.cache_read_tokens, 180);
         assert_eq!(upstream.input_tokens, 100, "上游原始 usage 不得被修改");
+        let _ = simulated;
     }
 
     #[test]
@@ -2361,33 +2467,111 @@ mod tests {
             cache_creation_tokens: 20,
             cache_read_tokens: 30,
         };
-        let simulated = super::super::cache_metering::CacheUsage {
-            cache_read: 30,
-            cache_covered_est: 50,
-            prompt_total_est: 100,
+        let client = super::ClientTokens {
+            input: 75,
+            output: 10,
+            cache_creation: 30,
+            cache_read: 45,
         };
-        let multipliers = ((2.0, 3.0, 4.0, 5.0), (1.5, 1.0, 2.5, 0.75));
-        let simulated_total_input = 150;
+        let multipliers = (2.0, 3.0, 4.0, 5.0);
 
-        let (_, rust, go) = super::selected_billing_snapshot(
+        // v1 里"选中哪个引擎"是靠 rust 槽 / go 槽哪个非空隐式表达的；v2 改为显式
+        // `engine` 标签 + 单个 client 值。该不变量本身没变：一次请求只记一个引擎。
+        for kind in [
             super::super::cache_engine::CacheEngineKind::Rust,
-            simulated,
-            upstream,
-            simulated_total_input,
-            multipliers,
-        );
-        assert!(rust.is_some(), "Rust Key 必须记录 Rust 模拟计费");
-        assert!(go.is_none(), "Rust Key 不得记录 Go 模拟计费");
-
-        let (_, rust, go) = super::selected_billing_snapshot(
             super::super::cache_engine::CacheEngineKind::Go,
-            simulated,
+        ] {
+            let snap = super::selected_billing_snapshot(kind, client, upstream, multipliers);
+            assert_eq!(
+                snap.engine,
+                kind,
+                "快照必须标记本次请求实际使用的引擎"
+            );
+            assert_eq!(
+                snap.upstream, upstream,
+                "上游真值必须原样保留（它是该引擎的真实成本口径）"
+            );
+        }
+    }
+
+    /// 引擎 C / D 必须**各自**带上游真值进计费快照。
+    ///
+    /// 这条断言的前提被本次 schema 改造反转了：v1 三槽（upstream + rust + go）里
+    /// C / D 无处安放，只能两槽皆空、在对比表里整段缺失。v2 改为逐引擎配对后，
+    /// 每个引擎自带一份上游口径，四套引擎一视同仁。
+    #[test]
+    fn stateless_engines_get_their_own_paired_slot() {
+        let upstream = TokenUsageBreakdown {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_tokens: 20,
+            cache_read_tokens: 30,
+        };
+        for kind in [
+            super::super::cache_engine::CacheEngineKind::Real,
+            super::super::cache_engine::CacheEngineKind::NoCache,
+        ] {
+            let snap = super::selected_billing_snapshot(
+                kind,
+                super::ClientTokens {
+                    input: 100,
+                    output: 10,
+                    cache_creation: 0,
+                    cache_read: 0,
+                },
+                upstream,
+                (1.0, 1.0, 1.0, 1.0),
+            );
+            assert_eq!(snap.engine, kind, "{kind:?} 必须标记自己的引擎名");
+            assert_eq!(
+                snap.upstream, upstream,
+                "{kind:?} 必须带自己那份上游真值 —— 否则对比表里没有分母"
+            );
+            assert_eq!(snap.client.input_tokens, 100, "{kind:?} 客户端计费必须记入");
+        }
+    }
+
+    /// 引擎 D 的计费快照必须等于「客户端所见 × 倍率」，且与上游 usage 无关。
+    ///
+    /// 上游报 input=100 / output=10 / cc=20 / cr=30，但引擎 D 下发的是本地估算
+    /// （input=777 / output=42）。计费快照若从上游值重新推导，就会记成 100/10 ——
+    /// 与客户端实际被计费的数字不符。故此处钉住：快照只认传入的 ClientTokens。
+    #[test]
+    fn nocache_engine_bills_local_tokens_not_upstream() {
+        let upstream = TokenUsageBreakdown {
+            input_tokens: 100,
+            output_tokens: 10,
+            cache_creation_tokens: 20,
+            cache_read_tokens: 30,
+        };
+        // 客户端实际收到的口径：本地估算，cache 恒为 0。
+        let client_tokens = ClientTokens {
+            input: 777,
+            output: 42,
+            cache_creation: 0,
+            cache_read: 0,
+        };
+        let snap = super::selected_billing_snapshot(
+            super::super::cache_engine::CacheEngineKind::NoCache,
+            client_tokens,
             upstream,
-            simulated_total_input,
-            multipliers,
+            (2.0, 3.0, 1.0, 1.0),
         );
-        assert!(rust.is_none(), "Go Key 不得记录 Rust 模拟计费");
-        assert!(go.is_some(), "Go Key 必须记录 Go 模拟计费");
+        assert_eq!(
+            snap.engine,
+            super::super::cache_engine::CacheEngineKind::NoCache
+        );
+        assert_eq!(
+            snap.upstream.input_tokens, 100,
+            "上游真值列必须原样保留（你选的口径）"
+        );
+
+        // 直接验证倍率作用在本地值上，而非上游值。
+        let billed = super::scaled_billing_usage(client_tokens, (2.0, 3.0, 1.0, 1.0));
+        assert_eq!(billed.input_tokens, 1554, "777×2，不是 100×2");
+        assert_eq!(billed.output_tokens, 126, "42×3，不是 10×3");
+        assert_eq!(billed.cache_creation_tokens, 0, "D 的 cache 恒为 0");
+        assert_eq!(billed.cache_read_tokens, 0);
     }
 
     #[test]
@@ -2668,5 +2852,46 @@ mod tests {
         assert!(validate_max_tokens(1).is_ok());
         assert!(validate_max_tokens(0).is_err());
         assert!(validate_max_tokens(-1).is_err());
+    }
+
+    /// 原文已带 `max_tokens` 时必须逐字节原样返回 —— 直通路径的保真度全靠这条。
+    #[test]
+    fn ensure_max_tokens_leaves_body_untouched_when_present() {
+        // 刻意用非字母序的键序 + 紧凑无空格，验证没有被重新序列化过。
+        let raw = r#"{"model":"m","max_tokens":100,"messages":[],"thinking":{"type":"disabled"}}"#;
+        assert_eq!(ensure_max_tokens(raw.to_string(), 32_000), raw);
+    }
+
+    /// 缺 `max_tokens` 时补上该字段（Anthropic 必填），且**只补这一个**。
+    #[test]
+    fn ensure_max_tokens_injects_only_that_field_when_missing() {
+        let raw = r#"{"model":"m","messages":[],"thinking":{"type":"disabled"}}"#;
+        let got = ensure_max_tokens(raw.to_string(), 32_000);
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+
+        assert_eq!(v["max_tokens"], 32_000);
+        // thinking 必须还是客户端发的样子：不能被补出 budget_tokens。
+        assert_eq!(v["thinking"], serde_json::json!({"type": "disabled"}));
+        // 不该凭空多出往返序列化才会有的那些键。
+        for key in ["system", "tools", "tool_choice", "output_config", "metadata", "stream"] {
+            assert!(
+                v.get(key).is_none(),
+                "不应注入 `{key}`，实际 body: {got}"
+            );
+        }
+        // 原有键一个不少。
+        assert_eq!(v.as_object().unwrap().len(), 4, "应为 model/messages/thinking/max_tokens");
+    }
+
+    /// 非 JSON 对象（数组 / 裸值 / 语法错误）原样转发，不在这里加工。
+    #[test]
+    fn ensure_max_tokens_passes_through_non_object_bodies() {
+        for raw in ["[1,2,3]", "\"str\"", "not json at all", ""] {
+            assert_eq!(
+                ensure_max_tokens(raw.to_string(), 32_000),
+                raw,
+                "非对象 body 应原样返回"
+            );
+        }
     }
 }

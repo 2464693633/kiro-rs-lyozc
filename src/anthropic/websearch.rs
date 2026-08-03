@@ -624,8 +624,11 @@ pub async fn handle_websearch_request(
                 }
             };
             // 透传给上游，由 Anthropic 原生处理 web_search tool
+            // 使用 call_api_dual_for_credential(ctx.id, ...) 而非 call_api_dual，
+            // 避免内部再次 acquire_context：balanced 模式下第二次 acquire 可能路由
+            // 到 Kiro 凭据，导致 Anthropic body 发给 Kiro 端点产生 400 错误。
             return match provider
-                .call_api_dual(&anthropic_body, Some(&anthropic_body), None, None, group)
+                .call_api_dual_for_credential(ctx.id, &anthropic_body, &anthropic_body)
                 .await
             {
                 Ok(result) => {

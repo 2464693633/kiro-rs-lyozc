@@ -154,32 +154,38 @@ function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
     setRange(undefined);
     setTimeFilter({ startDate, endDate, granularity: "day" });
   };
+
+  const ENGINE_LABELS: Record<string, string> = {
+    rust: 'Rust 缓存',
+    go: 'Go 缓存',
+    real: '真实上游',
+    nocache: '无缓存',
+  };
+
+  const ENGINE_COLORS: Record<string, string> = {
+    rust: 'bg-blue-500',
+    go: 'bg-emerald-500',
+    real: 'bg-red-500',
+    nocache: 'bg-gray-500',
+  };
+
+  const upstreamMultiplier = config?.upstreamMultipliers[String(credentialId)] ?? 1;
+
   const rows = [
     {
       label: "上游真实",
-      tokens: data?.upstreamTokens ?? 0,
+      tokens: data?.engines?.reduce((sum, e) => sum + e.upstreamTokens, 0) ?? 0,
       cost: data?.upstreamCost ?? 0,
-      multiplier: config?.upstreamMultipliers[String(credentialId)] ?? 1,
+      multiplier: upstreamMultiplier,
       color: "bg-red-500",
     },
-    ...((data?.rustTokens ?? 0) > 0 || (data?.rustCost ?? 0) > 0
-      ? [{
-          label: "Rust 模拟",
-          tokens: data?.rustTokens ?? 0,
-          cost: data?.rustCost ?? 0,
-          multiplier: config?.rustMultiplier ?? 1,
-          color: "bg-blue-500",
-        }]
-      : []),
-    ...((data?.goTokens ?? 0) > 0 || (data?.goCost ?? 0) > 0
-      ? [{
-          label: "Go 模拟",
-          tokens: data?.goTokens ?? 0,
-          cost: data?.goCost ?? 0,
-          multiplier: config?.goMultiplier ?? 1,
-          color: "bg-emerald-500",
-        }]
-      : []),
+    ...(data?.engines?.map(e => ({
+      label: ENGINE_LABELS[e.engine] || e.engine,
+      tokens: e.clientTokens,
+      cost: e.clientCost,
+      multiplier: config?.[`${e.engine}Multiplier` as keyof typeof config] as number ?? 1,
+      color: ENGINE_COLORS[e.engine] || 'bg-gray-500',
+    })) ?? []),
   ];
   const timeText = timeFilter.range
     ? timeFilter.range === "24h"

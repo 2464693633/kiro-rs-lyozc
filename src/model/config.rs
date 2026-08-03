@@ -239,6 +239,14 @@ pub struct Config {
     /// go 缓存模拟引擎参数（引擎 B，移植自 kiro-go）
     #[serde(default)]
     pub cache_engine_go: CacheEngineGoConfig,
+
+    /// real 引擎参数（引擎 C：上游真实 usage + 自己一组倍率，无缓存状态）
+    #[serde(default)]
+    pub cache_engine_real: CacheEngineRealConfig,
+
+    /// nocache 引擎参数（引擎 D：cache 恒为 0、token 并入 input，无缓存状态）
+    #[serde(default)]
+    pub cache_engine_nocache: CacheEngineNoCacheConfig,
     /// Billing comparison prices and source multipliers.
     #[serde(default)]
     pub billing: BillingConfig,
@@ -271,6 +279,30 @@ pub struct CacheEngineRustConfig {
     /// 默认 TTL（秒），对应 ephemeral 缺省值
     #[serde(default = "default_rust_cache_default_ttl_secs")]
     pub default_ttl_secs: i64,
+
+    // ---- 引擎 A 专属倍率 ----
+    //
+    // **为什么是 `Option` 而非直接 `f64` 默认 1.0**：引擎 A 历史上一直用全局
+    // 「Token 膨胀倍率」（`input_inflation_multiplier` 等三个顶层字段）。若这里直接
+    // 默认 1.0，现有部署升级后 A 会突然从「全局配的 2×」变成「自己的 1×」——
+    // 倍率静默失效，且配置文件里那三个全局字段看着还在生效。
+    //
+    // `None` = 未单独设置，回退全局；一旦从 UI 保存过就变成具体值并从此独立。
+    /// input 倍率。`None` = 用全局 `input_inflation_multiplier`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_multiplier: Option<f64>,
+    /// output 倍率。`None` = 用全局 `output_inflation_multiplier`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_multiplier: Option<f64>,
+    /// cache_read 倍率。`None` = 用全局 `cache_inflation_multiplier`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_multiplier: Option<f64>,
+    /// cache_creation 倍率。`None` = 用全局 `cache_inflation_multiplier`。
+    ///
+    /// 注意全局那套只有**一个** cache 倍率，creation 与 read 同值。拆成两个后
+    /// A 才能像 B/C 那样独立调这两项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_multiplier: Option<f64>,
 }
 
 /// go 缓存模拟引擎（`anthropic::cache_metering_go`）参数。
@@ -307,6 +339,99 @@ pub struct CacheEngineGoConfig {
     /// 维度上的可比性（数字差异将无法区分是引擎算法不同还是倍率不同造成的）。
     #[serde(default = "default_go_multiplier")]
     pub cache_creation_multiplier: f64,
+    /// 下发前对 `output_tokens` 的缩放倍率（go 引擎专属）。
+    ///
+    /// **Go 原实现没有这个倍率**（`buildClaudeUsageMap` 只缩放 input 与
+    /// cache_read），故默认 1.0 = 原行为。开放它是为了让四套引擎在「可调维度」上
+    /// 对称：否则 B 是唯一无法调 output 的引擎，运维要改 B 的 output 只能去动
+    /// 全局倍率，而那会同时影响引擎 A。
+    #[serde(default = "default_go_multiplier")]
+    pub output_multiplier: f64,
+}
+
+/// 引擎 C（`real`）参数：上游真实 usage + 自己一组倍率。
+///
+/// 无缓存状态（无指纹表 / TTL / 容量），故只有倍率字段。四个倍率各自独立，
+/// 与引擎 A 的全局膨胀倍率、引擎 B 的三倍率互不影响。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEngineRealConfig {
+    /// 对上游真实 `input_tokens` 的缩放倍率
+    #[serde(default = "default_go_multiplier")]
+    pub input_multiplier: f64,
+    /// 对上游真实 `output_tokens` 的缩放倍率
+    #[serde(default = "default_go_multiplier")]
+    pub output_multiplier: f64,
+    /// 对上游真实 `cache_read_input_tokens` 的缩放倍率
+    #[serde(default = "default_go_multiplier")]
+    pub cache_read_multiplier: f64,
+    /// 对上游真实 `cache_creation_input_tokens` 的缩放倍率
+    #[serde(default = "default_go_multiplier")]
+    pub cache_creation_multiplier: f64,
+}
+
+/// 引擎 D（`nocache`）参数：cache 字段恒为 0，token 并入 input。
+///
+/// 只有 input / output 两个倍率 —— cache 倍率对本引擎无意义（cache 恒为 0，
+/// 乘任何倍率都是 0），故不提供，避免出现「配了却无效」的旋钮。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheEngineNoCacheConfig {
+    /// 对**客户端请求本地估算**的 input 的缩放倍率。
+    ///
+    /// 注意口径：引擎 D 不读上游 usage，input 取 `token::count_all_tokens` 对客户端
+    /// 请求的本地估算值（请求发出前即已确定）。上游可能本身就是另一个 kiro-rs 反代，
+    /// 它报的 usage 已被模拟 / 膨胀过一轮，拿来当"真值"会二次加工。
+    #[serde(default = "default_go_multiplier")]
+    pub input_multiplier: f64,
+    /// 对**实际返回内容本地估算**的 output 的缩放倍率。
+    ///
+    /// 同样不读上游 usage：非流式从响应 `content` 数组估算，流式累积 SSE delta 后
+    /// 整体估算一次（`count_tokens` 非线性，逐 delta 求和会显著高估）。
+    #[serde(default = "default_go_multiplier")]
+    pub output_multiplier: f64,
+}
+
+impl Default for CacheEngineRealConfig {
+    fn default() -> Self {
+        Self {
+            input_multiplier: default_go_multiplier(),
+            output_multiplier: default_go_multiplier(),
+            cache_read_multiplier: default_go_multiplier(),
+            cache_creation_multiplier: default_go_multiplier(),
+        }
+    }
+}
+
+impl Default for CacheEngineNoCacheConfig {
+    fn default() -> Self {
+        Self {
+            input_multiplier: default_go_multiplier(),
+            output_multiplier: default_go_multiplier(),
+        }
+    }
+}
+
+impl CacheEngineRealConfig {
+    /// 非法倍率（<= 0 / NaN / inf）一律回落 1.0，与引擎 B 同规则。
+    pub fn sanitized(self) -> Self {
+        Self {
+            input_multiplier: sanitize_multiplier(self.input_multiplier),
+            output_multiplier: sanitize_multiplier(self.output_multiplier),
+            cache_read_multiplier: sanitize_multiplier(self.cache_read_multiplier),
+            cache_creation_multiplier: sanitize_multiplier(self.cache_creation_multiplier),
+        }
+    }
+}
+
+impl CacheEngineNoCacheConfig {
+    /// 非法倍率（<= 0 / NaN / inf）一律回落 1.0，与引擎 B 同规则。
+    pub fn sanitized(self) -> Self {
+        Self {
+            input_multiplier: sanitize_multiplier(self.input_multiplier),
+            output_multiplier: sanitize_multiplier(self.output_multiplier),
+        }
+    }
 }
 
 fn default_rust_cache_capacity() -> usize {
@@ -374,6 +499,30 @@ pub struct BillingConfig {
     pub rust_multiplier: f64,
     #[serde(default = "default_inflation_multiplier")]
     pub go_multiplier: f64,
+    /// 引擎 C（real）的计费对比调节系数。
+    #[serde(default = "default_inflation_multiplier")]
+    pub real_multiplier: f64,
+    /// 引擎 D（nocache）的计费对比调节系数。
+    #[serde(default = "default_inflation_multiplier")]
+    pub nocache_multiplier: f64,
+}
+
+impl BillingConfig {
+    /// 按引擎标识取计费对比的成本调节系数。
+    ///
+    /// 这**不是**下发给客户端的 token 膨胀倍率（那个已经作用在记录下来的 client
+    /// usage 上了），而是计费对比视图专用的二次调节 —— 用于把不同引擎的账面成本
+    /// 拉到同一口径下比较。未知引擎（历史 JSONL 里将来新增的名字）取 1.0，
+    /// 使其成本仍按原样计入而不是被静默归零。
+    pub fn engine_multiplier(&self, engine: &str) -> f64 {
+        match engine {
+            "rust" => self.rust_multiplier,
+            "go" => self.go_multiplier,
+            "real" => self.real_multiplier,
+            "nocache" => self.nocache_multiplier,
+            _ => 1.0,
+        }
+    }
 }
 
 impl Default for BillingConfig {
@@ -383,6 +532,8 @@ impl Default for BillingConfig {
             upstream_multipliers: HashMap::new(),
             rust_multiplier: 1.0,
             go_multiplier: 1.0,
+            real_multiplier: 1.0,
+            nocache_multiplier: 1.0,
         }
     }
 }
@@ -402,6 +553,11 @@ impl Default for CacheEngineRustConfig {
             capacity: default_rust_cache_capacity(),
             max_ttl_secs: default_rust_cache_max_ttl_secs(),
             default_ttl_secs: default_rust_cache_default_ttl_secs(),
+            // None = 回退全局膨胀倍率。默认不填，使升级后行为与升级前完全一致。
+            input_multiplier: None,
+            output_multiplier: None,
+            cache_read_multiplier: None,
+            cache_creation_multiplier: None,
         }
     }
 }
@@ -415,6 +571,7 @@ impl Default for CacheEngineGoConfig {
             min_cacheable_tokens: default_go_min_cacheable_tokens(),
             opus_min_cacheable_tokens: default_go_opus_min_cacheable_tokens(),
             input_token_multiplier: default_go_multiplier(),
+            output_multiplier: default_go_multiplier(),
             cache_read_multiplier: default_go_multiplier(),
             cache_creation_multiplier: default_go_multiplier(),
         }
@@ -440,8 +597,20 @@ impl CacheEngineRustConfig {
             } else {
                 self.default_ttl_secs
             },
+            // 非法值回落 `None`（= 回退全局）而非 1.0：`None` 是本字段既有的
+            // 「未设置」语义，回落到它可保持升级前的行为；回落 1.0 则会把已配的
+            // 全局倍率静默抹成不缩放。
+            input_multiplier: sanitize_opt_multiplier(self.input_multiplier),
+            output_multiplier: sanitize_opt_multiplier(self.output_multiplier),
+            cache_read_multiplier: sanitize_opt_multiplier(self.cache_read_multiplier),
+            cache_creation_multiplier: sanitize_opt_multiplier(self.cache_creation_multiplier),
         }
     }
+}
+
+/// `Option<f64>` 倍率的夹取：`Some(非法)` → `None`，其余原样。
+fn sanitize_opt_multiplier(v: Option<f64>) -> Option<f64> {
+    v.filter(|x| x.is_finite() && *x > 0.0)
 }
 
 impl CacheEngineGoConfig {
@@ -469,6 +638,7 @@ impl CacheEngineGoConfig {
             input_token_multiplier: sanitize_multiplier(self.input_token_multiplier),
             cache_read_multiplier: sanitize_multiplier(self.cache_read_multiplier),
             cache_creation_multiplier: sanitize_multiplier(self.cache_creation_multiplier),
+            output_multiplier: sanitize_multiplier(self.output_multiplier),
         }
     }
 }
@@ -603,6 +773,8 @@ impl Default for Config {
             cache_inflation_multiplier: default_inflation_multiplier(),
             cache_engine_rust: CacheEngineRustConfig::default(),
             cache_engine_go: CacheEngineGoConfig::default(),
+            cache_engine_real: CacheEngineRealConfig::default(),
+            cache_engine_nocache: CacheEngineNoCacheConfig::default(),
             billing: BillingConfig::default(),
             custom_models: Vec::new(),
             config_path: None,
@@ -703,6 +875,87 @@ mod cache_engine_config_tests {
         let cfg: Config = serde_json::from_str(json).expect("老配置应可解析");
         assert_eq!(cfg.cache_engine_rust.capacity, 4096);
         assert_eq!(cfg.cache_engine_go.max_ratio, 0.85);
+        // C / D 是后加的两段：老文件必然没有，且默认必须是 1.0（不缩放）。
+        // 若默认不是 1.0，升级即静默改变所有既有 Key 的下发口径。
+        assert_eq!(cfg.cache_engine_real.input_multiplier, 1.0);
+        assert_eq!(cfg.cache_engine_real.output_multiplier, 1.0);
+        assert_eq!(cfg.cache_engine_real.cache_read_multiplier, 1.0);
+        assert_eq!(cfg.cache_engine_real.cache_creation_multiplier, 1.0);
+        assert_eq!(cfg.cache_engine_nocache.input_multiplier, 1.0);
+        assert_eq!(cfg.cache_engine_nocache.output_multiplier, 1.0);
+    }
+
+    /// C / D 的默认值：全 1.0。与「配置段缺失时行为不变」是同一条约束的两面 ——
+    /// 上一条测反序列化，这条测结构体本身的 `Default`。
+    #[test]
+    fn stateless_engine_defaults_are_all_one() {
+        let real = CacheEngineRealConfig::default();
+        assert_eq!(
+            (
+                real.input_multiplier,
+                real.output_multiplier,
+                real.cache_read_multiplier,
+                real.cache_creation_multiplier
+            ),
+            (1.0, 1.0, 1.0, 1.0)
+        );
+        let nocache = CacheEngineNoCacheConfig::default();
+        assert_eq!(
+            (nocache.input_multiplier, nocache.output_multiplier),
+            (1.0, 1.0)
+        );
+    }
+
+    /// C / D 的非法倍率必须夹回 1.0。
+    ///
+    /// 0 / 负数 / NaN / inf 都要挡：这四个值乘上去会分别得到"永远 0 token"、
+    /// 负 token、NaN（序列化成 null）、inf（序列化成 null），全都会让客户端
+    /// 拿到不可用的 usage。复用 `sanitize_multiplier`，与 go 引擎同一套判据。
+    #[test]
+    fn stateless_engine_sanitize_clamps_illegal_multipliers() {
+        let real = CacheEngineRealConfig {
+            input_multiplier: 0.0,
+            output_multiplier: -2.0,
+            cache_read_multiplier: f64::NAN,
+            cache_creation_multiplier: f64::INFINITY,
+        }
+        .sanitized();
+        assert_eq!(
+            (
+                real.input_multiplier,
+                real.output_multiplier,
+                real.cache_read_multiplier,
+                real.cache_creation_multiplier
+            ),
+            (1.0, 1.0, 1.0, 1.0),
+            "0 / 负 / NaN / inf 一律夹回 1.0"
+        );
+
+        let nocache = CacheEngineNoCacheConfig {
+            input_multiplier: f64::NEG_INFINITY,
+            output_multiplier: 0.0,
+        }
+        .sanitized();
+        assert_eq!((nocache.input_multiplier, nocache.output_multiplier), (1.0, 1.0));
+
+        // 合法值必须原样保留（含小于 1 的缩小倍率 —— 那是合法运营选择）。
+        let ok = CacheEngineRealConfig {
+            input_multiplier: 2.5,
+            output_multiplier: 0.3,
+            cache_read_multiplier: 10.0,
+            cache_creation_multiplier: 0.75,
+        }
+        .sanitized();
+        assert_eq!(
+            (
+                ok.input_multiplier,
+                ok.output_multiplier,
+                ok.cache_read_multiplier,
+                ok.cache_creation_multiplier
+            ),
+            (2.5, 0.3, 10.0, 0.75),
+            "合法值不得被改动"
+        );
     }
 
     /// 嵌套结构存在但字段缺失时，逐字段回落默认。
@@ -725,6 +978,7 @@ mod cache_engine_config_tests {
             capacity: 0,
             max_ttl_secs: 0,
             default_ttl_secs: -5,
+            ..Default::default()
         }
         .sanitized();
         assert_eq!(bad_rust.capacity, 4096);
@@ -738,6 +992,7 @@ mod cache_engine_config_tests {
             min_cacheable_tokens: -100,
             opus_min_cacheable_tokens: -1,
             input_token_multiplier: -3.0,
+            output_multiplier: f64::INFINITY,
             cache_read_multiplier: 0.0,
             cache_creation_multiplier: f64::NAN,
         }
@@ -747,6 +1002,12 @@ mod cache_engine_config_tests {
         assert_eq!(bad_go.max_entries, 256, "容量有 256 下限");
         assert_eq!(bad_go.min_cacheable_tokens, 0, "负阈值夹到 0");
         assert_eq!(bad_go.opus_min_cacheable_tokens, 0);
+        // B 的倍率非法时回落 1.0（不是 None —— B 的字段不是 Option，
+        // 它没有「回退全局」的语义，全局倍率从来不作用在 go 路径上）。
+        assert_eq!(bad_go.input_token_multiplier, 1.0, "负倍率非法");
+        assert_eq!(bad_go.output_multiplier, 1.0, "inf 非法");
+        assert_eq!(bad_go.cache_read_multiplier, 1.0, "0 倍率非法");
+        assert_eq!(bad_go.cache_creation_multiplier, 1.0, "NaN 非法");
     }
 
     /// 命中率旋钮的合法区间是 [0.5, 0.99]，对齐 Go admin 端点的校验。
@@ -810,10 +1071,12 @@ mod cache_engine_config_tests {
             min_cacheable_tokens: 2048,
             opus_min_cacheable_tokens: 4096,
             input_token_multiplier: 1.5,
+            output_multiplier: 2.5,
             cache_read_multiplier: 2.0,
             cache_creation_multiplier: 0.5,
         };
         let s = c.sanitized();
+        assert_eq!(s.output_multiplier, 2.5, "合法 output 倍率不得被改动");
         // 幂等：再夹一次不应变化
         assert_eq!(s.sanitized().max_ratio, s.max_ratio);
         assert_eq!(s.sanitized().max_entries, s.max_entries);
@@ -845,3 +1108,4 @@ mod tests {
         assert_eq!(config.model_cache_ttl_secs, 120);
     }
 }
+

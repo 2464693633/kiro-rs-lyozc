@@ -255,13 +255,29 @@ export function ClientKeysPage() {
                             系统
                           </Badge>
                         )}
-                        {/* 仅标注非默认引擎：默认 rust 不占视觉噪声 */}
+                        {/* 标注引擎：rust 默认不标，其余三个标注 */}
                         {k.cacheEngine === 'go' && (
                           <Badge
                             variant="outline"
-                            title="缓存模拟走 go 引擎（移植自 kiro-go，全局共享指纹表）"
+                            title="缓存引擎 B：Go（全局共享指纹表）"
                           >
-                            go 引擎
+                            Go
+                          </Badge>
+                        )}
+                        {k.cacheEngine === 'real' && (
+                          <Badge
+                            variant="outline"
+                            title="缓存引擎 C：Real（真实上游 prompt caching）"
+                          >
+                            Real
+                          </Badge>
+                        )}
+                        {k.cacheEngine === 'nocache' && (
+                          <Badge
+                            variant="outline"
+                            title="缓存引擎 D：NoCache（禁用 prompt caching）"
+                          >
+                            NoCache
                           </Badge>
                         )}
                       </div>
@@ -403,8 +419,8 @@ export function ClientKeysPage() {
               </p>
             </div>
             <div>
-              <label className="text-[12px] text-muted-foreground">缓存模拟引擎</label>
-              <div className="mt-1 flex gap-2">
+              <label className="text-[12px] text-muted-foreground">缓存引擎</label>
+              <div className="mt-1 grid grid-cols-2 gap-2">
                 <Button
                   type="button"
                   size="sm"
@@ -412,7 +428,7 @@ export function ClientKeysPage() {
                   onClick={() => setCreateEngine('rust')}
                   disabled={createKey.isPending}
                 >
-                  rust（引擎 A）
+                  Rust (A)
                 </Button>
                 <Button
                   type="button"
@@ -421,13 +437,35 @@ export function ClientKeysPage() {
                   onClick={() => setCreateEngine('go')}
                   disabled={createKey.isPending}
                 >
-                  go（引擎 B）
+                  Go (B)
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={createEngine === 'real' ? 'default' : 'outline'}
+                  onClick={() => setCreateEngine('real')}
+                  disabled={createKey.isPending}
+                >
+                  Real (C)
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={createEngine === 'nocache' ? 'default' : 'outline'}
+                  onClick={() => setCreateEngine('nocache')}
+                  disabled={createKey.isPending}
+                >
+                  NoCache (D)
                 </Button>
               </div>
               <p className="mt-1 text-[11px] text-muted-foreground">
                 {createEngine === 'rust'
-                  ? 'rust：按 session / Key 隔离缓存前缀；主 Key 无 session 时不模拟缓存。'
-                  : 'go：移植自 kiro-go，全局共享指纹表 —— 不同 Key 的相同前缀会互相命中。'}
+                  ? 'Rust：按 session / Key 隔离缓存；适合长会话。'
+                  : createEngine === 'go'
+                  ? 'Go：全局共享指纹表，不同 Key 的相同前缀会互相命中。'
+                  : createEngine === 'real'
+                  ? 'Real：直接依赖上游 prompt caching，无本地缓存状态。'
+                  : 'NoCache：禁用 prompt caching，用于对比基线。'}
               </p>
             </div>
             <DialogFooter>

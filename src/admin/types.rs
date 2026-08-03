@@ -881,15 +881,46 @@ pub struct CreateClientKeyResponse {
 
 // ============ 双缓存模拟引擎 ============
 
-/// 两套引擎的参数（GET/PUT /config/cache-engines 共用同一形状）
+/// 四套引擎的参数（GET/PUT /config/cache-engines 共用同一形状）。
+///
+/// C / D 与 `global` 用 `Option` 而非 `#[serde(default)]`，是为了让**老前端的 PUT
+/// 不产生副作用**：`admin-ui/dist/` 是提交进仓库并由 rust-embed 嵌入的，后端先上线、
+/// 前端未重新构建的窗口期真实存在。此时老弹窗只会 PUT `{rust, go}` —— 若用
+/// `serde(default)`，缺失字段会被填成默认值 1.0 并落盘，把 C / D 的倍率静默重置。
+/// 用 `Option` 则表示"本次不涉及"，处理端保持原值不动。
+///
+/// GET 与 PUT 的响应恒填满四套，故前端可按必填字段声明类型。
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheEnginesConfigPayload {
     pub rust: crate::model::config::CacheEngineRustConfig,
     pub go: crate::model::config::CacheEngineGoConfig,
+    #[serde(default)]
+    pub real: Option<crate::model::config::CacheEngineRealConfig>,
+    #[serde(default)]
+    pub nocache: Option<crate::model::config::CacheEngineNoCacheConfig>,
+    /// 引擎 A 使用的全局膨胀倍率。
+    ///
+    /// 纳入本 payload 是为了「一个窗口调完四套引擎」，与 `/config/token-inflation`
+    /// 是同一份存储的两个入口（不是两份数据）。顶栏那个入口保持不变，避免破坏现有用法。
+    #[serde(default)]
+    pub global: Option<GlobalInflationPayload>,
 }
 
-/// 两套引擎的运行计数器
+/// 全局膨胀倍率（引擎 A 专用；B / C / D 各有自己那套）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalInflationPayload {
+    pub input_multiplier: f64,
+    pub output_multiplier: f64,
+    pub cache_multiplier: f64,
+}
+
+/// 各引擎的运行计数器。
+///
+/// 只有 A / B 有计数器：C / D 无缓存状态（无指纹表、无 TTL、无 LRU），
+/// 命中率 / 淘汰 / 过期这些指标对它们不存在，故不设字段而非填零 ——
+/// 填零会让运维以为"有缓存但一直没命中"。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheEnginesStatsResponse {
@@ -915,18 +946,50 @@ pub struct BillingConfigPayload {
     pub upstream_multipliers: std::collections::HashMap<u64, f64>,
     pub rust_multiplier: f64,
     pub go_multiplier: f64,
+    /// 引擎 C / D 的成本调节系数。
+    ///
+    /// `serde(default)` 而非必填：老前端的 PUT 不带这两个字段，若必填会整个请求 400，
+    /// 连它本来想改的模型价格也一起改不了。默认 1.0 = 不调节。
+    #[serde(default = "default_billing_multiplier")]
+    pub real_multiplier: f64,
+    #[serde(default = "default_billing_multiplier")]
+    pub nocache_multiplier: f64,
+}
+
+fn default_billing_multiplier() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingUsagePoint {
     pub ts: String,
+    /// 本桶所有引擎的上游真实成本合计。
     pub upstream_cost: f64,
-    pub rust_cost: f64,
-    pub go_cost: f64,
+    /// 本桶所有引擎的客户端计费合计。
+    pub client_cost: f64,
+    pub calls: u64,
+    /// 逐引擎明细。同一条目内的两个成本**来自同一批请求**，故可直接相除得加价倍数。
+    pub engines: Vec<EngineBillingPayload>,
+}
+
+/// 单个引擎的「上游真实 ↔ 客户端计费」配对。
+///
+/// v1 的形状是 `upstream_cost` + `rust_cost` + `go_cost` 三个平铺字段：上游只有一个
+/// 槽、模拟值按引擎分列，混合流量下 `upstream_cost` 是全部引擎之和，与任一引擎的
+/// 客户端计费不可比；引擎 C / D 更是无处安放。改为逐引擎配对后，每个引擎自带上游
+/// 口径，一一对应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineBillingPayload {
+    /// 引擎标识（`rust` / `go` / `real` / `nocache`；历史数据可能有其它值）。
+    pub engine: String,
+    /// 该引擎流量的上游真实成本。
+    pub upstream_cost: f64,
+    /// 该引擎流量的客户端计费成本。
+    pub client_cost: f64,
     pub upstream_tokens: u64,
-    pub rust_tokens: u64,
-    pub go_tokens: u64,
+    pub client_tokens: u64,
     pub calls: u64,
 }
 
@@ -935,12 +998,9 @@ pub struct BillingUsagePoint {
 pub struct BillingComparisonResponse {
     pub points: Vec<BillingUsagePoint>,
     pub upstream_cost: f64,
-    pub rust_cost: f64,
-    pub go_cost: f64,
-    pub upstream_tokens: u64,
-    pub rust_tokens: u64,
-    pub go_tokens: u64,
+    pub client_cost: f64,
     pub calls: u64,
+    pub engines: Vec<EngineBillingPayload>,
 }
 
 /// 更新客户端 Key 元数据

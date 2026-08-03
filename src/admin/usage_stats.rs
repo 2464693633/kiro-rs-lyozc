@@ -52,13 +52,55 @@ pub struct UsageRecord {
     /// True only for direct upstream Anthropic credentials.
     #[serde(default)]
     pub is_upstream: bool,
-    /// Raw upstream usage and the simulated usage for the engine selected by this request.
+    /// 本次请求所用的缓存模拟引擎标识（`CacheEngineKind::as_str`）。
+    /// `None` = v1 老记录（靠下面两个旧字段推断）。
+    ///
+    /// 存 `String` 而非 `CacheEngineKind`：这是**落盘**字段，会被后续版本的二进制读回。
+    /// 若存枚举，将来新增引擎后、老二进制读到未知变体会 serde 失败，而摄入侧是
+    /// `if let Ok(rec)` —— 整条记录被静默丢弃，连 token 数一起丢，不只是丢引擎标签。
+    /// 读侧宽容、写侧仍由 `as_str()` 保证取值合法。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<String>,
+    /// 上游真实用量 —— 这一次请求的真实成本口径。
     #[serde(default)]
     pub upstream_usage: Option<TokenUsageBreakdown>,
+    /// 客户端被计费的用量（已乘该引擎的倍率）。
+    ///
+    /// 与 `upstream_usage` **同一次请求、一一对应**：两者相除即该引擎的加价倍数。
+    /// v1 schema 把它按引擎分列成 `rust_usage` / `go_usage` 两个字段，导致
+    /// 「上游真实」只有一个槽而模拟值有两个 —— 混合流量下 `upstream_usage` 累加的是
+    /// 全部引擎之和，与单个引擎的模拟值不可比。C / D 更是无处安放。
     #[serde(default)]
+    pub client_usage: Option<TokenUsageBreakdown>,
+    /// v1 兼容字段：仅供读取老 JSONL，新记录一律写 `engine` + `client_usage`。
+    /// 归一化由 [`UsageRecord::normalized`] 完成。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rust_usage: Option<TokenUsageBreakdown>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub go_usage: Option<TokenUsageBreakdown>,
+}
+
+impl UsageRecord {
+    /// 把 v1 的 `rust_usage` / `go_usage` 折叠进 `engine` + `client_usage`。
+    ///
+    /// 老记录里「哪个引擎」是靠哪个字段非空隐式表达的，新 schema 改为显式。不做这层
+    /// 转换的话，升级前的历史数据会在逐引擎对比表里整段消失。
+    ///
+    /// 已是 v2 的记录原样返回。
+    pub fn normalized(mut self) -> Self {
+        use crate::anthropic::cache_engine::CacheEngineKind;
+        if self.client_usage.is_some() {
+            return self;
+        }
+        if let Some(rust) = self.rust_usage.take() {
+            self.engine = Some(CacheEngineKind::Rust.as_str().to_string());
+            self.client_usage = Some(rust);
+        } else if let Some(go) = self.go_usage.take() {
+            self.engine = Some(CacheEngineKind::Go.as_str().to_string());
+            self.client_usage = Some(go);
+        }
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -208,58 +250,122 @@ pub struct BucketStats {
     pub calls: u64,
     pub errors: u64,
     pub credits: f64,
-    pub upstream_usage: TokenUsageBreakdown,
-    pub rust_usage: TokenUsageBreakdown,
-    pub go_usage: TokenUsageBreakdown,
-    pub upstream_calls: u64,
 }
 
 impl BucketStats {
     fn add(&mut self, rec: &UsageRecord) {
-        self.input_tokens += rec.input_tokens;
-        self.output_tokens += rec.output_tokens;
-        self.cache_creation_tokens += rec.cache_creation_tokens;
-        self.cache_read_tokens += rec.cache_read_tokens;
+        // saturating_add：debug 模式不 panic，release 模式不回绕（计费数据安全）
+        self.input_tokens = self.input_tokens.saturating_add(rec.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(rec.output_tokens);
+        self.cache_creation_tokens =
+            self.cache_creation_tokens.saturating_add(rec.cache_creation_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(rec.cache_read_tokens);
         self.credits += rec.credits;
-        self.calls += 1;
+        self.calls = self.calls.saturating_add(1);
         if rec.status != "success" {
-            self.errors += 1;
-        }
-        if rec.is_upstream {
-            self.upstream_calls += 1;
-            if let Some(v) = rec.upstream_usage {
-                add_usage(&mut self.upstream_usage, v);
-            }
-            if let Some(v) = rec.rust_usage {
-                add_usage(&mut self.rust_usage, v);
-            }
-            if let Some(v) = rec.go_usage {
-                add_usage(&mut self.go_usage, v);
-            }
+            self.errors = self.errors.saturating_add(1);
         }
     }
 
     /// 把另一个 stats 累加到自己上（用于 group 过滤后重新汇总）
     fn add_stats(&mut self, other: &BucketStats) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_creation_tokens =
+            self.cache_creation_tokens.saturating_add(other.cache_creation_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(other.cache_read_tokens);
         self.credits += other.credits;
-        self.calls += other.calls;
-        self.errors += other.errors;
-        add_usage(&mut self.upstream_usage, other.upstream_usage);
-        add_usage(&mut self.rust_usage, other.rust_usage);
-        add_usage(&mut self.go_usage, other.go_usage);
-        self.upstream_calls += other.upstream_calls;
+        self.calls = self.calls.saturating_add(other.calls);
+        self.errors = self.errors.saturating_add(other.errors);
     }
 }
 
+/// 逐引擎的「上游真实 / 客户端被计费」配对。
+///
+/// 两个口径**同一次请求同时记入**，故任意聚合层级上两者始终可比 —— 这是 v1 schema
+/// 做不到的：那里 `upstream_usage` 是所有引擎共用的一个槽，混合流量下它累加的是全部
+/// 引擎之和，而 `rust_usage` 只含 rust 流量，相除得出的"加价倍数"没有意义。
+#[derive(Debug, Default, Clone, Copy)]
+struct EngineBillingPair {
+    /// 上游真实用量（真实成本口径）。
+    upstream: TokenUsageBreakdown,
+    /// 客户端被计费用量（已乘该引擎倍率）。
+    client: TokenUsageBreakdown,
+    /// 该引擎的上游请求数。
+    calls: u64,
+}
+
+impl EngineBillingPair {
+    fn add(&mut self, upstream: TokenUsageBreakdown, client: TokenUsageBreakdown) {
+        add_usage(&mut self.upstream, upstream);
+        add_usage(&mut self.client, client);
+        self.calls = self.calls.saturating_add(1);
+    }
+}
+
+/// 计费配对的聚合键。
+///
+/// 含 `key_id` 是为了支持按 Key 过滤（`query_billing` 的 `key_id` 参数）：不含它就得
+/// 再维护一份按 Key 的副本，而带上它反而更省 —— 每个 Key 只用一个引擎，故实际条目数
+/// 是 `Key 数 × 上游凭据数 × 模型数`，而非笛卡尔积。
+///
+/// `engine` 用 `String` 而非 `&'static str`：值来自 JSONL，可能是本二进制不认识的
+/// 引擎名（降级运行）。见 [`UsageRecord::engine`]。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BillingKey {
+    key_id: u64,
+    credential_id: u64,
+    model: String,
+    engine: String,
+}
+
+/// 逐引擎费用小计（仅内部累加用；对外形状见 `types::EngineBillingPayload`）。
+#[derive(Debug, Default, Clone, Copy)]
+struct EngineCostRow {
+    upstream_cost: f64,
+    client_cost: f64,
+    upstream_tokens: u64,
+    client_tokens: u64,
+    calls: u64,
+}
+
+impl EngineCostRow {
+    fn merge(&mut self, other: &EngineCostRow) {
+        self.upstream_cost += other.upstream_cost;
+        self.client_cost += other.client_cost;
+        self.upstream_tokens = self.upstream_tokens.saturating_add(other.upstream_tokens);
+        self.client_tokens = self.client_tokens.saturating_add(other.client_tokens);
+        self.calls = self.calls.saturating_add(other.calls);
+    }
+}
+
+/// 转成 API payload，并按引擎名排序。
+///
+/// 排序不是洁癖：`HashMap` 迭代顺序每次进程都不同，不排的话前端图表的系列顺序
+/// 会随刷新乱跳，颜色也跟着换。
+fn engine_rows_to_payload(
+    rows: &HashMap<String, EngineCostRow>,
+) -> Vec<crate::admin::types::EngineBillingPayload> {
+    let mut out: Vec<_> = rows
+        .iter()
+        .map(|(engine, row)| crate::admin::types::EngineBillingPayload {
+            engine: engine.clone(),
+            upstream_cost: row.upstream_cost,
+            client_cost: row.client_cost,
+            upstream_tokens: row.upstream_tokens,
+            client_tokens: row.client_tokens,
+            calls: row.calls,
+        })
+        .collect();
+    out.sort_by(|a, b| a.engine.cmp(&b.engine));
+    out
+}
+
 fn add_usage(dst: &mut TokenUsageBreakdown, src: TokenUsageBreakdown) {
-    dst.input_tokens += src.input_tokens;
-    dst.output_tokens += src.output_tokens;
-    dst.cache_creation_tokens += src.cache_creation_tokens;
-    dst.cache_read_tokens += src.cache_read_tokens;
+    dst.input_tokens = dst.input_tokens.saturating_add(src.input_tokens);
+    dst.output_tokens = dst.output_tokens.saturating_add(src.output_tokens);
+    dst.cache_creation_tokens = dst.cache_creation_tokens.saturating_add(src.cache_creation_tokens);
+    dst.cache_read_tokens = dst.cache_read_tokens.saturating_add(src.cache_read_tokens);
 }
 
 /// 单个时间桶含分组数据
@@ -275,6 +381,13 @@ struct BucketEntry {
     by_key_credential: HashMap<u64, HashMap<u64, BucketStats>>,
     by_credential_model: HashMap<u64, HashMap<String, BucketStats>>,
     by_key_credential_model: HashMap<u64, HashMap<u64, HashMap<String, BucketStats>>>,
+    /// 逐引擎计费对：`(key, 引擎, 凭据, 模型) → (上游真实, 客户端被计费)`。
+    ///
+    /// **只收上游凭据的记录**（`is_upstream`），故实际条目数远小于 key 的笛卡尔积 ——
+    /// 多数部署里上游账号只有一两个。这也是它独立于上面八张表的原因：那八张表每个
+    /// 条目都会被复制一份 `BucketStats`，而计费只有 `query_billing` 读，塞进
+    /// `BucketStats` 等于让另外七张表白背 100+ 字节。
+    by_engine_billing: HashMap<BillingKey, EngineBillingPair>,
 }
 
 /// 时间维度聚合器
@@ -452,7 +565,11 @@ impl UsageAggregator {
                     continue;
                 }
                 if let Ok(rec) = serde_json::from_str::<UsageRecord>(&line) {
-                    self.ingest(&rec);
+                    // 必须 normalized()：v1 记录把「哪个引擎」隐式表达在
+                    // rust_usage / go_usage 哪个非空上，不折叠成 engine +
+                    // client_usage 的话，ingest 会因 engine 为 None 而跳过整条 ——
+                    // 升级后历史数据在逐引擎对比表里整段消失（且无任何报错）。
+                    self.ingest(&rec.normalized());
                     count += 1;
                 }
             }
@@ -616,8 +733,12 @@ impl UsageAggregator {
         out
     }
 
-    /// Billing comparison aggregated by time bucket. Only direct upstream records
-    /// contribute; native Kiro credentials are intentionally excluded.
+    /// 逐引擎计费对比，按时间桶聚合。**只统计上游凭据的记录** —— 原生 Kiro 凭据
+    /// 没有上游美元成本，计入会让「上游真实」这一列失去意义。
+    ///
+    /// 每个引擎独立成行，行内 `upstream_cost` 与 `client_cost` 来自**同一批请求**
+    /// （见 [`EngineBillingPair`]），故两者相除得到的加价倍数是有意义的。v1 schema
+    /// 做不到这点：那里「上游真实」是所有引擎共用的一个槽。
     pub fn query_billing(
         &self,
         window: StatsQueryWindow,
@@ -631,67 +752,84 @@ impl UsageAggregator {
         let inner = self.inner.read();
         let buckets = select_buckets(&inner, window.granularity);
         let mut points = Vec::new();
-        let mut total = (0.0, 0.0, 0.0, 0u64, 0u64, 0u64, 0u64);
+        // 全窗口的逐引擎累计，用于汇总行。
+        let mut totals: HashMap<String, EngineCostRow> = HashMap::new();
+        let mut total_upstream_cost = 0.0;
+        let mut total_client_cost = 0.0;
+        let mut total_calls = 0u64;
+
         for bucket in buckets.iter().filter(|b| bucket_in_window(b, window)) {
-            let models = match key_id {
-                Some(id) => bucket.by_key_credential_model.get(&id),
-                None => Some(&bucket.by_credential_model),
-            };
-            let Some(models) = models else { continue };
-            let mut row = (0.0, 0.0, 0.0, 0u64, 0u64, 0u64, 0u64);
-            for (credential_id, model_map) in models {
+            // 本桶内的逐引擎小计。
+            let mut per_engine: HashMap<String, EngineCostRow> = HashMap::new();
+            let mut bucket_upstream_cost = 0.0;
+            let mut bucket_client_cost = 0.0;
+            let mut bucket_calls = 0u64;
+
+            for (bk, pair) in &bucket.by_engine_billing {
+                // 按 Key 过滤：None = 全部 Key 汇总。
+                if let Some(id) = key_id {
+                    if bk.key_id != id {
+                        continue;
+                    }
+                }
                 if let Some(allow) = cred_filter {
-                    if !allow.contains(credential_id) {
+                    if !allow.contains(&bk.credential_id) {
                         continue;
                     }
                 }
                 let upstream_mul = config
                     .upstream_multipliers
-                    .get(credential_id)
+                    .get(&bk.credential_id)
                     .copied()
                     .unwrap_or(1.0);
-                for (model, stats) in model_map {
-                    row.3 += stats.upstream_usage.total_tokens();
-                    row.4 += stats.rust_usage.total_tokens();
-                    row.5 += stats.go_usage.total_tokens();
-                    row.6 += stats.upstream_calls;
-                    if let Some(price) = config.model_prices.get(model) {
-                        row.0 += cost(stats.upstream_usage, price, upstream_mul);
-                        row.1 += cost(stats.rust_usage, price, config.rust_multiplier);
-                        row.2 += cost(stats.go_usage, price, config.go_multiplier);
-                    }
+                // 客户端侧的引擎倍率：这是**计费对比专用**的成本调节系数，与下发给
+                // 客户端的 token 膨胀倍率是两件事（后者已作用在 pair.client 上）。
+                let client_mul = config.engine_multiplier(&bk.engine);
+
+                let row = per_engine.entry(bk.engine.clone()).or_default();
+                row.upstream_tokens += pair.upstream.total_tokens();
+                row.client_tokens += pair.client.total_tokens();
+                row.calls += pair.calls;
+                bucket_calls += pair.calls;
+                if let Some(price) = config.model_prices.get(&bk.model) {
+                    let up = cost(pair.upstream, price, upstream_mul);
+                    let cl = cost(pair.client, price, client_mul);
+                    row.upstream_cost += up;
+                    row.client_cost += cl;
+                    bucket_upstream_cost += up;
+                    bucket_client_cost += cl;
                 }
             }
-            total.0 += row.0;
-            total.1 += row.1;
-            total.2 += row.2;
-            total.3 += row.3;
-            total.4 += row.4;
-            total.5 += row.5;
-            total.6 += row.6;
+
+            // 累进全窗口汇总。
+            for (engine, row) in &per_engine {
+                totals.entry(engine.clone()).or_default().merge(row);
+            }
+            total_upstream_cost += bucket_upstream_cost;
+            total_client_cost += bucket_client_cost;
+            total_calls += bucket_calls;
+
             points.push(crate::admin::types::BillingUsagePoint {
                 ts: ts_to_rfc3339(bucket.ts),
-                upstream_cost: row.0,
-                rust_cost: row.1,
-                go_cost: row.2,
-                upstream_tokens: row.3,
-                rust_tokens: row.4,
-                go_tokens: row.5,
-                calls: row.6,
+                upstream_cost: bucket_upstream_cost,
+                client_cost: bucket_client_cost,
+                calls: bucket_calls,
+                engines: engine_rows_to_payload(&per_engine),
             });
         }
+
         let summary = crate::admin::types::BillingComparisonResponse {
             points: points.clone(),
-            upstream_cost: total.0,
-            rust_cost: total.1,
-            go_cost: total.2,
-            upstream_tokens: total.3,
-            rust_tokens: total.4,
-            go_tokens: total.5,
-            calls: total.6,
+            upstream_cost: total_upstream_cost,
+            client_cost: total_client_cost,
+            calls: total_calls,
+            engines: engine_rows_to_payload(&totals),
         };
         (points, summary)
     }
+
+    /// 旧签名占位，见下方 legacy 标记。
+    #[allow(dead_code)]
 
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
@@ -747,21 +885,22 @@ impl Default for UsageAggregator {
     }
 }
 
-/// 把记录写入对应桶；不存在则插入并按时间排序，超过容量时移除最旧的
+/// 把记录写入对应桶；不存在则二分查找插入位置（保持升序），超过容量时移除最旧的。
+/// 原线性扫描+全量排序改为 binary_search_by_key，O(log n) 查找 + O(n) 插入，
+/// 去掉了每次插入都重新排序的 O(n log n) 开销。
 fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max: usize) {
-    if let Some(b) = buckets.iter_mut().find(|b| b.ts == ts) {
-        add_record_to_bucket(b, rec);
-        return;
-    }
-    let mut entry = BucketEntry {
-        ts,
-        ..Default::default()
-    };
-    add_record_to_bucket(&mut entry, rec);
-    buckets.push(entry);
-    buckets.sort_by_key(|b| b.ts);
-    while buckets.len() > max {
-        buckets.remove(0);
+    match buckets.binary_search_by_key(&ts, |b| b.ts) {
+        Ok(idx) => {
+            add_record_to_bucket(&mut buckets[idx], rec);
+        }
+        Err(idx) => {
+            let mut entry = BucketEntry { ts, ..Default::default() };
+            add_record_to_bucket(&mut entry, rec);
+            buckets.insert(idx, entry);
+            while buckets.len() > max {
+                buckets.remove(0);
+            }
+        }
     }
 }
 
@@ -811,6 +950,27 @@ fn add_record_to_bucket(bucket: &mut BucketEntry, rec: &UsageRecord) {
         .entry(rec.model.clone())
         .or_default()
         .add(rec);
+
+    // 逐引擎计费：只有上游凭据有真实美元成本，Kiro 凭据不参与（与 query_billing
+    // 既有语义一致）。无 engine 标记的记录也跳过 —— 那是 v1 里 A/B 之外的路径，
+    // 归不到任何引擎，硬塞进某一栏会污染对比。
+    if rec.is_upstream {
+        if let Some(engine) = rec.engine.as_deref() {
+            bucket
+                .by_engine_billing
+                .entry(BillingKey {
+                    key_id: rec.key_id,
+                    engine: engine.to_string(),
+                    credential_id: rec.credential_id,
+                    model: rec.model.clone(),
+                })
+                .or_default()
+                .add(
+                    rec.upstream_usage.unwrap_or_default(),
+                    rec.client_usage.unwrap_or_default(),
+                );
+        }
+    }
 }
 
 fn cost(
@@ -906,6 +1066,8 @@ mod tests {
             status: "success".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -948,6 +1110,8 @@ mod tests {
             status: "success".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -965,6 +1129,8 @@ mod tests {
             status: "error".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -1023,6 +1189,8 @@ mod tests {
             status: "success".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -1040,6 +1208,8 @@ mod tests {
             status: "success".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -1093,6 +1263,8 @@ mod tests {
             status: "error".to_string(),
             is_upstream: false,
             upstream_usage: None,
+            engine: None,
+            client_usage: None,
             rust_usage: None,
             go_usage: None,
         };
@@ -1101,10 +1273,9 @@ mod tests {
         assert_eq!(ov.today_errors, 1);
     }
 
-    #[test]
-    fn billing_query_calculates_upstream_and_engine_costs() {
-        let agg = UsageAggregator::new();
-        let rust_rec = UsageRecord {
+    /// 计费测试用的基础记录：1M 上游 input、2M 客户端 input，走 rust 引擎。
+    fn billing_rec(engine: &str, client_input: u64) -> UsageRecord {
+        UsageRecord {
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
             credential_id: 9,
@@ -1117,17 +1288,21 @@ mod tests {
             duration_ms: 0,
             status: "success".to_string(),
             is_upstream: true,
+            engine: Some(engine.to_string()),
             upstream_usage: Some(TokenUsageBreakdown {
                 input_tokens: 1_000_000,
                 ..Default::default()
             }),
-            rust_usage: Some(TokenUsageBreakdown {
-                input_tokens: 2_000_000,
+            client_usage: Some(TokenUsageBreakdown {
+                input_tokens: client_input,
                 ..Default::default()
             }),
+            rust_usage: None,
             go_usage: None,
-        };
-        agg.ingest(&rust_rec);
+        }
+    }
+
+    fn billing_config() -> crate::model::config::BillingConfig {
         let mut config = crate::model::config::BillingConfig::default();
         config.model_prices.insert(
             "m".to_string(),
@@ -1139,35 +1314,188 @@ mod tests {
         config.upstream_multipliers.insert(9, 2.0);
         config.rust_multiplier = 1.5;
         config.go_multiplier = 0.5;
+        config
+    }
+
+    fn engine_row<'a>(
+        resp: &'a crate::admin::types::BillingComparisonResponse,
+        engine: &str,
+    ) -> &'a crate::admin::types::EngineBillingPayload {
+        resp.engines
+            .iter()
+            .find(|e| e.engine == engine)
+            .unwrap_or_else(|| panic!("应有 {engine} 行"))
+    }
+
+    #[test]
+    fn billing_query_pairs_upstream_with_client_per_engine() {
+        let agg = UsageAggregator::new();
+        agg.ingest(&billing_rec("rust", 2_000_000));
+        let config = billing_config();
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+
         let (_, result) = agg.query_billing(window, None, None, &config);
+        // 上游 1M × $5/M × 凭据倍率 2.0 = $10；客户端 2M × $5/M × rust 倍率 1.5 = $15
         assert_eq!(result.upstream_cost, 10.0);
-        assert_eq!(result.rust_cost, 15.0);
-        assert_eq!(result.go_cost, 0.0, "Rust 请求不得累计 Go 引擎费用");
+        assert_eq!(result.client_cost, 15.0);
         assert_eq!(result.calls, 1);
 
-        let mut other = rust_rec.clone();
-        other.credential_id = 10;
-        agg.ingest(&other);
-        let credential_filter = std::collections::HashSet::from([9]);
-        let (_, filtered) = agg.query_billing(window, None, Some(&credential_filter), &config);
-        assert_eq!(filtered.upstream_cost, 10.0);
-        assert_eq!(filtered.rust_cost, 15.0);
-        assert_eq!(filtered.go_cost, 0.0);
-        assert_eq!(filtered.calls, 1);
+        let rust = engine_row(&result, "rust");
+        assert_eq!(rust.upstream_cost, 10.0, "引擎行必须自带上游成本");
+        assert_eq!(rust.client_cost, 15.0);
+        assert_eq!(rust.calls, 1);
+        assert_eq!(result.engines.len(), 1, "未使用的引擎不该出现");
+    }
 
-        let mut go_rec = rust_rec;
-        go_rec.rust_usage = None;
-        go_rec.go_usage = Some(TokenUsageBreakdown {
-            input_tokens: 3_000_000,
+    /// `engine_multiplier` 与 token 膨胀倍率**刻意叠乘**，不是重复相乘的 bug。
+    ///
+    /// 两者是两个不同的旋钮，作用在两个不同的层：
+    /// - token 膨胀倍率（`cacheEngine*.{input,output,...}Multiplier`）在**请求路径**
+    ///   上作用，改的是下发给客户端的 usage 数字，已经烙进记录下来的 `client_usage`。
+    /// - `billing.<engine>Multiplier` 只在**计费对比视图**上作用，改的是账面单价，
+    ///   不回头改 token。
+    ///
+    /// 故一条 1M 上游 / 2M 客户端（2× 已在请求路径乘过）的记录，配 `rust_multiplier
+    /// = 1.5` 时客户端成本相对上游是 3×。这看着像"乘了两次"，但两次乘的不是同一个
+    /// 量：第一次乘 token，第二次乘钱。
+    ///
+    /// 本测试同时钉住 `client_tokens` 在两种配置下都是 2M —— 若哪天有人把
+    /// `engine_multiplier` 改成也缩放 token（即"合并成一个旋钮"），token 断言先炸，
+    /// 使这次口径变更不可能静默发生。
+    #[test]
+    fn engine_multiplier_scales_cost_only_and_stacks_on_token_multiplier() {
+        let agg = UsageAggregator::new();
+        // client_input = 2M 表示请求路径已按 2× 膨胀过（上游只有 1M）。
+        agg.ingest(&billing_rec("rust", 2_000_000));
+        let window = || StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+
+        // 计费系数取 1.0：客户端成本只反映 token 膨胀，2M × $5/M = $10。
+        let mut config = billing_config();
+        config.rust_multiplier = 1.0;
+        let (_, neutral) = agg.query_billing(window(), None, None, &config);
+        assert_eq!(neutral.client_cost, 10.0, "系数 1.0 时只剩 token 膨胀那一层");
+
+        // 计费系数取 1.5：在已膨胀的 token 之上再调账面单价，$10 × 1.5 = $15。
+        config.rust_multiplier = 1.5;
+        let (_, scaled) = agg.query_billing(window(), None, None, &config);
+        assert_eq!(scaled.client_cost, 15.0, "计费系数叠在 token 膨胀之上");
+
+        // 两种配置下 token 数完全相同：计费系数不碰 token。
+        assert_eq!(engine_row(&neutral, "rust").client_tokens, 2_000_000);
+        assert_eq!(
+            engine_row(&scaled, "rust").client_tokens,
+            2_000_000,
+            "engine_multiplier 只作用于成本，不得改动 token 口径"
+        );
+    }
+
+    /// **v1 schema 的核心缺陷**：`upstream_usage` 是所有引擎共用的一个槽，混合流量下
+    /// 它累加的是「A 请求的上游 + B 请求的上游」，而 `rust_usage` 只含 A 的客户端计费。
+    /// 拿 `rust_cost / upstream_cost` 得到的"加价倍数"分母里混着 B 的成本，无意义。
+    ///
+    /// 新 schema 逐引擎配对存储，故每个引擎行的上游成本**只含该引擎自己的请求**。
+    #[test]
+    fn each_engine_row_carries_only_its_own_upstream_cost() {
+        let agg = UsageAggregator::new();
+        agg.ingest(&billing_rec("rust", 2_000_000));
+        agg.ingest(&billing_rec("go", 3_000_000));
+        let config = billing_config();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let (_, result) = agg.query_billing(window, None, None, &config);
+
+        // 两条请求各自 1M 上游 → 汇总 $20。这个数 v1 也对。
+        assert_eq!(result.upstream_cost, 20.0);
+        assert_eq!(result.calls, 2);
+
+        // 但逐引擎行必须各自只有 $10 —— v1 无法表达这一点。
+        let rust = engine_row(&result, "rust");
+        let go = engine_row(&result, "go");
+        assert_eq!(
+            rust.upstream_cost, 10.0,
+            "rust 行的上游成本不得含 go 请求的成本（v1 此处为 20.0）"
+        );
+        assert_eq!(
+            go.upstream_cost, 10.0,
+            "go 行的上游成本不得含 rust 请求的成本"
+        );
+        assert_eq!(rust.client_cost, 15.0, "2M × $5/M × 1.5");
+        assert_eq!(go.client_cost, 7.5, "3M × $5/M × 0.5");
+
+        // 一一对应的意义：比值只在配对存储下才成立。
+        assert_eq!(rust.client_cost / rust.upstream_cost, 1.5);
+        assert_eq!(go.client_cost / go.upstream_cost, 0.75);
+    }
+
+    /// 引擎 C / D 必须与 A / B 一样进对比表 —— 这是四引擎改造的目的。
+    #[test]
+    fn stateless_engines_appear_in_billing_comparison() {
+        let agg = UsageAggregator::new();
+        agg.ingest(&billing_rec("real", 1_000_000));
+        agg.ingest(&billing_rec("nocache", 4_000_000));
+        let mut config = billing_config();
+        config.real_multiplier = 2.0;
+        config.nocache_multiplier = 3.0;
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let (_, result) = agg.query_billing(window, None, None, &config);
+
+        let real = engine_row(&result, "real");
+        let nocache = engine_row(&result, "nocache");
+        assert_eq!(real.upstream_cost, 10.0);
+        assert_eq!(real.client_cost, 10.0, "1M × $5/M × real 倍率 2.0");
+        assert_eq!(nocache.upstream_cost, 10.0);
+        assert_eq!(nocache.client_cost, 60.0, "4M × $5/M × nocache 倍率 3.0");
+    }
+
+    /// 凭据过滤与按 Key 过滤都必须逐引擎生效。
+    #[test]
+    fn billing_filters_apply_per_engine() {
+        let agg = UsageAggregator::new();
+        agg.ingest(&billing_rec("rust", 2_000_000));
+        let mut other_cred = billing_rec("rust", 2_000_000);
+        other_cred.credential_id = 10;
+        agg.ingest(&other_cred);
+        let mut other_key = billing_rec("go", 3_000_000);
+        other_key.key_id = 2;
+        agg.ingest(&other_key);
+
+        let config = billing_config();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+
+        // 凭据过滤：只留 9，另一条 rust 请求（凭据 10）应被排除。
+        let only_nine = std::collections::HashSet::from([9]);
+        let (_, filtered) = agg.query_billing(window, None, Some(&only_nine), &config);
+        assert_eq!(engine_row(&filtered, "rust").calls, 1);
+        assert_eq!(engine_row(&filtered, "rust").upstream_cost, 10.0);
+
+        // 按 Key 过滤：Key 1 只用 rust，故 go 行整个消失。
+        let (_, by_key) = agg.query_billing(window, Some(1), None, &config);
+        assert!(
+            by_key.engines.iter().all(|e| e.engine != "go"),
+            "Key 1 没有 go 流量，不该出现 go 行"
+        );
+        assert_eq!(engine_row(&by_key, "rust").calls, 2, "Key 1 的两个凭据都算");
+    }
+
+    /// v1 老 JSONL（只有 `rust_usage` / `go_usage`，无 `engine`）必须仍能归类，
+    /// 否则升级瞬间历史数据会从对比表里整段消失。
+    #[test]
+    fn v1_records_normalize_into_engine_rows() {
+        let agg = UsageAggregator::new();
+        let mut v1 = billing_rec("rust", 2_000_000);
+        // 造一条真正的 v1 记录：engine / client_usage 为空，靠 rust_usage 表达。
+        v1.engine = None;
+        v1.client_usage = None;
+        v1.rust_usage = Some(TokenUsageBreakdown {
+            input_tokens: 2_000_000,
             ..Default::default()
         });
-        agg.ingest(&go_rec);
+        agg.ingest(&v1.clone().normalized());
 
-        let (_, mixed) = agg.query_billing(window, None, Some(&credential_filter), &config);
-        assert_eq!(mixed.upstream_cost, 20.0);
-        assert_eq!(mixed.rust_cost, 15.0, "Go 请求不得再次累计 Rust 引擎费用");
-        assert_eq!(mixed.go_cost, 7.5);
-        assert_eq!(mixed.calls, 2);
+        let config = billing_config();
+        let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
+        let (_, result) = agg.query_billing(window, None, None, &config);
+        let rust = engine_row(&result, "rust");
+        assert_eq!(rust.client_cost, 15.0, "v1 的 rust_usage 应归入 rust 行");
+        assert_eq!(rust.upstream_cost, 10.0);
     }
 }

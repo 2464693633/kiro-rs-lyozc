@@ -39,6 +39,11 @@ pub struct AdminState {
     pub cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
     /// 引擎 B 句柄（读计数器 / 热改参数）
     pub go_cache_tracker: Option<Arc<crate::anthropic::cache_metering_go::GoCacheTracker>>,
+    /// 引擎 C / D 的倍率存储（热改参数）。
+    ///
+    /// 与 `AppState.cache_engines.stateless` 是**同一个 `Arc`**，由 main.rs 构造后
+    /// 分别注入两侧。C / D 无缓存状态，故没有 tracker，只有这份倍率。
+    pub stateless_multipliers: Option<Arc<crate::anthropic::cache_engine::StatelessMultipliers>>,
 }
 
 impl AdminState {
@@ -59,6 +64,7 @@ impl AdminState {
             groups,
             cache_meter: None,
             go_cache_tracker: None,
+            stateless_multipliers: None,
         }
     }
 
@@ -66,13 +72,21 @@ impl AdminState {
     ///
     /// 用 builder 而非扩 `new` 的参数表：`new` 已有 6 个位置参数，再加两个同类型
     /// Option 极易在调用点写错顺序。
+    /// 注入四套引擎的运行期句柄。
+    ///
+    /// `stateless_multipliers` **必须与请求路径（`AppState`）传入同一个 `Arc`**：
+    /// 引擎 C / D 的热更新是对该 `Arc` 内的原子量做 store，两边若各持一份分配，
+    /// Admin 改完返回成功、请求路径却永远读默认 1.0 —— 静默失效且无报错。
+    /// A / B 天然共享 tracker `Arc`，故无此风险。
     pub fn with_cache_engines(
         mut self,
         cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
         go_cache_tracker: Option<Arc<crate::anthropic::cache_metering_go::GoCacheTracker>>,
+        stateless_multipliers: Option<Arc<crate::anthropic::cache_engine::StatelessMultipliers>>,
     ) -> Self {
         self.cache_meter = cache_meter;
         self.go_cache_tracker = go_cache_tracker;
+        self.stateless_multipliers = stateless_multipliers;
         self
     }
 }

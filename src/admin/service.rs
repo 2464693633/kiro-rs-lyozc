@@ -3570,6 +3570,8 @@ fn billing_config_payload(config: &crate::model::config::BillingConfig) -> Billi
         upstream_multipliers: config.upstream_multipliers.clone(),
         rust_multiplier: config.rust_multiplier,
         go_multiplier: config.go_multiplier,
+        real_multiplier: config.real_multiplier,
+        nocache_multiplier: config.nocache_multiplier,
     }
 }
 
@@ -3584,6 +3586,8 @@ fn billing_config_from_payload(payload: &BillingConfigPayload) -> crate::model::
         upstream_multipliers: payload.upstream_multipliers.clone(),
         rust_multiplier: payload.rust_multiplier,
         go_multiplier: payload.go_multiplier,
+        real_multiplier: payload.real_multiplier,
+        nocache_multiplier: payload.nocache_multiplier,
     }
 }
 

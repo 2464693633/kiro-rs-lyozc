@@ -23,6 +23,12 @@ pub const DEFAULT_PROMPT_CACHE_TTL_MS: i64 = 5 * 60 * 1000;
 /// 最长 TTL（1h），对齐 Anthropic `ttl="1h"`。
 pub const MAX_PROMPT_CACHE_TTL_MS: i64 = 60 * 60 * 1000;
 
+/// 倍率 1.0 的 f64 位型，装进 `AtomicI64` 的默认值。
+///
+/// 倍率一律以 `f64::to_bits` 存原子量，不用千分比整数：千分比会把 <0.0005 的
+/// 正倍率量化成 0（下发 token 全归零），也会静默截断任何超过 3 位小数的值。
+pub(super) const ONE_BITS: i64 = 1.0f64.to_bits() as i64;
+
 /// Go `estimateApproxTokens` 的逐字移植。
 ///
 /// 分类用**显式字符范围**而非 `unicode.IsDigit`/`IsLetter`：空格 / 制表 / 换行
@@ -371,6 +377,10 @@ pub fn normalize_prompt_cache_ttl(ttl_ms: i64) -> i64 {
 }
 
 /// Go `interfaceHasCacheControl`：递归判断值树里是否出现过 `cache_control`。
+///
+/// 仅测试使用：断点提取走 [`extract_prompt_cache_ttl`]，它同时要取出 ttl 值，
+/// 故不需要「是否存在」这个更弱的判断。保留是因为它是 Go 侧函数的对照实现。
+#[cfg(test)]
 pub fn value_has_cache_control(value: &Value) -> bool {
     match value {
         Value::Object(map) => {
@@ -723,8 +733,11 @@ pub struct GoCacheUsage {
 
 /// go 缓存模拟引擎的进程内状态。
 ///
-/// **无会话隔离**：`entries` 是全局表（忠实移植 Go 的 `C1: cross-account sharing`），
-/// 不同客户端 Key 的相同前缀会互相命中。这是与引擎 A 唯一的可观测行为差异。
+/// **隔离粒度是 Kiro 凭据，而非客户端 Key / session**（忠实移植 Go 的
+/// `C1: cross-account sharing`）：指纹表按 `credential_id` 分区，同一凭据下的**不同
+/// 客户端 Key 会互相命中**，不同凭据之间不会。这是与引擎 A（按 session / key_id
+/// 隔离）唯一的可观测行为差异，由 `fingerprints_are_shared_within_account_only`
+/// 钉住两侧。
 pub struct GoCacheTracker {
     /// Cache state is partitioned by the actual Kiro credential.
     inner: Mutex<HashMap<u64, TrackerInner>>,
@@ -738,10 +751,17 @@ pub struct GoCacheTracker {
     ttl_ms: AtomicI64,
     min_cacheable_tokens: AtomicI64,
     opus_min_cacheable_tokens: AtomicI64,
-    /// go 引擎专属的下发缩放倍率（不走全局膨胀倍率）。同样用千分比整数存进原子量。
-    input_token_multiplier_millis: AtomicI64,
-    cache_read_multiplier_millis: AtomicI64,
-    cache_creation_multiplier_millis: AtomicI64,
+    /// go 引擎专属的下发缩放倍率（不走全局膨胀倍率）。以 `f64::to_bits` 存进原子量，
+    /// 不用千分比整数 —— 见 [`ONE_BITS`]。
+    input_token_multiplier_bits: AtomicI64,
+    cache_read_multiplier_bits: AtomicI64,
+    cache_creation_multiplier_bits: AtomicI64,
+    /// 下发前对 `output_tokens` 的缩放倍率。
+    ///
+    /// Go 原实现无此倍率（`buildClaudeUsageMap` 不碰 output），故默认 1.0 =
+    /// 与 Go 一致。开放它是为了四引擎倍率对称 —— 否则 B 是唯一不能调 output 的
+    /// 引擎，运维得记住这个例外。
+    output_multiplier_bits: AtomicI64,
     /// 可注入时钟（毫秒）。`None` = 用系统时间。仅测试使用：否则 TTL 与 LRU
     /// 相关行为只能靠 sleep 验证。
     clock_ms: Mutex<Option<i64>>,
@@ -764,9 +784,10 @@ impl GoCacheTracker {
             ttl_ms: AtomicI64::new(0),
             min_cacheable_tokens: AtomicI64::new(0),
             opus_min_cacheable_tokens: AtomicI64::new(0),
-            input_token_multiplier_millis: AtomicI64::new(1000),
-            cache_read_multiplier_millis: AtomicI64::new(1000),
-            cache_creation_multiplier_millis: AtomicI64::new(1000),
+            input_token_multiplier_bits: AtomicI64::new(ONE_BITS),
+            cache_read_multiplier_bits: AtomicI64::new(ONE_BITS),
+            cache_creation_multiplier_bits: AtomicI64::new(ONE_BITS),
+            output_multiplier_bits: AtomicI64::new(ONE_BITS),
             clock_ms: Mutex::new(None),
         };
         tracker.apply_config(config);
@@ -785,30 +806,36 @@ impl GoCacheTracker {
             .store(c.min_cacheable_tokens, Ordering::Relaxed);
         self.opus_min_cacheable_tokens
             .store(c.opus_min_cacheable_tokens, Ordering::Relaxed);
-        self.input_token_multiplier_millis.store(
-            (c.input_token_multiplier * 1000.0).round() as i64,
-            Ordering::Relaxed,
-        );
-        self.cache_read_multiplier_millis.store(
-            (c.cache_read_multiplier * 1000.0).round() as i64,
-            Ordering::Relaxed,
-        );
-        self.cache_creation_multiplier_millis.store(
-            (c.cache_creation_multiplier * 1000.0).round() as i64,
+        // 倍率存 f64 位型而非千分比整数：千分比会把 <0.0005 的正倍率量化成 0
+        // （客户端 token 全归零），且对任何超过 3 位小数的值都静默丢精度。
+        // 计费口径上这是不可接受的。见 `multipliers`。
+        self.input_token_multiplier_bits
+            .store(c.input_token_multiplier.to_bits() as i64, Ordering::Relaxed);
+        self.output_multiplier_bits
+            .store(c.output_multiplier.to_bits() as i64, Ordering::Relaxed);
+        self.cache_read_multiplier_bits
+            .store(c.cache_read_multiplier.to_bits() as i64, Ordering::Relaxed);
+        self.cache_creation_multiplier_bits.store(
+            c.cache_creation_multiplier.to_bits() as i64,
             Ordering::Relaxed,
         );
     }
 
-/// go 引擎专属倍率 `(input, cache_read, cache_creation)`。
+/// go 引擎专属倍率 `(input, output, cache_read, cache_creation)`。
     ///
-    /// 这三个值**取代**全局膨胀倍率作用在 go 路径上：两套引擎各用自己的一组，
-    /// 使各自下发口径可独立调参。`cache_creation` 默认 1.0（= Go 原实现只缩放
-    /// input 与 cache_read），可按需调离。
-    pub fn multipliers(&self) -> (f64, f64, f64) {
+    /// 这四个值**取代**全局膨胀倍率作用在 go 路径上，使每个引擎的下发口径可独立
+    /// 调参。默认全 1.0：`output` 与 `cache_creation` 保持 1.0 时与 Go 原实现
+    /// 一致（Go 的 `buildClaudeUsageMap` 只缩放 input 与 cache_read）。
+    ///
+    /// 调离 1.0 会偏离 Go 原实现，且会削弱两套引擎在「creation/read 划分」这个
+    /// 维度上的可比性 —— 数字差异将无法区分是引擎算法不同还是倍率不同造成的。
+    pub fn multipliers(&self) -> (f64, f64, f64, f64) {
+        let load = |a: &AtomicI64| f64::from_bits(a.load(Ordering::Relaxed) as u64);
         (
-            self.input_token_multiplier_millis.load(Ordering::Relaxed) as f64 / 1000.0,
-            self.cache_read_multiplier_millis.load(Ordering::Relaxed) as f64 / 1000.0,
-            self.cache_creation_multiplier_millis.load(Ordering::Relaxed) as f64 / 1000.0,
+            load(&self.input_token_multiplier_bits),
+            load(&self.output_multiplier_bits),
+            load(&self.cache_read_multiplier_bits),
+            load(&self.cache_creation_multiplier_bits),
         )
     }
 
@@ -865,6 +892,11 @@ impl GoCacheTracker {
     /// 两阶段是 `scan_start = len-2` 能成立的前提：本轮最深断点此刻尚未入表，故
     /// 它覆盖的「本轮新内容」必然落进 cache_creation。若改成一次性先写后查，首轮
     /// 就会因刚写入的 `len-2` 断点而报出 cache_read —— 那是伪造读数。
+    ///
+    /// 仅测试使用（`account_id = 0` 的单账号简写）。请求路径一律走
+    /// [`Self::compute_for_account`]：凭据隔离不是可选项，故生产侧不该有省略
+    /// 账号的入口。
+    #[cfg(test)]
     pub fn compute(&self, profile: &PromptCacheProfile) -> GoCacheUsage {
         self.compute_for_account(0, profile)
     }
@@ -890,7 +922,10 @@ impl GoCacheTracker {
 
         // 首个请求（表空）：只可能是 creation，且**不套 0.85 封顶**（对齐 Go）。
         if inner.entries.is_empty() {
-            drop(inner);
+            // 释放的必须是 guard `all`，不是从它借出的 `inner`：`drop(&mut T)` 是
+            // 空操作（编译器 `dropping_references` 会警告），锁会一直持到函数返回。
+            // NLL 使这里合法 —— 本分支内 `inner` 已无后续使用。
+            drop(all);
             self.misses.fetch_add(1, Ordering::Relaxed);
             let creation = if last_tokens < min_tokens { 0 } else { last_tokens };
             return GoCacheUsage {
@@ -908,10 +943,17 @@ impl GoCacheTracker {
         }
 
         // 最深断点覆盖本轮新内容，Anthropic 恒计 creation，故从 len-2 起扫。
-        let scan_start = if profile.breakpoints.len() >= 2 {
-            profile.breakpoints.len() - 2
-        } else {
-            profile.breakpoints.len() - 1
+        //
+        // 只有 1 个断点时没有「更浅的历史断点」可扫：那唯一的断点就是本轮最深断点，
+        // 按上述规则必须整段计入 creation。此前这里回退成 len-1 = 0，会把它当历史
+        // 断点扫描，命中就报出 cache_read 且 creation 归零 —— 与两阶段设计矛盾的伪造读数。
+        let Some(scan_start) = profile.breakpoints.len().checked_sub(2) else {
+            drop(all); // 同上：释放 guard 才真正解锁
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return GoCacheUsage {
+                cache_creation: if last_tokens < min_tokens { 0 } else { last_tokens },
+                cache_read: 0,
+            };
         };
 
         let mut matched = 0i64;
@@ -937,7 +979,7 @@ impl GoCacheTracker {
             matched = bp.cumulative_tokens.min(profile.total_input_tokens).min(last_tokens);
             break;
         }
-        drop(inner);
+        drop(all); // 同上：释放 guard 才真正解锁
 
         if matched > 0 {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -952,6 +994,9 @@ impl GoCacheTracker {
     }
 
     /// Go `Update`：把本轮断点写入表。**只应在请求成功后调用**，使失败请求不污染缓存。
+    ///
+    /// 仅测试使用，理由同 [`Self::compute`]。
+    #[cfg(test)]
     pub fn update(&self, profile: &PromptCacheProfile) {
         self.update_for_account(0, profile)
     }
@@ -1089,6 +1134,8 @@ impl GoCacheTracker {
             return;
         };
         let now = self.now_ms();
+        // 先清所有 dirty 标志并取快照（持锁期间），写失败后再恢复。
+        // 注意：dirty 须在锁内重置，否则与并发 compute/update 产生竞态。
         let snapshot = {
             let mut all = self.inner.lock();
             if !all.values().any(|state| state.dirty) {
@@ -1116,11 +1163,19 @@ impl GoCacheTracker {
         let json = match serde_json::to_vec(&disk) {
             Ok(b) => b,
             Err(e) => {
+                // 序列化失败：恢复所有 account 的 dirty，下次定时任务重试
+                for inner in self.inner.lock().values_mut() {
+                    inner.dirty = true;
+                }
                 tracing::warn!("GoCacheTracker 序列化失败: {}", e);
                 return;
             }
         };
         if let Err(e) = crate::common::fs::write_file_atomic(&path, &json) {
+            // 写文件失败：恢复所有 account 的 dirty，下次定时任务重试
+            for inner in self.inner.lock().values_mut() {
+                inner.dirty = true;
+            }
             tracing::warn!("GoCacheTracker 落盘失败 {}: {}", path.display(), e);
         }
     }
@@ -1899,6 +1954,25 @@ mod tests {
         assert_eq!(t.stats().entries, 0, "compute 不应写入任何条目");
         t.compute(&p);
         assert_eq!(t.compute(&p).cache_read, 0, "反复 compute 仍不该命中");
+    }
+
+    /// 单断点（len==1）：唯一断点就是本轮最深断点，Anthropic 恒计 creation。
+    /// 回归 `scan_start = len-1` 的旧算法——它会扫到 index 0 并把已入表的该断点
+    /// 报成 cache_read，等于把本轮新内容伪造成缓存读取。
+    #[test]
+    fn single_breakpoint_never_reports_cache_read() {
+        let t = tracker();
+        let p = profile_of(&convo(1), &t);
+        assert_eq!(p.breakpoints.len(), 1, "convo(1) 应只产生一个断点");
+
+        // 先写入该断点，使表非空（空表分支会提前返回，绕过 scan_start）。
+        t.update(&p);
+        assert!(t.stats().entries > 0, "update 应已写入断点");
+
+        // 同一 profile 再 compute：唯一断点已在表中且未过期，旧算法必然误报 read。
+        let u = t.compute(&p);
+        assert_eq!(u.cache_read, 0, "最深断点不得计入 cache_read");
+        assert!(u.cache_creation > 0, "本轮内容应全部计入 cache_creation");
     }
 
     /// 最小可缓存阈值：所有断点都低于阈值时，既不命中也不写入。

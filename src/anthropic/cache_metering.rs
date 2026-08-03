@@ -32,6 +32,20 @@ const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）。可经 `cacheEngineRust.defaultTtlSecs` 覆盖。
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
+/// 倍率原子量的「未设置」哨兵值。
+///
+/// 倍率以 `f64::to_bits` 存进 `AtomicI64`（不用千分比整数：那会把 <0.0005 的正
+/// 倍率量化成 0）。`-1` 作为哨兵是安全的：它对应 `f64::from_bits(u64::MAX)`，
+/// 即一个符号位为 1 的 NaN，而 `sanitize_opt_multiplier` 只放行
+/// `is_finite() && > 0.0` 的值 —— 合法倍率的位型永远不可能等于 `-1`。
+///
+/// 不用 0 当哨兵：`0i64` 是 `+0.0` 的位型，而"把该项归零"与"未设置"必须可区分。
+///
+/// 「未设置」的语义是**回退全局膨胀倍率** —— 这条回退是为了升级兼容：老部署把
+/// 倍率配在全局那一套里，若引擎 A 的新字段直接默认 1.0，升级后已配的倍率会静默
+/// 失效（比如 input 从 2× 变回 1×）而没有任何报错。
+const MULTIPLIER_UNSET: i64 = -1;
+
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -76,6 +90,20 @@ pub struct CacheUsage {
 }
 
 impl CacheUsage {
+    /// 本次请求是否真的跑了缓存模拟。
+    ///
+    /// `prompt_total_est == 0` 表示模拟**未发生**，而不是"模拟出 0 个 token"。
+    /// 目前唯一的触发路径是主 apiKey（`key_id == 0`）且请求无 session：
+    /// [`isolation_seed`] 对该组合返回 `None`（该 Key 被多用户共享，模拟会造出
+    /// 跨用户幻命中），于是 [`compute_cache_usage`] 直接返回全零。
+    ///
+    /// 调用方必须据此走真实上游口径，而不能把 0 丢进
+    /// [`Self::split_against_total`] —— 那会因 `.max(1)` 把客户端 `input_tokens`
+    /// 钉死成 1，销毁上游真实值。
+    pub fn is_simulated(&self) -> bool {
+        self.prompt_total_est > 0
+    }
+
     /// 按真实 total 口径做互斥分摊，返回 `(input_tokens, cache_creation, cache_read)`。
     ///
     /// `total_real` 是最终上报口径的全量 prompt token（contextUsage 真值优先，
@@ -138,6 +166,18 @@ pub struct CacheMeter {
     max_ttl_secs: AtomicI64,
     /// 默认 TTL（秒），用于无显式 ttl 的 cache_control
     default_ttl_secs: AtomicI64,
+    /// 引擎 A 专属倍率，`f64` 位型；**`-1` = 未设置，回退全局膨胀倍率**。
+    ///
+    /// 用哨兵值而非 `Option`：`Option<f64>` 无法原子化，而热更新必须是原子的。
+    /// 哨兵为何安全、以及为何存位型而不存千分比整数，见 [`MULTIPLIER_UNSET`]。
+    ///
+    /// **为什么需要"未设置"这个状态**：升级前的部署把倍率配在全局
+    /// `inputInflationMultiplier` 上。若 A 的字段直接默认 1.0，升级后这些部署的
+    /// 倍率会静默失效（2× 变 1×）。故未显式配置时必须回退全局。
+    input_multiplier_bits: AtomicI64,
+    output_multiplier_bits: AtomicI64,
+    cache_read_multiplier_bits: AtomicI64,
+    cache_creation_multiplier_bits: AtomicI64,
 }
 
 #[derive(Default)]
@@ -178,6 +218,11 @@ impl CacheMeter {
             capacity: AtomicUsize::new(DEFAULT_CAPACITY),
             max_ttl_secs: AtomicI64::new(MAX_TTL_SECS),
             default_ttl_secs: AtomicI64::new(DEFAULT_TTL_SECS),
+            // -1 = 未设置 → 回退全局膨胀倍率。见字段文档。
+            input_multiplier_bits: AtomicI64::new(MULTIPLIER_UNSET),
+            output_multiplier_bits: AtomicI64::new(MULTIPLIER_UNSET),
+            cache_read_multiplier_bits: AtomicI64::new(MULTIPLIER_UNSET),
+            cache_creation_multiplier_bits: AtomicI64::new(MULTIPLIER_UNSET),
         }
     }
 
@@ -198,6 +243,41 @@ impl CacheMeter {
         self.max_ttl_secs.store(c.max_ttl_secs, Ordering::Relaxed);
         self.default_ttl_secs
             .store(c.default_ttl_secs, Ordering::Relaxed);
+        // None → 哨兵值，读取时回退全局倍率。见 MULTIPLIER_UNSET。
+        let to_bits = |v: Option<f64>| {
+            v.map(|x| x.to_bits() as i64).unwrap_or(MULTIPLIER_UNSET)
+        };
+        self.input_multiplier_bits
+            .store(to_bits(c.input_multiplier), Ordering::Relaxed);
+        self.output_multiplier_bits
+            .store(to_bits(c.output_multiplier), Ordering::Relaxed);
+        self.cache_read_multiplier_bits
+            .store(to_bits(c.cache_read_multiplier), Ordering::Relaxed);
+        self.cache_creation_multiplier_bits
+            .store(to_bits(c.cache_creation_multiplier), Ordering::Relaxed);
+    }
+
+    /// 引擎 A 的四元倍率，逐项回退全局。
+    ///
+    /// `global` 是 `(input, output, cache)` 三元组 —— 全局那套没有 creation/read
+    /// 之分，故两个 cache 位都回退到同一个 `global.2`（= 改造前的原行为）。
+    ///
+    /// 逐项而非整组回退：允许只覆盖 input 而让其余三项继续跟随全局。
+    pub fn multipliers(&self, global: (f64, f64, f64)) -> (f64, f64, f64, f64) {
+        let load = |a: &AtomicI64, fallback: f64| {
+            let raw = a.load(Ordering::Relaxed);
+            if raw == MULTIPLIER_UNSET {
+                fallback
+            } else {
+                f64::from_bits(raw as u64)
+            }
+        };
+        (
+            load(&self.input_multiplier_bits, global.0),
+            load(&self.output_multiplier_bits, global.1),
+            load(&self.cache_read_multiplier_bits, global.2),
+            load(&self.cache_creation_multiplier_bits, global.2),
+        )
     }
 
     /// 当前计数器快照。
@@ -337,12 +417,11 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒
-pub fn parse_ttl(ttl: Option<&str>) -> i64 {
-    parse_ttl_with_default(ttl, DEFAULT_TTL_SECS)
-}
-
-/// 同 [`parse_ttl`]，但缺省值来自配置（`cacheEngineRust.defaultTtlSecs`）。
+/// 解析 cache_control 的 ttl 字符串（"5m" / "1h"）→ 秒。
+///
+/// `default_secs` 是无 ttl / 无法识别时的缺省值，由调用方从配置读出
+/// （`cacheEngineRust.defaultTtlSecs`），不写死成 [`DEFAULT_TTL_SECS`] ——
+/// 后者只是该配置项自身的默认值。
 fn parse_ttl_with_default(ttl: Option<&str>, default_secs: i64) -> i64 {
     match ttl {
         Some(s) if s.eq_ignore_ascii_case("1h") => 3600,
@@ -815,6 +894,7 @@ mod tests {
             capacity: 0,
             max_ttl_secs: 0,
             default_ttl_secs: -5,
+            ..Default::default()
         };
         let meter = CacheMeter::new_with_config(None, bad);
         assert_eq!(meter.stats().capacity, DEFAULT_CAPACITY);
@@ -863,10 +943,13 @@ mod tests {
 
     #[test]
     fn parse_ttl_handles_known_values() {
-        assert_eq!(parse_ttl(Some("1h")), 3600);
-        assert_eq!(parse_ttl(Some("5m")), 300);
-        assert_eq!(parse_ttl(None), 300);
-        assert_eq!(parse_ttl(Some("garbage")), 300);
+        let p = |s: Option<&str>| parse_ttl_with_default(s, DEFAULT_TTL_SECS);
+        assert_eq!(p(Some("1h")), 3600);
+        assert_eq!(p(Some("5m")), 300);
+        assert_eq!(p(None), 300);
+        assert_eq!(p(Some("garbage")), 300, "无法识别的 ttl 回落缺省值而非报错");
+        // 缺省值必须来自参数，不是写死的 DEFAULT_TTL_SECS。
+        assert_eq!(parse_ttl_with_default(None, 77), 77);
     }
 
     #[test]
@@ -1548,4 +1631,34 @@ mod tests {
         img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
         B64.encode(&buf)
     }
+
+    /// 极小正倍率必须原值往返，不得被存储格式量化掉。
+    ///
+    /// 这一条钉的是**存储格式**，不是倍率语义：倍率曾以千分比整数存 `AtomicI64`
+    /// （`(v * 1000.0).round()`），于是任何 <0.0005 的正倍率都被 round 成 0 —— 配置
+    /// 校验放行（`sanitize` 只要求 `is_finite() && > 0.0`，无下限），admin 回读配置
+    /// 也显示 0.0004，但请求路径乘的是 0，客户端 usage 全归零。无报错、无日志。
+    ///
+    /// 断言用精确相等而非 `assert_ne!(_, 0.0)`：只钉「非 0」的话，把千分比换成
+    /// 百万分比一样能过，而百万分比只是把断点从 0.0005 推到 0.0000005。要求原值
+    /// 往返才排除掉整个「定点量化」这类实现。
+    #[test]
+    fn tiny_multipliers_survive_storage_roundtrip() {
+        let m = CacheMeter::new_with_config(
+            None,
+            crate::model::config::CacheEngineRustConfig {
+                input_multiplier: Some(0.0004),
+                output_multiplier: Some(0.4),
+                cache_read_multiplier: Some(0.0006),
+                ..crate::model::config::CacheEngineRustConfig::default()
+            },
+        );
+        // 全局兜底给 9.0，用来验证「未设置」与「设置成极小值」可区分。
+        let got = m.multipliers((9.0, 9.0, 9.0));
+        assert_eq!(got.0, 0.0004, "input 倍率被存储格式改动");
+        assert_eq!(got.1, 0.4, "output 倍率被存储格式改动");
+        assert_eq!(got.2, 0.0006, "cache_read 倍率被存储格式改动");
+        assert_eq!(got.3, 9.0, "cache_creation 未设置时应回落到全局兜底");
+    }
+
 }

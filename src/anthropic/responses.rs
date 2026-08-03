@@ -160,7 +160,17 @@ pub async fn post_responses(
     };
 
     // 2. 复用 Anthropic 全链路（内部强制非流式）
-    let inner = post_messages(State(state), Extension(key_ctx), axum::http::HeaderMap::new(), Json(anthropic_req)).await;
+    //
+    // raw_body 传 None：客户端发的是 Responses 格式，不存在可直接转发给上游的
+    // Anthropic 原文，只能用翻译后的结构体重新序列化（= post_messages 的兜底）。
+    let inner = post_messages(
+        State(state),
+        Extension(key_ctx),
+        axum::http::HeaderMap::new(),
+        None,
+        Json(anthropic_req),
+    )
+    .await;
 
     let status = inner.status();
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {

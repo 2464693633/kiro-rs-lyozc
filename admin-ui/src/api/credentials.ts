@@ -473,11 +473,33 @@ export async function setTokenInflationConfig(
 
 // ==== 双缓存模拟引擎 ====
 
+/**
+ * 全局膨胀倍率（引擎 A 未显式配置时的逐项回退值）。
+ *
+ * 注意只有三项：`cache` 一项同时作用于 cache_read 与 cache_creation ——
+ * 这是加独立倍率之前的历史形状，保留它才能让老部署升级后行为不变。
+ */
+export interface GlobalInflationConfig {
+  inputMultiplier: number
+  outputMultiplier: number
+  cacheMultiplier: number
+}
+
 /** 引擎 A（rust，带会话隔离）参数 */
 export interface CacheEngineRustConfig {
   capacity: number
   maxTtlSecs: number
   defaultTtlSecs: number
+  /**
+   * 引擎 A 专属倍率。`null` = 未设置，逐项回退全局膨胀倍率。
+   *
+   * 保留 `null` 语义是为了向后兼容：老部署只配了全局倍率，若这里直接默认 1.0，
+   * 升级后已配的倍率会静默失效。UI 显示时应解析成生效值（见 effectiveRustMultipliers）。
+   */
+  inputMultiplier: number | null
+  outputMultiplier: number | null
+  cacheReadMultiplier: number | null
+  cacheCreationMultiplier: number | null
 }
 
 /** 引擎 B（go，全局共享指纹表）参数 */
@@ -489,15 +511,58 @@ export interface CacheEngineGoConfig {
   opusMinCacheableTokens: number
   /** go 引擎专属：下发前对 input_tokens 的缩放倍率（不走全局膨胀倍率） */
   inputTokenMultiplier: number
+  /**
+   * go 引擎专属：下发前对 output_tokens 的缩放倍率。
+   *
+   * 默认 1.0 = Go 原实现（它没有这个倍率）。开放为可调是为了四引擎对称 ——
+   * B 不该因为移植来源缺一个旋钮就少一个。
+   */
+  outputMultiplier: number
   /** go 引擎专属：下发前对 cache_read_input_tokens 的缩放倍率 */
   cacheReadMultiplier: number
   /** go 引擎专属：下发前对 cache_creation_input_tokens 的缩放倍率（默认 1.0 = Go 原实现） */
   cacheCreationMultiplier: number
 }
 
+/** 引擎 C（real，真实上游 prompt caching）参数 */
+/** 引擎 C（real，保留上游真实 cache 划分）倍率 */
+export interface CacheEngineRealConfig {
+  inputMultiplier: number
+  outputMultiplier: number
+  cacheReadMultiplier: number
+  cacheCreationMultiplier: number
+}
+
+/** 引擎 D（nocache，禁用 prompt caching）参数 */
+/**
+ * 引擎 D（nocache，本地估算 token）倍率。
+ *
+ * 只有 input / output 两个 —— D 的 cache 恒为 0，cache 倍率乘上去也永远是 0。
+ */
+export interface CacheEngineNoCacheConfig {
+  inputMultiplier: number
+  outputMultiplier: number
+}
+
+/** 引擎 A 未显式设置倍率时的回退来源（同时也是顶栏「Token 膨胀倍率」那一套） */
+export interface GlobalInflationConfig {
+  inputMultiplier: number
+  outputMultiplier: number
+  cacheMultiplier: number
+}
+
 export interface CacheEnginesConfig {
   rust: CacheEngineRustConfig
   go: CacheEngineGoConfig
+  real?: CacheEngineRealConfig
+  nocache?: CacheEngineNoCacheConfig
+  /**
+   * 全局膨胀倍率。纳入本 payload 是为了「一个窗口调完四套引擎」——
+   * 它与 `/config/token-inflation` 是同一份存储的两个入口，不是两份数据。
+   *
+   * 作用有两处：① 引擎 A 的倍率为 null 时逐项回退到这里；② 顶栏那个入口。
+   */
+  global?: GlobalInflationConfig
 }
 
 export interface CacheEngineCounters {
@@ -512,6 +577,8 @@ export interface CacheEngineCounters {
 export interface CacheEnginesStats {
   rust: CacheEngineCounters
   go: CacheEngineCounters
+  real?: CacheEngineCounters
+  nocache?: CacheEngineCounters
 }
 
 /** 获取两套引擎参数（返回 sanitized 后、运行时真正生效的值） */

@@ -2574,13 +2574,11 @@ impl BufferedStreamContext {
         self.inner.cache_usage = cache_usage;
     }
 
-    /// 设置缩放倍率。`cache` 同时作用于 creation 与 read（引擎 A 语义）。
-    /// go 引擎需要两者取不同值时用 [`Self::set_inflation_multipliers_split`]。
-    pub fn set_inflation_multipliers(&mut self, input: f64, output: f64, cache: f64) {
-        self.set_inflation_multipliers_split(input, output, cache, cache);
-    }
-
-    /// 分别设置 creation / read 倍率。go 引擎传 `cache_creation = 1.0`（不缩放）。
+    /// 设置 creation / read 各自的倍率。
+    ///
+    /// 四个倍率一律显式传：引擎 A 的 creation 与 read 现在也是两个独立配置项，
+    /// 曾有一个「`cache` 同时作用于两者」的便捷重载，但四引擎全部改用分列倍率后
+    /// 它无调用方 —— 留着只会让人以为「两者相等」是某个引擎的语义。
     pub fn set_inflation_multipliers_split(
         &mut self,
         input: f64,

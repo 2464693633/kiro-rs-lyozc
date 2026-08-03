@@ -401,7 +401,7 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
  *
  * 省略即 `rust`，与后端 `#[serde(default)]` 对齐。
  */
-export type CacheEngineKind = 'rust' | 'go'
+export type CacheEngineKind = 'rust' | 'go' | 'real' | 'nocache'
 
 export interface ClientKeyItem {
   id: number
@@ -528,28 +528,33 @@ export interface BillingConfig {
   upstreamMultipliers: Record<string, number>
   rustMultiplier: number
   goMultiplier: number
+  realMultiplier: number
+  nocacheMultiplier: number
+}
+
+export interface EngineBillingRow {
+  engine: string
+  upstreamCost: number
+  clientCost: number
+  upstreamTokens: number
+  clientTokens: number
+  calls: number
 }
 
 export interface BillingUsagePoint {
   ts: string
   upstreamCost: number
-  rustCost: number
-  goCost: number
-  upstreamTokens: number
-  rustTokens: number
-  goTokens: number
+  clientCost: number
   calls: number
+  engines: EngineBillingRow[]
 }
 
 export interface BillingComparisonResponse {
   points: BillingUsagePoint[]
   upstreamCost: number
-  rustCost: number
-  goCost: number
-  upstreamTokens: number
-  rustTokens: number
-  goTokens: number
+  clientCost: number
   calls: number
+  engines: EngineBillingRow[]
 }
 
 // ============ 请求链路追踪 ============

@@ -25,9 +25,9 @@ use parking_lot::Mutex;
 
 /// 将 Kiro 协议请求体转换为 Anthropic Messages API 格式。
 ///
-/// 仅提取核心字段（model / messages / max_tokens），用于上游直通凭据在无
+/// 仅提取核心字段（model / messages / max_tokens / stream），用于上游直通凭据在无
 /// anthropic_body 时的降级转换（如 admin 模型测试）。
-fn convert_kiro_to_anthropic_body(kiro_body: &str) -> anyhow::Result<String> {
+fn convert_kiro_to_anthropic_body(kiro_body: &str, is_stream: bool) -> anyhow::Result<String> {
     let v: Value = serde_json::from_str(kiro_body)
         .map_err(|e| anyhow!("kiro_body 解析失败: {}", e))?;
 
@@ -35,15 +35,22 @@ fn convert_kiro_to_anthropic_body(kiro_body: &str) -> anyhow::Result<String> {
         .as_str()
         .ok_or_else(|| anyhow!("kiro_body 缺少 modelId"))?;
 
-    let content = v["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-        .as_str()
-        .unwrap_or("test");
+    // content 可能是字符串（纯文本）或数组（多模态），两种情况都要正确保留。
+    // 以前用 .as_str().unwrap_or("test")，当 content 为数组时 as_str() 返回 None，
+    // 导致多模态内容被静默替换为字面量 "test"。
+    let raw_content = &v["conversationState"]["currentMessage"]["userInputMessage"]["content"];
+    let content: Value = if raw_content.is_string() || raw_content.is_array() {
+        raw_content.clone()
+    } else {
+        // 解析到 Null / Object 等意外类型：降级为空字符串，至少不发送错误内容
+        Value::String(String::new())
+    };
 
     let anthropic_req = json!({
         "model": model_id,
         "messages": [{"role": "user", "content": content}],
         "max_tokens": 1024,
-        "stream": false,
+        "stream": is_stream,
     });
 
     serde_json::to_string(&anthropic_req)
@@ -622,14 +629,25 @@ impl KiroProvider {
 
             // ===== 上游凭据直通路径 =====
             if ctx.credentials.is_upstream_credential() {
-                let base_url = ctx.credentials.upstream_base_url.as_deref().unwrap();
+                let base_url = match ctx.credentials.upstream_base_url.as_deref() {
+                    Some(u) => u,
+                    None => {
+                        tracing::error!(
+                            "上游凭据 #{} is_upstream_credential()=true 但 upstream_base_url 为空，跳过",
+                            ctx.id
+                        );
+                        self.token_manager.report_failure(ctx.id);
+                        last_error = Some(anyhow::anyhow!("凭据 #{} 缺少 upstream_base_url", ctx.id));
+                        continue;
+                    }
+                };
                 let upstream_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
                 let body = match anthropic_body {
                     Some(b) => b.to_string(),
                     None => {
                         // 没有 anthropic_body 时尝试从 kiro_body 转换（admin测试等场景）
-                        match convert_kiro_to_anthropic_body(request_body) {
+                        match convert_kiro_to_anthropic_body(request_body, is_stream) {
                             Ok(converted) => converted,
                             Err(e) => {
                                 tracing::warn!(
@@ -697,6 +715,11 @@ impl KiroProvider {
                     });
                 }
 
+                // 必须在 response.text()（消耗 response）之前提取 Retry-After，
+                // 否则 headers 随 response 一起消耗，只能拿到空 HeaderMap。
+                let rate_limit_429 = (status.as_u16() == 429)
+                    .then(|| UpstreamRateLimitError::from_headers(response.headers()));
+
                 let body_text = response.text().await.unwrap_or_default();
 
                 if matches!(status.as_u16(), 401 | 403) {
@@ -713,10 +736,8 @@ impl KiroProvider {
                 }
 
                 if status.as_u16() == 429 {
-                    let rate_limit_error = UpstreamRateLimitError::from_headers(
-                        // 需要先获取 headers 再读 body，这里 body 已读
-                        &reqwest::header::HeaderMap::new(),
-                    );
+                    let rate_limit_error = rate_limit_429
+                        .unwrap_or_else(|| UpstreamRateLimitError::new(None));
                     Self::emit_attempt(
                         sink, attempt, ctx.id, "upstream", Some(429),
                         outcome::TRANSIENT, Some(&body_text), attempt_start,
@@ -1262,5 +1283,184 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
+    }
+}
+
+/// 上游凭据直通路径的实测：起一个 mock 上游，断言线上真正发出的字节与请求头。
+///
+/// 这些测试存在的理由是一次真实故障：直通路径曾转发
+/// `serde_json::to_string(&payload)` 的产物而非客户端原文，把 serde 默认值实体化进
+/// body（`thinking.budget_tokens` 被补成 20000），上游以
+/// `thinking.budget_tokens is not supported when thinking.type is disabled` 拒收。
+/// 光靠读代码看不出这种偏差 —— 必须把字节收下来比对。
+#[cfg(test)]
+mod upstream_passthrough_tests {
+    use super::*;
+    use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint};
+    use crate::model::config::Config;
+
+    /// 起一个只服务一次请求的 mock 上游，返回 `(base_url, 收到的原始请求)`。
+    async fn spawn_mock_upstream() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+
+            // 先读到 header 结束，再按 content-length 精确读完 body ——
+            // 不能读到 EOF：reqwest 保持连接打开，读到 EOF 会挂死。
+            let body_start = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(p + 4);
+                }
+            };
+
+            if let Some(body_start) = body_start {
+                let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim().eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while buf.len() < body_start + content_len {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+
+            let body = serde_json::json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude-sonnet-4.6",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 2}
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+
+            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
+        });
+
+        (format!("http://{}", addr), rx)
+    }
+
+    fn provider_with_upstream(base_url: String) -> KiroProvider {
+        let mut cred = KiroCredentials::default();
+        cred.upstream_base_url = Some(base_url);
+        cred.upstream_api_key = Some("sk-upstream-test".to_string());
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
+
+        KiroProvider::with_proxy(
+            Arc::new(manager),
+            None,
+            endpoints,
+            Config::default().default_endpoint,
+        )
+    }
+
+    /// 客户端原文逐字节到达上游：`thinking:{type:disabled}` 不得被补上
+    /// `budget_tokens`，也不得多出一串显式 `null`。
+    #[tokio::test]
+    async fn forwards_client_bytes_verbatim() {
+        let (base_url, rx) = spawn_mock_upstream().await;
+        let provider = provider_with_upstream(base_url);
+
+        // 客户端原文：thinking 只给 type，不给 budget_tokens。
+        let client_body = r#"{"model":"claude-sonnet-4.6","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
+
+        let result = provider
+            .call_api_dual("{}", Some(client_body), Some("test-beta-flag"), None, None)
+            .await
+            .expect("上游直通应成功");
+        assert!(result.is_upstream, "应走上游直通路径");
+
+        let received = rx.await.expect("mock 上游应收到请求");
+        let (head, body) = received.split_once("\r\n\r\n").expect("应有完整 header");
+
+        assert_eq!(body, client_body, "转发的 body 必须与客户端原文逐字节相同");
+        assert!(
+            !body.contains("budget_tokens"),
+            "disabled 时不得注入 budget_tokens，实际 body: {body}"
+        );
+        assert!(
+            !body.contains("null"),
+            "不得把缺省字段写成显式 null，实际 body: {body}"
+        );
+
+        let head_lower = head.to_lowercase();
+        assert!(head_lower.contains("post /v1/messages"), "应 POST /v1/messages，实际: {head}");
+        assert!(
+            head_lower.contains("x-api-key: sk-upstream-test"),
+            "x-api-key 应换成上游凭据的 key，实际: {head}"
+        );
+        assert!(
+            head_lower.contains("anthropic-version: 2023-06-01"),
+            "应带 anthropic-version，实际: {head}"
+        );
+        assert!(
+            head_lower.contains("anthropic-beta: test-beta-flag"),
+            "anthropic-beta 应透传，实际: {head}"
+        );
+    }
+
+    /// 缺 `max_tokens` 时补上该字段（API 必填），且**只**补这一个。
+    #[tokio::test]
+    async fn injects_only_max_tokens_when_client_omits_it() {
+        let (base_url, rx) = spawn_mock_upstream().await;
+        let provider = provider_with_upstream(base_url);
+
+        // handler 的 ensure_max_tokens 已补过 max_tokens，这里模拟它的产物。
+        let body_with_injected = r#"{"max_tokens":32000,"messages":[{"role":"user","content":"hi"}],"model":"claude-sonnet-4.6","thinking":{"type":"disabled"}}"#;
+
+        provider
+            .call_api_dual("{}", Some(body_with_injected), None, None, None)
+            .await
+            .expect("上游直通应成功");
+
+        let received = rx.await.expect("mock 上游应收到请求");
+        let (_, body) = received.split_once("\r\n\r\n").unwrap();
+        let parsed: Value = serde_json::from_str(body).expect("body 应是合法 JSON");
+
+        assert_eq!(parsed["max_tokens"], 32000, "max_tokens 应存在");
+        assert!(
+            parsed["thinking"].get("budget_tokens").is_none(),
+            "仍不得注入 budget_tokens，实际: {body}"
+        );
+        assert!(
+            parsed.get("system").is_none() && parsed.get("tools").is_none(),
+            "不得实体化其余缺省字段，实际: {body}"
+        );
     }
 }

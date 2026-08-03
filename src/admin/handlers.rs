@@ -631,6 +631,16 @@ pub async fn get_cache_engines_config(State(state): State<AdminState>) -> impl I
     Json(super::types::CacheEnginesConfigPayload {
         rust: config.cache_engine_rust.sanitized(),
         go: config.cache_engine_go.sanitized(),
+        real: Some(config.cache_engine_real.sanitized()),
+        nocache: Some(config.cache_engine_nocache.sanitized()),
+        // 引擎 A 的倍率来自全局配置，与 B / C / D 各自那套并列展示在同一个弹窗里。
+        // 这里读的是磁盘快照（与上面四套同源），而非 TokenManager 的原子量 ——
+        // 两者在正常路径下一致，但磁盘值才是"重启后仍生效"的那份。
+        global: Some(super::types::GlobalInflationPayload {
+            input_multiplier: config.input_inflation_multiplier,
+            output_multiplier: config.output_inflation_multiplier,
+            cache_multiplier: config.cache_inflation_multiplier,
+        }),
     })
 }
 
@@ -645,11 +655,74 @@ pub async fn set_cache_engines_config(
 
     let rust_cfg = payload.rust.sanitized();
     let go_cfg = payload.go.sanitized();
+    // C / D 缺省时沿用磁盘现值，不回落默认 —— 老前端不带这两段时不该清掉已配倍率。
+    let disk = state
+        .service
+        .token_manager()
+        .config()
+        .config_path()
+        .and_then(|path| crate::model::config::Config::load(path).ok());
+    // 缺省回落顺序：磁盘现值 → 运行时现值 → 默认。
+    //
+    // 不能直接 `unwrap_or_default()`：磁盘读失败（文件被占用 / 路径未知）时那会把
+    // C 的倍率静默重置成 1.0，且紧接着的 apply_real_config 会把这个"重置"真正生效。
+    // 运行时值取自与请求路径共享的那个 Arc，即当前真正在用的倍率，比默认值更接近真相。
+    let real_cfg = payload
+        .real
+        .or_else(|| disk.as_ref().map(|c| c.cache_engine_real))
+        .or_else(|| {
+            state.stateless_multipliers.as_ref().map(|s| {
+                let (input, output, cache_read, cache_creation) = s.real();
+                crate::model::config::CacheEngineRealConfig {
+                    input_multiplier: input,
+                    output_multiplier: output,
+                    cache_read_multiplier: cache_read,
+                    cache_creation_multiplier: cache_creation,
+                }
+            })
+        })
+        .unwrap_or_default()
+        .sanitized();
+    let nocache_cfg = payload
+        .nocache
+        .or_else(|| disk.as_ref().map(|c| c.cache_engine_nocache))
+        .or_else(|| {
+            state.stateless_multipliers.as_ref().map(|s| {
+                let (input, output) = s.nocache();
+                crate::model::config::CacheEngineNoCacheConfig {
+                    input_multiplier: input,
+                    output_multiplier: output,
+                }
+            })
+        })
+        .unwrap_or_default()
+        .sanitized();
+
+    // 全局倍率先校验再落盘：`set_token_inflation_config` 限定 [1.0, 100.0]，
+    // 若等到四段引擎配置已写入磁盘后才失败，就会留下"引擎参数已改、倍率未改"的
+    // 半应用状态 —— 而前端拿到的是 500，运维无从知道哪一半生效了。
+    if let Some(g) = payload.global {
+        for (name, val) in [
+            ("input", g.input_multiplier),
+            ("output", g.output_multiplier),
+            ("cache", g.cache_multiplier),
+        ] {
+            if !val.is_finite() || val < 1.0 || val > 100.0 {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(super::types::AdminErrorResponse::invalid_request(format!(
+                        "{name} 膨胀倍率必须在 1.0..=100.0 范围内: {val}"
+                    ))),
+                )
+                    .into_response();
+            }
+        }
+    }
 
     if let Err(e) = state
         .service
         .token_manager()
-        .persist_cache_engines_config(rust_cfg, go_cfg)
+        .persist_cache_engines_config(rust_cfg, go_cfg, real_cfg, nocache_cfg)
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -660,16 +733,52 @@ pub async fn set_cache_engines_config(
             .into_response();
     }
 
+    // 全局倍率：引擎 A 用它，故同一个弹窗要能改。走 TokenManager 既有入口
+    // （它自己校验 + 落盘 + 原子量生效 + 失败回滚），不在这里另写一套。
+    //
+    // 它内部会重新 load 配置文件，读到的正是上面刚写好的四段引擎参数，故两次写
+    // 不会互相覆盖。范围校验已在函数开头做过，此处失败只可能是磁盘问题。
+    if let Some(g) = payload.global {
+        if let Err(e) = state.service.token_manager().set_token_inflation_config(
+            g.input_multiplier,
+            g.output_multiplier,
+            g.cache_multiplier,
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(super::types::AdminErrorResponse::internal_error(format!(
+                    "四段引擎参数已写入，但全局倍率写入失败: {e}"
+                ))),
+            )
+                .into_response();
+        }
+    }
+
+    // 热更新：四套引擎全部无需重启。C / D 是对共享 Arc 里的原子量做 store ——
+    // 该 Arc 与请求路径同一份分配（见 AdminState::with_cache_engines 文档），
+    // 否则这里改完、请求路径永远读默认值。
     if let Some(meter) = &state.cache_meter {
         meter.apply_config(rust_cfg);
     }
     if let Some(tracker) = &state.go_cache_tracker {
         tracker.apply_config(go_cfg);
     }
+    if let Some(stateless) = &state.stateless_multipliers {
+        stateless.apply_real_config(real_cfg);
+        stateless.apply_nocache_config(nocache_cfg);
+    }
 
+    // 回显生效值（已 sanitize），使前端能显示"哪些非法值被夹取了"。
     Json(super::types::CacheEnginesConfigPayload {
         rust: rust_cfg,
         go: go_cfg,
+        real: Some(real_cfg),
+        nocache: Some(nocache_cfg),
+        global: Some(super::types::GlobalInflationPayload {
+            input_multiplier: state.service.token_manager().get_input_inflation_multiplier(),
+            output_multiplier: state.service.token_manager().get_output_inflation_multiplier(),
+            cache_multiplier: state.service.token_manager().get_cache_inflation_multiplier(),
+        }),
     })
     .into_response()
 }
@@ -1575,6 +1684,9 @@ pub async fn list_traces(
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
+            // v1 老行的 engine / client_usage 为空，靠 rust_usage / go_usage 哪个非空
+            // 隐式表达引擎。不折叠的话，升级前落库的 trace 在前端会显示"无计费数据"。
+            let r = r.normalized();
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
             let final_is_upstream = upstream_map
                 .get(&r.final_credential_id)
@@ -1623,9 +1735,12 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
+                // 逐引擎配对：engine 标明这一次用了哪个引擎，upstreamUsage 与
+                // clientUsage 是同一次请求的两个口径，故可直接相除得加价倍数。
+                // v1 的 rustUsage / goUsage 已由 normalized() 折叠进这三个字段。
+                "engine": r.engine,
                 "upstreamUsage": r.upstream_usage,
-                "rustUsage": r.rust_usage,
-                "goUsage": r.go_usage,
+                "clientUsage": r.client_usage,
                 "attempts": attempts,
             })
         })

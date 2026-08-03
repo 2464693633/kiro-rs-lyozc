@@ -277,6 +277,16 @@ async fn main() {
     go_cache_tracker.load();
     go_cache_tracker.clone().spawn_background();
 
+    // 引擎 C / D 的倍率存储。无缓存状态、无持久化文件 —— 倍率本身存在 config.json，
+    // 这里只是它的运行期原子副本。
+    //
+    // **必须建一份、两边共享**：Admin 热更新是对这个 Arc 内的原子量做 store。若
+    // 请求路径与 Admin 路径各持一份，改配置会静默不生效（无报错、看着成功）。
+    let stateless_multipliers =
+        std::sync::Arc::new(anthropic::cache_engine::StatelessMultipliers::default());
+    stateless_multipliers.apply_real_config(config.cache_engine_real);
+    stateless_multipliers.apply_nocache_config(config.cache_engine_nocache);
+
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
         config.extract_thinking,
@@ -286,6 +296,7 @@ async fn main() {
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
         Some(go_cache_tracker.clone()),
+        Some(stateless_multipliers.clone()),
         trace_store.clone(),
     );
 
@@ -320,6 +331,7 @@ async fn main() {
             .with_cache_engines(
                 Some(cache_meter.clone()),
                 Some(go_cache_tracker.clone()),
+                Some(stateless_multipliers.clone()),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
