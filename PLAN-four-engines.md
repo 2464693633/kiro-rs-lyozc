@@ -213,8 +213,12 @@ pub struct CacheEngineNoCacheConfig {   // D：2 倍率（cache 恒 0，无需�
 
 ## 八、需要你知道的两点
 
-**① 前端需 npm 构建。** `admin-ui/dist/` 提交进仓库并由 `rust-embed` 嵌入，改 TSX 后
-必须构建否则运行时仍是旧界面。若环境无依赖需先 `npm install`。
+**① 前端需 npm 构建。** `admin-ui/dist/` 由 `rust-embed` 嵌入二进制，改 TSX 后必须构建
+否则运行时仍是旧界面。若环境无依赖需先 `npm install`。
+
+> 更正（2026-08-04）：`dist/` **不在**仓库里（`.gitignore` 第 9 行忽略）。Docker 构建在
+> `frontend-builder` 阶段自己跑 `bun run build` 再拷进来，所以服务器部署不需要本地产物；
+> 但本机 `cargo build` 需要 `dist/` 已存在，否则 `rust-embed` 在编译期就找不到目录。
 
 **② 计费对比仅统计上游凭据请求。** 沿用现状（Kiro 凭据无上游美元成本，无对比意义）。
 故走 Kiro 凭据的 Key 在每引擎配对表里不出现——与当前行为一致。

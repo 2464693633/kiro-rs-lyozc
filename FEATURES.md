@@ -50,7 +50,8 @@
 
 **核心原则**：
 
-- 发给上游的请求体**完整原样转发**，不做格式转换
+- 发给上游的请求体是**客户端原始字节**，逐字节不变；唯一例外是客户端漏发 `max_tokens`
+  时补上该字段（Anthropic 必填）。见 [上游 API 凭据直通](#功能二上游-api-凭据直通)
 - 返回给客户端的 `usage` 由**该 Key 选中的引擎**决定口径，四种口径互不相同
 - 口径分歧全部收敛在 `UsageMode::resolve_tokens` 一处 —— 客户端所见与计费记录共用它，
   避免两处各写一遍而逐渐漂移
@@ -153,7 +154,9 @@ A 的四个倍率**未设置时逐项回退全局膨胀倍率**：
 > 同理，`sanitized()` 遇到非法值（NaN / ≤0）回落 `None` 而非 1.0 —— 误配应退回"继承全局"，
 > 不该静默改成"不缩放"。
 
-回退在 `CacheMeter::multipliers()` 内完成，底层用 `-1` 毫倍率作哨兵表示未设置。
+回退在 `CacheMeter::multipliers()` 内完成。底层把 f64 以 `to_bits()` 存进 `AtomicI64`，
+用 `-1` 作「未设置」哨兵 —— `-1 as u64` 是负 NaN 位型，而合法倍率恒为有限正数，故永远撞不上
+哨兵。**不用千分比整数**：那会把 <0.0005 的正倍率量化成 0。见 [UPDATES.md](UPDATES.md)。
 
 #### 持久化
 
@@ -348,8 +351,8 @@ call_api_with_retry_for_credential()
   ├── is_upstream_credential() == true
   │     │
   │     ├── 目标 URL：{upstream_base_url}/v1/messages
-  │     ├── 请求体：anthropic_body_raw（未经 Kiro 格式转换的原始 JSON）
-  │     │           若无 anthropic_body_raw 则由 kiro_body 降级转换
+  │     ├── 请求体：anthropic_body_raw（客户端原始字节，来自 RawBody 扩展）
+  │     │           缺 max_tokens 时补该字段；无 RawBody 时由 kiro_body 降级转换
   │     ├── 请求头：
   │     │     x-api-key: {upstream_token}
   │     │     anthropic-version: 2023-06-01
@@ -363,7 +366,23 @@ call_api_with_retry_for_credential()
 
 ### 请求与响应处理
 
-**请求**：完整原样转发 Anthropic 格式请求体，不做任何字段修改。
+**请求**：转发**客户端原始字节**，唯一可能的改动是缺 `max_tokens` 时补该字段。
+
+原文由 `/v1/messages` 与 `/cc/v1/messages` 上的 `capture_raw_body` 中间件缓冲进
+`RawBody` 扩展，handler 从扩展里取，不再由 `MessagesRequest` 往返序列化得出。
+
+> **为什么不能往返序列化**：`MessagesRequest` 多个字段挂了 `#[serde(default = "…")]`，
+> 反序列化后"客户端没发"与"发了默认值"不可区分，再序列化就会把默认值**实体化**写进原文。
+> `thinking.budget_tokens` 被补成 20000 正是这样产生的 —— 客户端只发了
+> `"thinking": {"type": "disabled"}`，上游收到的却带 `budget_tokens`，于是回
+> `thinking.budget_tokens is not supported when thinking.type is disabled`。
+> 同理 `system` / `tools` 等会被写成显式 `null`。
+
+`ensure_max_tokens` 只补 `max_tokens` 这一个字段：它是 Anthropic Messages API 的必填项，
+而 `MessagesRequest` 给它挂了 `default = 32000`，客户端不发时本地解析能过、上游会以
+`max_tokens: field required` 拒掉。原文已带该键时**逐字节原样返回**（绝大多数请求走这条），
+只有需要注入时才重新序列化 —— 此时键序会被 `serde_json` 的 `BTreeMap` 重排，JSON 对象键序
+无语义，可接受。
 
 **非流式响应**（`upstream.rs::handle_upstream_non_stream_response`）：
 
@@ -658,13 +677,16 @@ PUT  /api/admin/client-keys/{id}     可修改
 | `src/anthropic/upstream.rs` | 上游直通处理器（非流式 + 流式 + SSE 改写 + 引擎 D 的输出累积器） |
 | `admin-ui/src/components/cache-engine-dialog.tsx` | 四引擎参数弹窗（4×4 倍率矩阵） |
 | `admin-ui/src/components/ui/table.tsx` | 表格基础组件 |
+| `UPDATES.md` | 逐次更新记录（本文档只写终态，过程记在那里） |
 
 ### 修改文件
 
 | 文件 | 主要变更 |
 |---|---|
-| `src/anthropic/cache_metering.rs` | `CacheMeterStats`、原子参数热重载、`spawn_background()`、引擎 A 的四个 `Option` 倍率（哨兵 `-1`） |
-| `src/anthropic/handlers.rs` | 四引擎路由、`UsageMode` 贯穿、`ClientTokens` / `BillingSnapshot`、上游凭据路径 |
+| `src/anthropic/cache_metering.rs` | `CacheMeterStats`、原子参数热重载、`spawn_background()`、引擎 A 的四个 `Option` 倍率（f64 位型 + `-1` 哨兵） |
+| `src/anthropic/handlers.rs` | 四引擎路由、`UsageMode` 贯穿、`ClientTokens` / `BillingSnapshot`、上游凭据路径、`ensure_max_tokens` |
+| `src/anthropic/middleware.rs` | `RawBody` 扩展 + `capture_raw_body` 中间件（上游直通的原文来源） |
+| `src/anthropic/router.rs` | `MAX_BODY_SIZE` 提为 `pub(crate)`；两条 `/messages` 各挂 `capture_raw_body` |
 | `src/admin/usage_stats.rs` | `UsageRecord` 的 `engine` + `client_usage` 配对字段、`normalized()`、稀疏 `by_engine_billing` 表、`query_billing` 逐引擎重写 |
 | `src/admin/trace_db.rs` | `engine` / `client_usage` 两列 + 迁移、`TraceRecord::normalized()` |
 | `src/model/config.rs` | 四套引擎配置结构、`BillingConfig` 的四个引擎系数 |
@@ -708,6 +730,30 @@ PUT  /api/admin/client-keys/{id}     可修改
 - **修复**：引擎 D 在该对象缺失时创建它。其余引擎保持原行为（不凭空造字段）
 - **回归测试**：`nocache_writes_local_output_even_when_upstream_omits_it`
 
+**P9 — 直通路径把 serde 缺省值实体化，上游报 400**
+
+- **现象**：`thinking.budget_tokens is not supported when thinking.type is disabled`
+- **原因**：直通体取自 `serde_json::to_string(&payload)`，即**重新序列化解析后的结构体**。`Thinking.budget_tokens` 是裸 `i32` 挂 `default = 20000`，反序列化后「客户端没发」与「客户端发了 20000」不可区分，重新序列化必然写出这个键。客户端发 `{"type":"disabled"}`，上游收到 `{"type":"disabled","budget_tokens":20000}` —— 两个字段互斥，400
+- **修复**：新增 `capture_raw_body` 中间件把请求体原文存进 `RawBody` 扩展，直通路径转发原始字节。只挂在 `/v1/messages` 与 `/cc/v1/messages` 上（唯一会命中直通的两条路径），且挂在 auth **内层** —— 未通过鉴权的请求不会被缓冲进内存
+- **回归测试**：`roundtrip_materializes_serde_defaults`（钉住往返**确实会**注入，说明 `RawBody` 为何必须存在）、`forwards_client_bytes_verbatim`（真 `TcpListener` mock 上游，逐字节比对）
+
+**P10 — 改用原文转发后 `max_tokens` 丢失**
+
+- **问题**：P9 的修复顺带去掉了往返序列化的一个副作用 —— 它会把 `MessagesRequest` 的 `default = 32000` 一并写出。而 `max_tokens` 是 Anthropic Messages API 的**必填项**，客户端不发时上游直接以 `field required` 拒掉
+- **修复**：`ensure_max_tokens` 只在原文缺该键时补这一个字段。已带则**原样返回、逐字节不变**（绝大多数请求走这条）
+- **回归测试**：`ensure_max_tokens_leaves_body_untouched_when_present`、`ensure_max_tokens_injects_only_that_field_when_missing`、`ensure_max_tokens_passes_through_non_object_bodies`、`injects_only_max_tokens_when_client_omits_it`
+
+**P11 — 极小正倍率被存储格式压成 0**
+
+- **问题**：四引擎的倍率都以千分比整数存 `AtomicI64`（`(v * 1000.0).round()`），任何 `< 0.0005` 的正倍率被 round 成 **0** —— 客户端 usage 全归零。配置校验放行（`sanitize_multiplier` 只要求 `is_finite() && > 0.0`，无下限），admin 回读也显示 `0.0004`，但请求路径乘的是 0。无报错、无日志
+- **修复**：四引擎（A/B/C/D）统一改 `f64::to_bits()` 存位型，原值往返。引擎 A 的 `-1` 哨兵保留 —— `-1 as u64` 是负 NaN 位型，而合法倍率必须 `is_finite() && > 0.0`，永远撞不上
+- **回归测试**：`tiny_multipliers_survive_storage_roundtrip`（引擎 A）、`tiny_multipliers_survive_storage_on_all_engines`（B/C/D）。两条都用**精确相等**而非 `assert_ne!(_, 0.0)` —— 只钉「非 0」的话，把千分比换成百万分比一样能过
+
+**P12 — 三处 `drop(inner)` 是空操作，锁没提前释放**
+
+- **问题**：`cache_metering_go.rs` 的 `compute_for_account` 里三处 `drop(inner)`，而 `inner` 是 `&mut TrackerInner`（从 guard 借出）。drop 一个引用什么都不做，锁一直持到函数返回。编译器报 `argument has type &mut TrackerInner`
+- **修复**：改 `drop(all)`（guard 本体）。NLL 下合法 —— 那些位置之后 `inner` 不再被用，借用已结束。原本想要的提前解锁现在真的生效
+
 ---
 
 ### 🟡 中严重度
@@ -741,9 +787,11 @@ PUT  /api/admin/client-keys/{id}     可修改
 
 **引擎 D 的 input 完全不读上游**，取 `token::count_all_tokens` 的本地结果。若上游本身是另一个 kiro-rs 反代，它报的 usage 已被加工过一轮 —— 引擎 D 的口径与那层加工无关。
 
-**逐引擎倍率不与全局倍率相乘**。每个引擎各用自己一套，引擎 A 的未设置项回退全局。不存在双重膨胀。
+**逐引擎倍率不与全局倍率相乘**。每个引擎各用自己一套，引擎 A 的未设置项回退全局。token 口径上不存在双重膨胀。
 
-**`admin-ui/dist/` 是提交进仓库并由 `rust-embed` 嵌入二进制的**。改前端后必须跑 `npm run build`，否则运行时仍是旧界面。
+**但计费对比视图里确实是两层相乘**，且是有意的：`client_usage` 记录时已乘过 token 倍率，成本视图再乘一次 `billing.rustMultiplier` 这类引擎系数。配 token 2× + 计费系数 1.5× 得到账面 3×。两者是不同旋钮 —— 前者改客户端看到的数字，后者只改对比视图的成本口径。由 `engine_multiplier_scales_cost_only_and_stacks_on_token_multiplier` 钉住。
+
+**`admin-ui/dist/` 不在仓库里**（`.gitignore` 第 9 行），但 `rust-embed` 的 `#[folder = "admin-ui/dist"]` 指向它 —— 所以本地 `cargo build` 前必须先跑前端构建，否则嵌入的是空目录或直接编译失败。Docker 路径无需手动处理：`Dockerfile` 的 `frontend-builder` 阶段跑 `bun run build`，再 `COPY --from` 进 Rust 构建阶段。
 
 ---
 
@@ -753,7 +801,7 @@ PUT  /api/admin/client-keys/{id}     可修改
                  ┌────────────────────────────────────────────────────────────┐
                  │                  kiro-rs-lyozc 请求处理                     │
                  │                                                            │
-请求 ──► handlers │ 1. 解析请求，保存 anthropic_body_raw                        │
+请求 ──► handlers │ 1. capture_raw_body → RawBody → anthropic_body_raw         │
          .rs      │ 2. token::count_all_tokens → total_input_tokens（本地口径） │
                  │ 3. cache_engines.begin(kind, global)                       │
                  │      → (CacheUsage, UsageMultipliers, PendingCache,        │
