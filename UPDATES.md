@@ -9,6 +9,77 @@
 
 ---
 
+## 2026-08-04 — Kiro 路径历史 `tool_result` 去重
+
+主题：**修一条会让上游拒掉整个请求、且不可重试的失败** ——
+`each tool_use must have a single result`（`TOOL_USE_RESULT_MISMATCH`）。
+
+`cargo test` 705 passed / 0 failed；`cargo check --all-targets` 零 warning。
+
+### 🔴 修复 — 历史里的重复 `tool_result` 直达上游
+
+**现象**：长会话（`messages.24.content.1`）经 **Kiro 凭据**转换后被上游拒：
+
+```json
+{"message":"messages.24.content.1: each tool_use must have a single result","reason":"TOOL_USE_RESULT_MISMATCH"}
+```
+
+这条 reason 在 [`CLIENT_VALIDATION_REASONS`](src/kiro/endpoint/mod.rs#L174) 里，命中即
+**立即终止、不重试** —— 判定"根因在请求体，重试无意义"。所以它不是偶发抖动，同一个会话
+每一轮都会失败。
+
+**成因**：`convert_request` 的步骤顺序留了个缺口。
+
+- [converter.rs:717](src/anthropic/converter.rs#L717) `build_history` 先把历史组装完。
+  历史里的 `tool_result` 来自 [`merge_user_messages`](src/anthropic/converter.rs#L1704) 的
+  `all_tool_results.extend(...)` —— **无条件累加**
+- [converter.rs:736](src/anthropic/converter.rs#L736) `validate_tool_pairing` 只校验
+  **当前消息**那一份（传进去的是 `last_message` 解析出来的 `&tool_results`）
+- 历史里的 result 从组装到发出，**中间没有任何一处去重**
+
+于是重复落在最后一条消息 → 被兜住；落在**历史**里 → 原样发给上游。`messages.24` 是
+25 条消息的会话，那个下标必然在历史里。
+
+两种重复来源都会命中：
+
+1. **单条消息内** —— 客户端在一个 content 数组里放两个同 id 的 `tool_result` 块。
+   [`process_message_content_dedup`](src/anthropic/converter.rs#L848) 的 `tool_result`
+   分支是无条件 `push` 的（那个函数的 `dedup` 参数只管**图片 SHA256**，与 tool_result 无关）
+2. **跨消息** —— 两条连续 user 消息各带一个同 id 的 result，被 `merge_user_messages`
+   合并进同一条历史消息
+
+常见触发路径是上一轮响应在 `tool_use` 中途被截断（超时 / 断线 / 客户端重连），
+客户端重发时带上了重复的结果块。
+
+**修复**：新增
+[`dedup_history_tool_results`](src/anthropic/converter.rs#L1071)，在 `build_history`
+之后、`validate_tool_pairing` 之前跨**整条历史**按 `tool_use_id` 去重。
+
+- **跨整条历史**而非逐条消息内：同 id 可能分散在不同 user 消息里，只在消息内去重挡不住
+- **保留首次出现**：后来的重复来自重发，第一个才是与当时那次 `tool_use` 真正配对的结果
+- **收敛在一处**而不是在 `process_message_content_dedup` 和 `merge_user_messages` 各修一遍：
+  「一个 `tool_use_id` 在发给上游的报文里只能出现一次」是个报文级不变量，分散去重的话，
+  将来任何新增的历史组装路径都得记得再去重一次
+- 日志用 `debug` 而非 `warn`：一次重发会让**后续每一轮**都命中同一批重复，warn 会持续
+  刷屏；而这里是成功兜住了，不是需要运维介入的异常
+
+**测试**：
+
+| 测试 | 钉住什么 |
+|---|---|
+| `history_duplicate_tool_result_is_deduped_before_upstream` | 端到端走 `convert_request`，统计 **current + history 合计**每个 id 出现几次（上游校验的就是这个口径），并断言留下的是 `"first"` |
+| `cross_message_duplicate_tool_result_is_deduped_before_upstream` | 同 id 分散在两条历史 user 消息的形状 |
+
+两条测试都刻意**多追加两轮对话**把带重复的 user 消息推进 history —— 删掉这两轮，
+`validate_tool_pairing` 就会兜住，测试随之失效。这一点写进测试注释了。
+
+> 排查过程中一个作废的猜测记在这，省下次的时间：`process_message_content` 旁边有个
+> `process_message_content_dedup`，看着像"有个去重版没被主路径调用"。实际
+> [converter.rs:813](src/anthropic/converter.rs#L813) 显示前者就是
+> `process_message_content_dedup(content, None)`，`dedup` 参数只做图片去重，与本 bug 无关。
+
+---
+
 ## 2026-08-04 — `426d788`
 
 主题：**上游直通改为转发客户端原始字节**（修一个会让上游 400 的真实故障），

@@ -722,6 +722,14 @@ pub fn convert_request_with_mode(
         tool_compatibility_mode,
     )?;
 
+    // 7.5. 历史内按 tool_use_id 去重 tool_result（同 id 只保留首次出现）
+    //
+    // 必须在 build_history 之后、且独立于下一步：validate_tool_pairing 只校验当前消息
+    // 那一份 tool_results，历史里的 result 由 merge_user_messages 无条件累加，此前无人
+    // 去重 —— 同 id 出现两次会让上游以 TOOL_USE_RESULT_MISMATCH 拒掉整个请求，且该
+    // reason 被判为不可重试。见 `dedup_history_tool_results`。
+    dedup_history_tool_results(&mut history);
+
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
@@ -1034,6 +1042,61 @@ fn validate_tool_pairing(
     }
 
     (filtered_results, unpaired_tool_use_ids)
+}
+
+/// 跨整条历史按 `tool_use_id` 去重 `tool_result`，只保留首次出现的那一个。
+///
+/// **为什么必须单独做这一步**：[`validate_tool_pairing`] 只校验**当前消息**那一份
+/// tool_results（`convert_request` 传给它的是 `last_message` 解析出来的），而历史里的
+/// tool_results 由 [`merge_user_messages`] 的 `all_tool_results.extend(...)` 无条件累加，
+/// 从组装到发出中间不经过任何去重。于是同一个 `tool_use_id` 在历史里出现两次时，上游
+/// 收到两个 result，以 `each tool_use must have a single result`
+/// （`TOOL_USE_RESULT_MISMATCH`）拒掉**整个请求** —— 且该 reason 已被判为不可重试，
+/// 请求直接失败。
+///
+/// 重复有两种来源，都由这里覆盖：
+/// 1. **单条消息内** —— 客户端在一个 content 数组里放了两个同 id 的 tool_result 块。
+///    `process_message_content_dedup` 的 `tool_result` 分支是无条件 push 的
+/// 2. **跨消息** —— 两条连续 user 消息各带一个同 id 的 result，被 `merge_user_messages`
+///    合并进同一条历史消息
+///
+/// 不在上述两处各修一遍，是为了让"一个 tool_use_id 在发给上游的报文里只能出现一次"
+/// 这条不变量收敛在一处。分散去重的话，将来任何新增的历史组装路径都得记得再去重一次。
+///
+/// **保留第一个**：重复通常来自上一轮响应在 tool_use 中途被截断（超时 / 断线 / 客户端
+/// 重连）后重发，第一个才是与当时那次 tool_use 真正配对的结果。
+///
+/// 日志用 `debug` 而非 `warn`：长会话里一次重发会让**后续每一轮**都命中同一批重复，
+/// warn 会持续刷屏；而这里是成功兜住了问题，不是需要运维介入的异常。
+fn dedup_history_tool_results(history: &mut [Message]) {
+    use std::collections::HashSet;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut removed = 0usize;
+
+    for msg in history.iter_mut() {
+        if let Message::User(user_msg) = msg {
+            let results = &mut user_msg
+                .user_input_message
+                .user_input_message_context
+                .tool_results;
+            results.retain(|r| {
+                if seen.insert(r.tool_use_id.clone()) {
+                    true
+                } else {
+                    removed += 1;
+                    false
+                }
+            });
+        }
+    }
+
+    if removed > 0 {
+        tracing::debug!(
+            "历史中移除了 {} 个重复的 tool_result（同一 tool_use_id 出现多次，保留首次出现）",
+            removed
+        );
+    }
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -3533,6 +3596,231 @@ mod tests {
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
+        );
+    }
+
+    /// 历史里的同 id `tool_result` 必须去重，否则上游 `TOOL_USE_RESULT_MISMATCH` 拒整个请求。
+    ///
+    /// 回归的是一条**不可重试**的失败：`each tool_use must have a single result`。该 reason
+    /// 在 [`crate::kiro::endpoint`] 的 `CLIENT_VALIDATION_REASONS` 里，命中即终止，不重试。
+    ///
+    /// 形状取自实际故障（`messages.24.content.1`）：重复必须落在**历史**里才能复现 ——
+    /// 落在最后一条消息时 `validate_tool_pairing` 会兜住（那条路径本来就有防护）。所以
+    /// 这里刻意再追加两轮把带重复的 user 消息推进 history，删掉这两轮测试就失效了。
+    #[test]
+    fn history_duplicate_tool_result_is_deduped_before_upstream() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 一轮完整的工具调用：assistant 发 tool_use，user 回两个同 id 的 tool_result。
+        // 这正是 message.24 那种长会话里断线重发会产生的形状。
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("读一下文件"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read",
+                         "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"},
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"},
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                input_schema: [("type".to_string(), serde_json::json!("object"))]
+                    .into_iter()
+                    .collect(),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        // 再追加两轮，把带重复的那条 user 消息推进 history。
+        let mut req = req;
+        req.messages.push(AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!("读完了"),
+        });
+        req.messages.push(AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("继续"),
+        });
+
+        let result = convert_request(&req).unwrap();
+
+        // 统计整个报文（current + history）里每个 tool_use_id 出现几次。
+        // 上游校验的是这个口径，不是单条消息内的。
+        let mut per_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut kept_content: Option<String> = None;
+        for r in &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
+        }
+        for m in &result.conversation_state.history {
+            if let Message::User(u) = m {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
+                    if r.tool_use_id == "tool-1" && kept_content.is_none() {
+                        kept_content = r.content
+                            .first()
+                            .and_then(|v| v.get("text"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            per_id.get("tool-1").copied(),
+            Some(1),
+            "同一 tool_use_id 在发给上游的报文里只能出现一次，实际分布：{per_id:?}"
+        );
+        assert_eq!(
+            kept_content.as_deref(),
+            Some("first"),
+            "重复时必须保留首次出现的 result —— 后来的那个来自断线重发"
+        );
+    }
+
+    /// 重复的第二种来源：同 id 分散在**两条连续 user 消息**里，被合并进同一条历史消息。
+    ///
+    /// 与 [`history_duplicate_tool_result_is_deduped_before_upstream`] 是不同形状：那条是
+    /// 单个 content 数组内的重复，这条是 `merge_user_messages` 的
+    /// `all_tool_results.extend(...)` 把两条消息的 result 累加到一起。两条都得钉住 ——
+    /// 只修一种的话另一种照样能把请求打成不可重试的 400。
+    ///
+    /// 底层的 `merge_user_messages` **刻意不去重**，去重统一在
+    /// [`dedup_history_tool_results`] 做一次。所以这条测试必须走完整 `convert_request`，
+    /// 直接调 `merge_user_messages` 断言 1 个会是错的。
+    #[test]
+    fn cross_message_duplicate_tool_result_is_deduped_before_upstream() {
+        use super::super::types::Message as AnthropicMessage;
+
+        let req = MessagesRequest {
+            model: "claude-sonnet-4-5-20250929".to_string(),
+            max_tokens: 64,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("读一下文件"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read",
+                         "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                // 两条连续 user 消息各带一个同 id 的 result —— 会被合并成一条历史消息。
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"}
+                    ]),
+                },
+                // 再追加两轮，把上面那两条推进 history。
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("读完了"),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("继续"),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: Some(vec![super::super::types::Tool {
+                tool_type: None,
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                input_schema: [("type".to_string(), serde_json::json!("object"))]
+                    .into_iter()
+                    .collect(),
+                max_uses: None,
+                cache_control: None,
+            }]),
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+
+        let mut per_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for r in &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tool_results
+        {
+            *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
+        }
+        for m in &result.conversation_state.history {
+            if let Message::User(u) = m {
+                for r in &u.user_input_message.user_input_message_context.tool_results {
+                    *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        assert_eq!(
+            per_id.get("tool-1").copied(),
+            Some(1),
+            "跨消息合并产生的重复也必须去掉，实际分布：{per_id:?}"
+        );
+    }
+
+    /// 单条消息内的重复在**解析层**是原样保留的 —— 去重不在这一层。
+    ///
+    /// 钉住这个分工：`process_message_content` 只做协议解析，不承担去重职责；
+    /// 「一个 tool_use_id 只能出现一次」由 [`dedup_history_tool_results`] 统一保证。
+    /// 若将来有人为了"就近修复"把去重塞进解析层，这条会失败并提示去看那个函数 ——
+    /// 两层都去重不是错，但会让不变量的归属重新变得模糊，那正是本次故障的成因。
+    #[test]
+    fn parsing_layer_keeps_duplicates_dedup_is_a_separate_step() {
+        let content = serde_json::json!([
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"},
+            {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"},
+        ]);
+        let (_, _, results) = process_message_content(&content).unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "解析层不去重（去重在 dedup_history_tool_results）"
         );
     }
 }
