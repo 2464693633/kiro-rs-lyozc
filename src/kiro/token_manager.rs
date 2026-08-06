@@ -3452,6 +3452,28 @@ impl MultiTokenManager {
         self.is_multiple_format.store(true, Ordering::Relaxed);
         self.persist_credentials()?;
 
+        // 7. priority 模式下重新评估当前凭据。
+        //
+        // 不做这一步的话新凭据永远不会生效：`acquire` 在 priority 模式下有一条短路
+        // ——只要 `current_id` 指向的凭据还健康（未禁用、未限流、匹配模型与分组）就
+        // 直接用它，**不再与其它凭据比较优先级**。而本函数只往 entries 里 push，
+        // 不动 `current_id`。
+        //
+        // 于是「Kiro 账号被封 → 降级到上游 API 凭据 → 自动化推入新的高优先级 Kiro
+        // 账号」这条路径会卡住：上游凭据一直健康，短路永远命中，新账号被无限期跳过。
+        // 这不是切换慢，是不会切 —— 除非上游凭据自己出故障。
+        //
+        // 只在 priority 模式下做：balanced 模式每次请求都重新均衡选择，本就不依赖
+        // `current_id`，改它反而会干扰均衡状态（见
+        // `balanced_read_only_selection_does_not_update_current_id`）。
+        //
+        // 与 `set_priority` 的行为对齐：改优先级会立刻重选，那么新增一个优先级更高
+        // 的凭据同样应该立刻生效。`select_highest_priority` 自身按 priority 取最小
+        // 值，故新凭据优先级更低时不会抢占当前凭据。
+        if self.get_load_balancing_mode() == "priority" {
+            self.select_highest_priority();
+        }
+
         tracing::info!("成功添加凭据 #{}", new_id);
         Ok(new_id)
     }
@@ -4649,6 +4671,143 @@ mod tests {
             .unwrap();
 
         assert_eq!(manager.snapshot().current_id, 1);
+    }
+
+    /// priority 模式下新增的高优先级凭据必须立刻生效。
+    ///
+    /// 回归的是一条**永久卡死**的行为，不是切换延迟：`acquire` 在 priority 模式下
+    /// 有短路 —— `current_id` 指向的凭据只要还健康就直接用，不再比较优先级；而
+    /// `add_credential` 只往 entries 里 push。两者相加的结果是新凭据被无限期跳过，
+    /// 除非当前凭据自己出故障。
+    ///
+    /// 形状取自实际故障：Kiro 账号被封 → 自动降级到上游 API 凭据 → 自动化推入新的
+    /// Kiro 账号 → 请求仍然全部走上游。故这里刻意让上游凭据**保持健康**：若测试里
+    /// 把它禁用掉，短路会因"当前凭据不可用"而自然失效，本次修复就测不到了。
+    #[tokio::test]
+    async fn added_higher_priority_credential_takes_effect_immediately() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        // 初始只有上游凭据，模拟 Kiro 账号全封后的稳定状态。
+        let upstream = KiroCredentials {
+            upstream_base_url: Some("https://sub2api.example.com".to_string()),
+            upstream_api_key: Some("sk-upstream".to_string()),
+            priority: 5,
+            ..KiroCredentials::default()
+        };
+        let manager = MultiTokenManager::new(config, vec![upstream], None, None, false).unwrap();
+
+        assert_eq!(
+            manager.acquire_context(None, None).await.unwrap().id,
+            1,
+            "初始应选中唯一的上游凭据"
+        );
+
+        // 自动化推入的 Kiro 账号，优先级高于上游（0 < 5）。
+        let new_id = manager
+            .add_credential(KiroCredentials {
+                access_token: Some("kiro-token".to_string()),
+                refresh_token: Some("kiro-refresh".to_string()),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                kiro_api_key: Some("kiro-api-key".to_string()),
+                priority: 0,
+                ..KiroCredentials::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.snapshot().current_id,
+            new_id,
+            "添加高优先级凭据后 current_id 必须立刻指向它，否则 acquire 的短路会一直命中旧凭据"
+        );
+        assert_eq!(
+            manager.acquire_context(None, None).await.unwrap().id,
+            new_id,
+            "下一次请求必须真的走新凭据"
+        );
+
+        // 上游凭据全程健康 —— 短路失效不是靠它出故障换来的。
+        let snapshot = manager.snapshot();
+        let upstream_entry = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(
+            !upstream_entry.disabled,
+            "上游凭据必须仍然可用，否则本测试测的是降级路径而非本次修复"
+        );
+    }
+
+    /// 新增的**低**优先级凭据不得抢占当前凭据。
+    ///
+    /// 与 [`added_higher_priority_credential_takes_effect_immediately`] 成对：修复引入的
+    /// 重新评估必须仍然按优先级取最小值，不能退化成"谁最后添加就用谁"。少了这一条，
+    /// 把 `select_highest_priority()` 误写成直接 `*current_id = new_id` 也能让上面那条通过。
+    #[tokio::test]
+    async fn added_lower_priority_credential_does_not_preempt_current() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let primary = KiroCredentials {
+            access_token: Some("primary-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 0,
+            ..KiroCredentials::default()
+        };
+        let manager = MultiTokenManager::new(config, vec![primary], None, None, false).unwrap();
+        assert_eq!(manager.snapshot().current_id, 1);
+
+        // 备用上游凭据，优先级更低（9 > 0）。
+        manager
+            .add_credential(KiroCredentials {
+                upstream_base_url: Some("https://backup.example.com".to_string()),
+                upstream_api_key: Some("sk-backup".to_string()),
+                priority: 9,
+                ..KiroCredentials::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.snapshot().current_id,
+            1,
+            "低优先级的新凭据不该抢占当前凭据"
+        );
+    }
+
+    /// balanced 模式下添加凭据不得改动 `current_id`。
+    ///
+    /// balanced 每次请求都重新均衡选择，本就不读 `current_id`；修复只针对 priority
+    /// 模式，若无条件调用 `select_highest_priority()` 会干扰均衡状态
+    /// （同 [`balanced_read_only_selection_does_not_update_current_id`] 的关切）。
+    #[tokio::test]
+    async fn adding_credential_in_balanced_mode_leaves_current_id_alone() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+
+        let first = KiroCredentials {
+            access_token: Some("first-token".to_string()),
+            expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+            priority: 5,
+            ..KiroCredentials::default()
+        };
+        let manager = MultiTokenManager::new(config, vec![first], None, None, false).unwrap();
+        let before = manager.snapshot().current_id;
+
+        manager
+            .add_credential(KiroCredentials {
+                access_token: Some("second-token".to_string()),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                kiro_api_key: Some("second-api-key".to_string()),
+                priority: 0, // 更高优先级，priority 模式下会切；balanced 下不该动
+                ..KiroCredentials::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.snapshot().current_id,
+            before,
+            "balanced 模式不依赖 current_id，添加凭据不该改动它"
+        );
     }
 
     #[test]

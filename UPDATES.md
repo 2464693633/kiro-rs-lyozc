@@ -9,6 +9,53 @@
 
 ---
 
+## 2026-08-06 — priority 模式新增凭据不生效
+
+主题：**修一条「新增的高优先级凭据被无限期跳过」的行为** —— 不是切换慢，是不会切。
+
+`cargo test` 708 passed / 0 failed；`cargo check --all-targets` 零 warning。
+
+### 🔴 修复 — priority 模式下 `add_credential` 不重新评估当前凭据
+
+**现象**：Kiro 账号被封 → 自动降级到上游 API 凭据 → 自动化推入新的 Kiro 账号
+（优先级更高）→ **请求仍然全部走上游**，新账号一直不被选中。
+
+**成因**：两处各自合理的逻辑相加后留了个缺口。
+
+- [token_manager.rs:1811-1837](src/kiro/token_manager.rs#L1811-L1837) `acquire` 在 priority
+  模式下有一条**短路**：`current_id` 指向的凭据只要还健康（未禁用、未限流、匹配模型与
+  分组），就直接用它，**不再与其它凭据比较优先级**
+- [token_manager.rs:3345](src/kiro/token_manager.rs#L3345) `add_credential` 只往 `entries`
+  里 push，然后持久化返回，**不动 `current_id`**
+
+`select_highest_priority()` 原本只有三个调用点 —— 改优先级
+（[2855](src/kiro/token_manager.rs#L2855)）、删凭据（[3663](src/kiro/token_manager.rs#L3663)）、
+切负载模式（[3844](src/kiro/token_manager.rs#L3844)）。新增凭据不在其中。
+
+于是那条路径正好卡住：上游凭据**始终健康**，短路每次都命中，指针永远没有重新评估的
+机会。只有上游自己出故障才会换 —— 而它不出故障。
+
+**修复**：`add_credential` 成功后，在 priority 模式下调一次 `select_highest_priority()`。
+
+- 与 `set_priority` 的既有行为对齐：改优先级会立刻重选，那么新增一个优先级更高的凭据
+  同样应该立刻生效
+- **只在 priority 模式下做**：balanced 每次请求都重新均衡选择，本就不读 `current_id`，
+  无条件调用会干扰均衡状态
+- `select_highest_priority` 自身按 `priority` 取最小值，故新凭据优先级更低时不会抢占
+
+**测试**（三条，覆盖三个不同维度）：
+
+| 测试 | 钉住什么 |
+|---|---|
+| `added_higher_priority_credential_takes_effect_immediately` | 主回归。刻意让上游凭据**全程健康**并在末尾断言 `!disabled` —— 若测试里把它禁用，短路会因"当前凭据不可用"自然失效，这条修复就测不到了 |
+| `added_lower_priority_credential_does_not_preempt_current` | 重新评估仍按优先级取最小值。少了这条，把修复误写成 `*current_id = new_id` 也能让上面那条通过 |
+| `adding_credential_in_balanced_mode_leaves_current_id_alone` | balanced 模式不受影响 |
+
+三条都做过**反向验证**：临时把修复短路掉（`if false && ...`）后重跑 —— 主回归如期失败
+（`left: 1, right: 2`），另两条仍通过，确认它们钉的是不同维度而非重复覆盖。
+
+---
+
 ## 2026-08-04 — Kiro 路径历史 `tool_result` 去重
 
 主题：**修一条会让上游拒掉整个请求、且不可重试的失败** ——
