@@ -48,6 +48,8 @@ export interface CredentialStatusItem {
   upstreamBaseUrl?: string
   /** 近 7 天 token 用量统计 */
   tokenUsage7d?: CredentialTokenUsage
+  /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
+  createdAt?: string
 }
 
 /** 凭据近 7 天 token 用量统计 */

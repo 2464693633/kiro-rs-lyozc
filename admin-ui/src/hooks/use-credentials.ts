@@ -20,6 +20,10 @@ import {
   setAccountThrottleConfig,
   getTokenInflationConfig,
   setTokenInflationConfig,
+  getAccountRpmLimitConfig,
+  setAccountRpmLimitConfig,
+  getSelfHealConfig,
+  setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -254,6 +258,45 @@ export function useSetTokenInflationConfig() {
     mutationFn: setTokenInflationConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['tokenInflationConfig'] })
+    },
+  })
+}
+
+// 获取单账号 RPM 限流配置
+export function useAccountRpmLimitConfig() {
+  return useQuery({
+    queryKey: ['accountRpmLimitConfig'],
+    queryFn: getAccountRpmLimitConfig,
+  })
+}
+
+// 更新单账号 RPM 限流配置
+export function useSetAccountRpmLimitConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountRpmLimitConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
+// 获取自愈治理配置（30s 刷新以便观测 consecutiveRounds/totalCount 变化）
+export function useSelfHealConfig() {
+  return useQuery({
+    queryKey: ['selfHealConfig'],
+    queryFn: getSelfHealConfig,
+    refetchInterval: 30_000,
+  })
+}
+
+// 更新自愈治理配置
+export function useSetSelfHealConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSelfHealConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['selfHealConfig'] })
     },
   })
 }

@@ -16,6 +16,7 @@ use super::{
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials,
         force_refresh_token,
+        get_account_rpm_limit_config,
         get_account_throttle_config,
         get_billing_config,
         get_all_credentials,
@@ -28,6 +29,7 @@ use super::{
         get_load_balancing_mode,
         get_log_governance_config,
         get_proxy_pool,
+        get_self_heal_config,
         get_token_inflation_config,
         get_update_config,
         list_client_keys,
@@ -44,6 +46,7 @@ use super::{
         reset_success_count,
         rollback_image_update,
         rotate_client_key,
+        set_account_rpm_limit_config,
         set_account_throttle_config,
         set_billing_config,
         set_cache_engines_config,
@@ -55,6 +58,7 @@ use super::{
         set_load_balancing_mode,
         set_log_governance_config,
         set_proxy_enabled,
+        set_self_heal_config,
         set_token_inflation_config,
         set_update_config,
         start_idc_login,
@@ -166,6 +170,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_cache_engines_config).put(set_cache_engines_config),
         )
         .route("/cache-engines/stats", get(get_cache_engines_stats))
+        .route(
+            "/config/account-rpm-limit",
+            get(get_account_rpm_limit_config).put(set_account_rpm_limit_config),
+        )
+        .route(
+            "/config/self-heal",
+            get(get_self_heal_config).put(set_self_heal_config),
+        )
         .route(
             "/config/log-governance",
             get(get_log_governance_config).put(set_log_governance_config),

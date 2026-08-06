@@ -23,11 +23,12 @@ use super::{
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
         BillingConfigPayload, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
-        ModelTestRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
-        SetGlobalProxyRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
-        SetPriorityRequest, SetTokenInflationConfigRequest, SetUpdateConfigRequest,
-        StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest,
-        UpdateClientKeyRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
+        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetLogGovernanceConfigRequest, SetPriorityRequest, SetSelfHealConfigRequest,
+        SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -612,6 +613,24 @@ pub async fn set_billing_config(
     }
 }
 
+/// GET /api/admin/config/account-rpm-limit
+/// 获取单账号 RPM 限流配置
+pub async fn get_account_rpm_limit_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_account_rpm_limit_config())
+}
+
+/// PUT /api/admin/config/account-rpm-limit
+/// 更新单账号 RPM 限流配置
+pub async fn set_account_rpm_limit_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetAccountRpmLimitConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_account_rpm_limit_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/cache-engines
 ///
 /// 返回磁盘配置经 `sanitized()` 后的值，即**运行时真正生效的参数**。直接回显原始
@@ -808,6 +827,24 @@ pub async fn set_token_inflation_config(
     Json(payload): Json<SetTokenInflationConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_token_inflation_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/self-heal
+/// 获取自愈治理配置
+pub async fn get_self_heal_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_self_heal_config())
+}
+
+/// PUT /api/admin/config/self-heal
+/// 更新自愈治理配置（运行时生效 + 持久化 config.json）
+pub async fn set_self_heal_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSelfHealConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_self_heal_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
