@@ -41,7 +41,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage, overageFailureMessage } from "@/lib/utils";
+import { maskProxyUrl, extractErrorMessage, overageFailureMessage, formatCredits } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -1198,8 +1198,13 @@ export function CredentialCard({
             )}
             {!credential.isUpstream && credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
               <div className="min-[420px]:col-span-2 border-t border-border/50 pt-2">
-                <div className="mb-1 text-xs text-muted-foreground">Token 用量（近 7 天）</div>
-                <div className="grid grid-cols-3 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-5">
+                <div className="mb-1 text-xs text-muted-foreground">用量（近 7 天）</div>
+                <div className="grid grid-cols-3 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-6">
+                  {/* 积分放第一列：账号余额是多人共用的总数，这一列才是本实例自己消耗的部分 */}
+                  <div className="flex justify-between gap-1">
+                    <span className="text-muted-foreground">积分</span>
+                    <span className="font-medium tabular-nums">{formatCredits(credential.tokenUsage7d.credits)}</span>
+                  </div>
                   <div className="flex justify-between gap-1">
                     <span className="text-muted-foreground">调用</span>
                     <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.calls)}</span>

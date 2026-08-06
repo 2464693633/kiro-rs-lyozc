@@ -9,6 +9,38 @@
 
 ---
 
+## 2026-08-06 — 凭据卡片补「本实例消耗的积分」
+
+**问题**：凭据卡片只显示 `balance.remaining`，那是向 Kiro 查的**账号总余额**。
+账号多人共用时这个数含别人的消耗，反映不出"我用了多少"。
+
+**现状**：后端早就在算了 —— `credits` 来自上游 `meteringEvent`，逐请求落盘
+（[usage_stats.rs:263](src/admin/usage_stats.rs#L263)），按凭据聚合
+（[usage_stats.rs:714](src/admin/usage_stats.rs#L714)），已挂在凭据响应上
+（[handlers.rs:63](src/admin/handlers.rs#L63)），前端类型里也有
+（[api.ts:60](admin-ui/src/types/api.ts#L60)）。唯一缺的是
+[credential-card.tsx](admin-ui/src/components/credential-card.tsx#L1202) 那个网格
+只渲染了 calls / 输入 / 输出 / 缓存写 / 缓存读五项，把 `credits` 漏了。
+
+**改动**：网格 5 列 → 6 列，「积分」放第一列（它比 token 数更能回答"我花了多少"）。
+格式化复用现成的 [`formatCredits`](admin-ui/src/lib/utils.ts#L144) —— 总览页与图表都在用它，
+不另写一个。标题从「Token 用量」改成「用量」，因为积分不是 token。
+
+两点口径限制，用这个数时需要知道：
+
+- **窗口是近 7 天**，写死在 [handlers.rs:46](src/admin/handlers.rs#L46) 的 `Range::Last7d`。
+  不是账号总消耗。`Range` 枚举只有 `Last24h` / `Last7d` / `Last30d`
+  （[usage_stats.rs:407](src/admin/usage_stats.rs#L407)），没有"全部时间"
+- **只统计经过本实例的请求**。这正是与账号余额的区别所在；反过来，
+  `余额减少量 − 本列积分` 可以估出其他人用掉的部分
+
+真正的"总消耗"需要一个逐凭据累计计数器（仿
+[`client_keys.total_credits`](src/admin/client_keys.rs#L49) 那个模式，只增不减、
+不受日志保留期裁剪影响）。加 `Range::All` 扫全部日桶不等价 —— 超期桶已被删除，
+数字会随时间**变小**，看起来像消耗减少了。该项未做。
+
+---
+
 ## 2026-08-06 — priority 模式新增凭据不生效
 
 主题：**修一条「新增的高优先级凭据被无限期跳过」的行为** —— 不是切换慢，是不会切。
