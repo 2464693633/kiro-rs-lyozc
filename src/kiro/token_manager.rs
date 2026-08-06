@@ -1825,6 +1825,60 @@ impl MultiTokenManager {
         }
     }
 
+    /// 新凭据入库后异步预热它的模型缓存。
+    ///
+    /// **解的是一个自锁**：候选排序的第一个键是
+    /// `discovery_rank = (support != Confirmed)`，排在 `priority` **前面**
+    /// （见 [`Self::select_next_credential`]）。而 `cached_model_support` 对没有
+    /// 缓存条目的凭据返回 `Unknown`，于是刚入库的凭据 rank=1，任何用过的旧凭据
+    /// rank=0 —— 优先级根本没参与比较就已经输了。
+    ///
+    /// 同一个 `Unknown` 还会让 `acquire` 的 priority 短路失效：当存在
+    /// `Confirmed` 的凭据时（`confirmed_available`），短路要求 `current_id` 指向
+    /// 的凭据也必须 `Confirmed`。所以单靠 `add_credential` 里的
+    /// `select_highest_priority()` 把指针指过去并不够，两处都会把新凭据踢回。
+    ///
+    /// 自锁的形状是：不被选中 → 缓存不填 → 一直 `Unknown` → 不被选中。除非有人
+    /// 手动点一次「查询模型」。预热就是在入库时替他点这一下。
+    ///
+    /// **后台 spawn 而非 await**：凭据此刻已经落盘成功，若在此处 await 且上游不可
+    /// 达，就会把「添加成功但预热失败」报成「添加失败」，误导调用方。预热失败只
+    /// 降级为下一次请求时按 `Unknown` 走原有逻辑，不影响正确性。
+    pub fn warm_model_cache_for(self: &Arc<Self>, id: u64) {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            match manager.refresh_model_cache_for(id, false).await {
+                Ok(response) => {
+                    tracing::info!(
+                        "凭据 #{} 模型缓存预热完成，{} 个模型",
+                        id,
+                        response.models.len()
+                    );
+                    // 预热后必须重选指针，否则修复仍然无效。
+                    //
+                    // `acquire` 选中凭据后会**回写** `current_id`。于是这个时序会把
+                    // 指针拖走：`add_credential` 指向新凭据 → 预热还没回来时来了一个
+                    // 请求 → 短路因新凭据 `Unknown` 而失败 → 排序按 `discovery_rank`
+                    // 选中旧凭据 → `current_id` 被改成旧凭据。此后预热虽然成功，但
+                    // 指针已不在新凭据上，而短路对健康的旧凭据恒命中，优先级永远不会
+                    // 被重新评估。
+                    //
+                    // 由 `empty_model_cache_defeats_priority_until_warmed` 反向钉住：
+                    // 去掉这次重选，该测试的第二段断言会失败（选中的仍是旧凭据）。
+                    if manager.get_load_balancing_mode() == "priority" {
+                        manager.select_highest_priority();
+                    }
+                }
+                // 仅降级：下次请求仍可按 Unknown 走 select_next_credential。
+                Err(error) => tracing::warn!(
+                    "凭据 #{} 模型缓存预热失败，其优先级需等首次成功调用后才生效: {}",
+                    id,
+                    error
+                ),
+            }
+        });
+    }
+
     /// 服务启动后异步预热所有当前启用凭据的模型缓存。
     pub fn start_model_cache_warmer(self: &Arc<Self>) {
         let manager = Arc::clone(self);
@@ -6273,6 +6327,78 @@ mod tests {
         assert!(
             !upstream_entry.disabled,
             "上游凭据必须仍然可用，否则本测试测的是降级路径而非本次修复"
+        );
+    }
+
+    /// 模型缓存为空的新凭据会被 `discovery_rank` 挡在优先级之外 —— 这是预热的理由。
+    ///
+    /// 与 [`added_higher_priority_credential_takes_effect_immediately`] 的区别是**请求
+    /// 带了具体模型**。那一条传 `model = None`，此时 `cached_model_support` 对所有凭据
+    /// 一律返回 `Unknown`，`discovery_rank` 全为 1、互相抵消，于是优先级决定胜负 ——
+    /// 所以它当时是绿的，却没能覆盖真实故障。
+    ///
+    /// 指定模型后自锁才显形：候选排序键是 `(discovery_rank, priority)`，而
+    /// `discovery_rank = (support != Confirmed)` 排在 **priority 前面**。用过的旧凭据
+    /// rank=0，刚入库的新凭据 rank=1 —— `(0, 5) < (1, 0)`，优先级根本没参与比较。
+    /// 不被选中 → 缓存不填 → 一直 `Unknown` → 不被选中，形成自锁。
+    ///
+    /// 本测试用 `seed_model_cache` 模拟 [`MultiTokenManager::warm_model_cache_for`]
+    /// 的效果（真实预热要打上游 HTTP，单测无法覆盖），证明缓存一填、优先级立刻生效。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_model_cache_defeats_priority_until_warmed() {
+        const MODEL: &str = "claude-opus-5";
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        // 上游凭据：优先级低（5），但已用过 —— 模型缓存已确认。
+        let upstream = KiroCredentials {
+            upstream_base_url: Some("https://sub2api.example.com".to_string()),
+            upstream_api_key: Some("sk-upstream".to_string()),
+            priority: 5,
+            ..KiroCredentials::default()
+        };
+        let manager = Arc::new(
+            MultiTokenManager::new(config, vec![upstream], None, None, false).unwrap(),
+        );
+        seed_model_cache(&manager, 1, &[MODEL]);
+
+        // 自动化推入的 Kiro 账号：优先级更高（0），但模型缓存为空。
+        let new_id = manager
+            .add_credential(KiroCredentials {
+                access_token: Some("kiro-token".to_string()),
+                refresh_token: Some("kiro-refresh".to_string()),
+                expires_at: Some((Utc::now() + Duration::hours(1)).to_rfc3339()),
+                kiro_api_key: Some("kiro-api-key".to_string()),
+                priority: 0,
+                ..KiroCredentials::default()
+            })
+            .await
+            .unwrap();
+
+        // 指针已指向新凭据（上一条修复的效果），但它 Unknown 而上游 Confirmed，
+        // acquire 的 confirmed_available 短路会把它踢回，排序又输在 discovery_rank。
+        assert_eq!(manager.snapshot().current_id, new_id);
+        assert_eq!(
+            manager.acquire_context(Some(MODEL), None).await.unwrap().id,
+            1,
+            "模型缓存为空时新凭据必然落选 —— 这正是需要预热的原因，不是修复失败"
+        );
+
+        // 上一次 acquire 把 current_id 回写成了旧凭据 —— 这正是光填缓存不够的原因。
+        assert_eq!(
+            manager.snapshot().current_id, 1,
+            "acquire 会回写 current_id，指针已被拖回旧凭据"
+        );
+
+        // 模拟 `warm_model_cache_for` 的两步：填缓存 + 重选指针。
+        // 缺任何一步都不生效 —— 只填缓存，短路会继续命中被拖走的旧指针。
+        seed_model_cache(&manager, new_id, &[MODEL]);
+        manager.select_highest_priority();
+
+        assert_eq!(
+            manager.acquire_context(Some(MODEL), None).await.unwrap().id,
+            new_id,
+            "缓存填充 + 指针重选后，高优先级凭据必须胜出"
         );
     }
 

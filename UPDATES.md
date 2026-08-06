@@ -68,6 +68,59 @@ git 在若干处把两组各自完整的函数按公共尾部（`return Err(err)
 
 ---
 
+## 2026-08-06 — 新凭据模型缓存预热（承接下一节，那次修复不充分）
+
+**问题**：上一节的修复上线后，用户报告**仍然不切换** —— 推入高优先级 Kiro 账号后，
+请求继续走优先级更低的上游 API 凭据。
+
+**为什么上次没修好**：那次只解决了「指针不动」，但选择逻辑里还有两道关卡把新凭据踢回。
+
+候选排序键是 `(discovery_rank, priority)`
+（[token_manager.rs:2063](src/kiro/token_manager.rs#L2063)），而
+`discovery_rank = (support != Confirmed)` 排在 **priority 前面**。
+`cached_model_support` 对没有缓存条目的凭据返回 `Unknown`
+（[token_manager.rs:1683](src/kiro/token_manager.rs#L1683)），于是：
+
+| | 模型缓存 | discovery_rank | priority | 排序键 |
+|---|---|---|---|---|
+| 上游凭据（用过） | `Confirmed` | 0 | 5 | `(0, 5)` ✅ 胜 |
+| 新 Kiro 账号 | 空 → `Unknown` | 1 | 0 | `(1, 0)` |
+
+`(0,5) < (1,0)` —— **优先级根本没参与比较**，第一个键就分出胜负了。
+
+同一个 `Unknown` 还让 priority 短路失效：存在 `Confirmed` 凭据时
+（`confirmed_available`），短路要求 `current_id` 指向的凭据也必须 `Confirmed`
+（[token_manager.rs:2169](src/kiro/token_manager.rs#L2169)）。
+
+自锁的形状：**不被选中 → 缓存不填 → 一直 `Unknown` → 不被选中**。
+
+**修复**：新增
+[`warm_model_cache_for`](src/kiro/token_manager.rs#L1829)，在凭据入库后异步预热模型缓存。
+接在三条入口后面 —— Admin 添加（批量导入也走它）、Social 登录、IdC 登录。
+
+两个设计点：
+
+- **后台 spawn 而非 await**：凭据此刻已落盘成功，若 await 且上游不可达，会把「添加成功
+  但预热失败」报成「添加失败」，误导调用方。预热失败只降级为按 `Unknown` 走原逻辑
+- **预热成功后必须再 `select_highest_priority()`** —— 这一步是写测试时才发现的：
+  `acquire` 选中凭据后会**回写** `current_id`。若预热返回前来了一个请求，短路因
+  `Unknown` 失败 → 排序选中旧凭据 → **指针被拖回旧凭据**。此后预热虽成功，但短路对
+  健康的旧凭据恒命中，优先级永不重估。缺这一步，修复照样无效
+
+**测试**：
+[`empty_model_cache_defeats_priority_until_warmed`](src/kiro/token_manager.rs) ——
+**请求带具体模型**，这是与上一节测试的关键区别：那三条传 `model = None`，此时所有凭据
+一律 `Unknown`、`discovery_rank` 互相抵消，优先级才决定胜负 —— 所以它们当时全绿却没
+覆盖真实故障。测试用 `seed_model_cache` 模拟预热效果（真实预热要打上游 HTTP，单测无法
+覆盖），并显式断言中途 `current_id` 被拖回旧凭据，钉住「填缓存 + 重选指针」两步都必需。
+
+做过反向验证：注释掉 `select_highest_priority()` 后第二段断言失败（`left: 1, right: 2`）。
+
+> **运维提示**：若预热失败（上游临时不可达），在 Admin 界面对该凭据点一次
+> 「查询模型」即可手动填充缓存，优先级随即生效。
+
+---
+
 ## 2026-08-06 — 凭据卡片补「本实例消耗的积分」
 
 **问题**：凭据卡片只显示 `balance.remaining`，那是向 Kiro 查的**账号总余额**。

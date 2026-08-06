@@ -1477,6 +1477,17 @@ impl AdminService {
             }
         }
 
+        // 预热模型缓存，使新凭据的优先级立刻可参与调度。
+        //
+        // 放在验活之后：验活失败会删掉凭据，提前预热等于给一个即将消失的 id 白跑
+        // 一次上游请求，还会留下误导性的失败日志。
+        //
+        // 上游凭据在 `fetch_balance` 路径里已经由 `get_available_models` 填过缓存，
+        // 但 Kiro 凭据走的是 `get_balance`（不碰模型缓存），且 `fetch_balance` 为
+        // false 的"直接导入"路径两者都不填 —— 所以这里统一补一次。
+        // 重复预热是廉价的：`refresh_model_cache_for(id, false)` 命中新鲜缓存即返回。
+        self.token_manager.warm_model_cache_for(credential_id);
+
         Ok(AddCredentialResponse {
             success: true,
             message: format!("凭据添加成功，ID: {}", credential_id),
@@ -3195,6 +3206,9 @@ impl AdminService {
             tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
         }
 
+        // 预热模型缓存，使新凭据的优先级立刻可参与调度（`get_balance` 不填该缓存）。
+        self.token_manager.warm_model_cache_for(credential_id);
+
         tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
         Ok(PollIdcLoginResponse::Success { credential_id })
     }
@@ -3452,6 +3466,9 @@ impl AdminService {
                 if let Err(e) = self.get_balance(credential_id).await {
                     tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
                 }
+
+                // 预热模型缓存，使新凭据的优先级立刻可参与调度（`get_balance` 不填该缓存）。
+                self.token_manager.warm_model_cache_for(credential_id);
 
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 Ok(PollIdcLoginResponse::Success { credential_id })
