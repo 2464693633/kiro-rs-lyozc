@@ -9,6 +9,204 @@
 
 ---
 
+## 2026-08-09 — 顶栏按钮重叠盖住「请求日志」tab（点不动）
+
+**问题**：宽屏（≥2xl）下工具区把 tab 行盖住，最右的「请求日志」tab 看不见。
+
+**先量后改**。用 CDP 驱动 headless Edge 量了 5 档视口，拿到确切数字：
+
+| 视口 | tab 行右边界 | 工具区左边界 | 重叠 | 日志 tab 可点 |
+|---|---|---|---|---|
+| 1536 | 656 | 536 | **+120** | ❌ |
+| 1600 | 688 | 568 | **+120** | ❌ |
+| 1700 | 738 | 618 | **+120** | ❌ |
+| 1920 | 848 | 728 | **+120** | ❌ |
+| 2560 | 1168 | 1048 | **+120** | ❌ |
+
+两个关键事实：
+
+1. **重叠量恒定 120px，与视口宽度无关** —— 把窗口拉到 2560 也不自愈。
+   因为 `HeaderActions` 是 `shrink-0` 且宽 900px，`max-w-[1400px]` 容器里
+   `HeaderBrand`（`flex-1 min-w-0`）拿到的剩余空间不够，而 `DesktopTabs` 自身
+   **没有 `min-w-0`** —— flex item 默认 `min-width:auto` 让它按内容撑开、溢出父级。
+2. `elementFromPoint(日志 tab 中心)` 命中的不是它自己 —— 即**点不动**，不只是看不见。
+
+这个重叠**早于本次订阅源改动**（在 committed 基线上量的），我加的按钮只是让它从
+120px 恶化到约 210px。
+
+**修复**（两处，主次分明）：
+
+- **主**：宽屏工具栏从「平铺 6 个带文字的配置按钮」改为「3 个高频图标 + 1 个齿轮菜单」。
+  工具区 900px → **289px**。配置项复用既有的 `*CompactItems`（它们本来就是为下拉设计的），
+  宽屏齿轮菜单与窄屏 ⋯ 菜单共用同一份 `SettingsMenuItems`，避免两套入口的项目集合漂移。
+- **次（护栏）**：`DesktopTabs` 补 `min-w-0 overflow-x-auto`。将来再塞东西也只会变成
+  可横向滚动，而不是静默盖住 tab。
+
+**状态可见性怎么保住的**：平铺按钮原本能一眼看到「膨胀中 / 故障转移·30m / 自愈开」。
+收进菜单后，① 菜单项自带当前值（实测文案：`关闭故障转移 · 30m`、`凭据自愈 | 已启用`）；
+② 齿轮上加一个琥珀色小点，仅在存在非默认配置（膨胀 >1x 或故障转移被关）时显示 ——
+不展开也知道有东西被调过。
+
+**修复后复量**：
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| `overlapPx`（5 档均值） | +120 | **−412**（余量） |
+| 日志 tab `topmostIsSelf` | false | **true** |
+| 工具区宽度 | 900px | **289px** |
+
+**功能验证**（真实鼠标事件，非 `.click()`——Radix 监听 `pointerdown`）：
+点击「请求日志」→ hash 从 `#/credentials` 切到 `#/traces`，页面渲染出日志面板；
+齿轮可点；窄屏（1280/1440）⋯ 菜单 8 组配置齐全、`actionsOverflowsRow: false`、
+移动版「日志」tab 可点。截图目视确认 5 个 tab 全部可见。
+
+净删 165 行（移除 8 个不再引用的平铺按钮组件及其专用 helper / 图标 import）。
+`cargo test` 761 passed；`tsc -b --force` 零错误（仓库开了 `noUnusedLocals`，
+死代码会直接编译失败，正好当清理清单用）。
+
+### 顺带去掉重复的「Token 膨胀倍率」入口
+
+顶栏原先有两个入口改同一份数据：独立的「Token 膨胀倍率」按钮，和「缓存引擎」弹窗里的
+`global` 段。后端两条路径都落到 `token_manager.set_token_inflation_config`，校验区间
+同为 `[1.0, 100.0]` —— 是同一份存储的两个门，不是两份配置。
+
+已删掉独立入口，四套引擎倍率 + 全局倍率统一在缓存引擎弹窗里调。菜单项改名为
+「缓存引擎与下发倍率」，非默认时带「（倍率生效中）」后缀。
+
+`PUT /api/admin/config/token-inflation` 端点**保留**（供直接调 API 的使用者），
+只是管理面板不再提供第二个按钮。前端 `useSetTokenInflationConfig` 也留着并加了注释
+说明「当前无调用方、保留做接口对等」，免得后来者当死代码删掉又在别处重写。
+
+修的一个连带 bug：`useSetCacheEnginesConfig` 原先只失效 `cacheEnginesConfig` /
+`cacheEnginesStats`。全局倍率的编辑入口收敛到这里后，齿轮上的「非默认」状态点
+（读 `tokenInflationConfig`）改完不会刷新 —— 已补上该 key 的失效。
+
+实测（CDP + API 双向）：顶栏与齿轮菜单均无独立膨胀入口；从菜单能打开缓存引擎弹窗
+（四套引擎 + 全局段齐全）；`PUT /config/cache-engines` 带 `global: {input: 2.5}` 后
+`GET /config/token-inflation` 读到 `2.5`，证明确为同一份存储；齿轮状态点从
+false → true。测完已复原为 1.0。
+
+---
+
+## 2026-08-09 — API Key 订阅源（拼车链接）自动导入
+
+**需求**：手里有个持续发号的拼车链接（GET 返回带 `ksk_` key 与 `aws_region` 的 JSON），
+希望定期拉取、把新 key 自动导入成凭据，不用手工一个个粘。
+
+**没有新增凭据类型**。复用了两套既有机制：
+[`import_one_credential`](src/admin/service.rs)（去重 + 验活 + 失败回滚都在里面）
+和 `start_*_scheduler` 那套后台轮询 pattern。
+
+### 为什么不需要自己记账「哪些 key 已导入过」
+
+`credential_dedup_fingerprint`（[token_manager.rs:131](src/kiro/token_manager.rs#L131)）
+对 api_key 类凭据取 `sha256(kiroApiKey)`，且这道检查在
+[`add_credential`](src/kiro/token_manager.rs#L3974) 里发生在**任何网络调用之前**就 bail。
+
+所以轮询天然幂等：20 个存量号位每 5 分钟拉一次，上游开销是 **0 次请求**，
+只有真正的新 key 才花一次验活。这是整套方案不需要额外状态文件的原因。
+
+### 字段映射的一个坑
+
+`aws_region` 落到 `apiRegion` 而**不是** `region`。endpoint 层用
+`effective_api_region` 拼 `q.{region}.amazonaws.com`
+（[ide.rs:26](src/kiro/endpoint/ide.rs#L26)），而 `region` 走的是 OIDC 刷新链路 ——
+api_key 凭据根本不刷新 token，填 `region` 只是噪音。
+
+**验活默认开启**。不是为了保险：`supports_opus()` 在 `subscription_title` 为 `None`
+时返回 `true`（[credentials.rs:509](src/kiro/model/credentials.rs#L509)），
+未验活的 Free key 会被放进 Opus 调度然后失败；验活顺带把订阅等级填上。
+
+### key 是短命的：清理策略
+
+观测到的两条 `warrantyUntil - claimTime` 都正好 2 小时。不处理的话
+`credentials.json` 会堆满死 key，调度器持续撞失败、触发自愈 churn。
+
+**没有做「到点即删」** —— 保修期过了 key 未必失效，硬删会浪费还能用的号。
+改为交给现有失败计数 / 自愈自然淘汰，再加一道精准善后（`reapDisabled`，默认关闭）：
+只删同时满足三条的凭据 —— `sourceChannel` 带 `keyfeed:` 前缀、已禁用、
+且禁用原因**不是** `Manual`（手动禁用是运维显式意图，例如留着排查）。
+
+`warrantyUntil` 仍然解析并回传前端展示（含「最早到保」与剩余时长），只是不触发删除。
+
+### 地址完全可配置（零硬编码）
+
+源地址、令牌、令牌参数名全在 `keyFeed` 配置里，代码中不含任何具体域名。换源只改 URL，
+只要返回结构一致就能直接用。三个入口都行：Admin UI 弹窗、`PUT /api/admin/config/key-feed`、
+直接编辑 `config.json`。
+
+UI 入口在顶栏「设置」齿轮菜单 →「凭据来源 / API Key 订阅源」（窄屏在 ⋯ 菜单同一位置）。
+起初这个按钮是平铺在顶栏的，结果撞上顶栏本就存在的布局缺陷 —— 见上一节
+「顶栏按钮重叠盖住『请求日志』tab」。
+
+**`tokenParam` 可配（默认 `token`）**。不同源的鉴权参数名不一样
+（`token` / `key` / `accessKey`…），做成可配置不是为了"灵活"，而是**让脱敏对任意源都成立**：
+只有参数名匹配，才能把令牌拆到独立字段、让 Admin API 只回 `tokenSet`。否则令牌会留在
+`url` 里被接口回显（这一点在实测中确认过）。参数名大小写不敏感。
+
+### 安全边界
+
+- 令牌与 URL **分开存**。粘贴完整链接时 `split_url_and_token` 在入口按 `tokenParam`
+  拆开；Admin API 只回 `tokenSet` 布尔，从不回显明文（与 `github_token` 同思路）
+- reqwest 的错误信息会把请求 URL 原样带上（含令牌），进日志/响应前先过
+  `redact_token` 换成 `<REDACTED>`
+- URL 强制 http/https 且必须可解析；端点名沿用 `add_credential` 的注册表校验
+- `intervalSecs` 有 60 秒硬下限，**落盘前就夹取** —— 若存原始值，将来下限调低会让
+  那个值静默变成生效值
+
+### 一个只在"换源"时才会暴露的坑
+
+`split_url_and_token` 原先无条件用 `Url::query_pairs_mut` 重建查询串。实测发现它会按
+`application/x-www-form-urlencoded` 重新编码，把 `%20` 改写成 `+`：
+
+```
+in : https://other.example.com/fetch?t=xyz&note=hello%20world
+out: https://other.example.com/fetch?t=xyz&note=hello+world   ← 变了
+```
+
+多数服务器两者都当空格，所以对当前那个源无影响。但只要换成的源在链接里带 HMAC /
+签名类参数，任何一个字节的改写都会让签名校验失败 —— 而且表现为"换了个地址就一直 401"，
+极难定位到是中转层改写了 URL。
+
+修法：**先只检测、不改 URL**，没有目标参数就原样返回输入字符串，一个字节都不碰。
+`test_split_url_preserves_bytes_when_no_token_param` 钉住这个行为（含签名参数、`%20`、
+大小写、路径里带 `token` 字样等 5 个用例）。做过反向验证：去掉快速路径该测试即失败。
+
+### 端到端验证
+
+临时目录起服务实测（均已清理）。真源部分：
+
+- 首轮拉取 → `imported: 2`，`apiRegion` 分别 `eu-central-1` / `us-east-1`，
+  `sourceChannel` 带 `keyfeed:` 前缀，无 `region` 噪音
+- 第二轮 → `imported: 0, duplicate: 2`，验证幂等
+- reaper 三方鉴别：造 `#1` Manual(keyfeed) / `#2` TooManyFailures(keyfeed) /
+  `#3` TooManyFailures(手工添加) → 只删 `#2`
+- 坏 token → 回上游原因「无效的领取令牌」，响应内 grep 不到 token
+- 非 http scheme / 不可解析 URL / 未注册端点 → 均 400
+- 后台调度器自行触发并**持续循环**（`pulledAt` 03:20:27 → 03:21:29），
+  且全去重那轮降到 debug 不刷屏
+
+**换源验证**（写了个 mock 源，故意换掉全部三要素：不同 host+port、路径 `/v2/dispense`
+而非 `/get`、鉴权参数 `accessKey` 而非 `token`）：
+
+- 指定 `tokenParam: "accessKey"` → `url` 里的密钥被拆走，响应 `tokenSet: true`，
+  grep 不到密钥；请求被正确拼回 `?accessKey=`，mock 源返回 200
+- `status: "expired"` 的号位被过滤（`total: 3` → `candidates: 2`）
+- 新区域 `ap-northeast-1` / `eu-west-1` 正常入库
+
+**向后兼容**：旧 `config.json` 缺 `tokenParam` → 回退 `token`，其余字段（间隔 600 /
+验活 true / 优先级 2）原样保留；完全没有 `keyFeed` 段 → 全默认（间隔 300、验活开），
+未配置 URL 时拉取干净报「未配置订阅源 URL」而非 panic。
+
+`cargo test` 761 passed / 0 failed（新增 17 个 key_feed 单测）；
+`key_feed.rs` clippy 零 warning；前端 `tsc -b` + build 通过。
+
+> **注意**：那个 GET 返回的 `msg` 是「已进拼车队列…正在补货」，带 `claimId`/`seatNo`。
+> 无法确定重复调用是纯读列表还是每次占座，故默认间隔 300 秒。若服务方语义是后者，
+> 应把间隔调大。
+
+---
+
 ## 2026-08-06 — 合并上游 v0.7.5
 
 上游 `ae99f5a..a2f4d7f`，25 个提交，0.7.3 → 0.7.5。**28 处冲突全部人工解决**。
