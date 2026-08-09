@@ -1,6 +1,7 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
+  ClientKeyPlaintextResponse,
   ClientKeysResponse,
   CreateClientKeyRequest,
   CreateClientKeyResponse,
@@ -60,5 +61,11 @@ export async function resetClientKeyStats(id: number): Promise<SuccessResponse> 
 
 export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
   const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
+  return data
+}
+
+/** 回看既有 Key 的明文（明文不进列表接口，按需单独取） */
+export async function revealClientKey(id: number): Promise<ClientKeyPlaintextResponse> {
+  const { data } = await api.get<ClientKeyPlaintextResponse>(`/client-keys/${id}/reveal`)
   return data
 }

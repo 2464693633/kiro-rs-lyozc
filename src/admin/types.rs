@@ -1061,10 +1061,23 @@ pub struct CreateClientKeyRequest {
     pub cache_engine: crate::anthropic::cache_engine::CacheEngineKind,
 }
 
-/// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
+/// 创建客户端 Key 响应（创建/轮换后立刻返回新明文）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateClientKeyResponse {
+    pub id: u64,
+    pub key: String,
+    pub name: String,
+    pub created_at: String,
+}
+
+/// 查看既有客户端 Key 明文的响应。
+///
+/// 形状与 `CreateClientKeyResponse` 相同，但**刻意不复用**：两者语义不同
+/// （一个是"刚生成的新值"、一个是"回看旧值"），日后其中一方加字段时不应牵连另一方。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientKeyPlaintextResponse {
     pub id: u64,
     pub key: String,
     pub name: String,

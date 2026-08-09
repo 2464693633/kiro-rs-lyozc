@@ -16,13 +16,26 @@ import {
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
-  useRotateClientKey,
+  useRotateClientKey, useRevealClientKey,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { CacheEngineKind, ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import type {
+  CacheEngineKind, ClientKeyItem, ClientKeyPlaintextResponse, CreateClientKeyResponse,
+} from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
+
+/**
+ * 明文展示对话框的状态。
+ *
+ * `mode` 只影响文案与按钮：`created` / `rotated` 是**刚生成的新值**（后者意味着旧值已失效，
+ * 下游必须换上），`revealed` 是**回看已有值**（随时可再看，不必强调"仅此一次"）。
+ */
+type PlainKeyDialogState = {
+  mode: 'created' | 'rotated' | 'revealed'
+  data: CreateClientKeyResponse | ClientKeyPlaintextResponse
+}
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -50,6 +63,7 @@ export function ClientKeysPage() {
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
+  const revealKey = useRevealClientKey()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
@@ -57,8 +71,8 @@ export function ClientKeysPage() {
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
   const [createEngine, setCreateEngine] = useState<CacheEngineKind>('rust')
-  const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
-  const [showCreatedPlain, setShowCreatedPlain] = useState(true)
+  const [plainKey, setPlainKey] = useState<PlainKeyDialogState | null>(null)
+  const [showPlain, setShowPlain] = useState(true)
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
@@ -80,13 +94,13 @@ export function ClientKeysPage() {
         group: createGroup.trim() || undefined,
         cacheEngine: createEngine,
       })
-      setCreatedKey(res)
+      setPlainKey({ mode: 'created', data: res })
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
       setCreateEngine('rust')
-      setShowCreatedPlain(true)
+      setShowPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
     }
@@ -143,7 +157,7 @@ export function ClientKeysPage() {
     if (
       !(await confirm({
         title: '重新生成 Key',
-        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
+        description: `重新生成 Key "${item.name}"？旧明文进入 7 天宽限期，期间仍可正常调用，方便下游逐步换上新明文；7 天后自动失效。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
         confirmText: '重新生成',
         destructive: true,
       }))
@@ -151,14 +165,25 @@ export function ClientKeysPage() {
       return
     try {
       const res = await rotateKey.mutateAsync(item.id)
-      setCreatedKey(res)
-      setShowCreatedPlain(true)
+      setPlainKey({ mode: 'rotated', data: res })
+      setShowPlain(true)
       // 系统密钥轮换后本地存储的 apiKey 已失效，提示用户用新明文重新登录
       if (item.isSystem) {
         toast.info('系统密钥已更新，若你正用该密钥登录管理面板，请用新明文重新登录')
       }
     } catch (err) {
       toast.error('重新生成失败：' + extractErrorMessage(err))
+    }
+  }
+
+  /** 回看旧 Key 明文：不改任何状态，只把明文取回来展示 */
+  const handleReveal = async (item: ClientKeyItem) => {
+    try {
+      const res = await revealKey.mutateAsync(item.id)
+      setPlainKey({ mode: 'revealed', data: res })
+      setShowPlain(true)
+    } catch (err) {
+      toast.error('获取明文失败：' + extractErrorMessage(err))
     }
   }
 
@@ -295,15 +320,22 @@ export function ClientKeysPage() {
                           <button
                             type="button"
                             className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            title="点击展开 Key 操作"
+                            title="点击查看明文 / 重新生成"
                           >
                             {k.maskedKey}
                           </button>
                         </DropdownMenuTrigger>
                         <DropdownMenuContent align="start">
+                          <DropdownMenuItem
+                            onSelect={() => handleReveal(k)}
+                            disabled={revealKey.isPending}
+                          >
+                            <Eye className="h-3.5 w-3.5" />
+                            查看 Key 明文
+                          </DropdownMenuItem>
                           <DropdownMenuItem onSelect={() => handleRotate(k)}>
                             <RefreshCw className="h-3.5 w-3.5" />
-                            重新生成 Key（旧 Key 立即失效）
+                            重新生成 Key（旧 Key 保留 7 天宽限期）
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
@@ -384,7 +416,7 @@ export function ClientKeysPage() {
           <DialogHeader>
             <DialogTitle>新建客户端 Key</DialogTitle>
             <DialogDescription>
-              创建后明文 Key 仅显示一次，请立即复制保存到安全位置。
+              创建后会展示明文 Key，请复制保存到安全位置（日后也可从列表回看）。
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleCreate} className="space-y-3 py-2">
@@ -482,24 +514,35 @@ export function ClientKeysPage() {
         </DialogContent>
       </Dialog>
 
-      {/* 创建后明文展示对话框 */}
-      <Dialog open={!!createdKey} onOpenChange={(o) => { if (!o) setCreatedKey(null) }}>
+      {/* 明文展示对话框：新建 / 轮换后展示新值，或回看已有值 */}
+      <Dialog open={!!plainKey} onOpenChange={(o) => { if (!o) setPlainKey(null) }}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <KeyRound className="h-4 w-4 text-emerald-500" />
-              Key 已生成
+              {plainKey?.mode === 'created'
+                ? 'Key 已生成'
+                : plainKey?.mode === 'rotated'
+                ? 'Key 已重新生成'
+                : 'Key 明文'}
             </DialogTitle>
             <DialogDescription>
-              这是 Key "{createdKey?.name}" 的明文。<strong>关闭对话框后将无法再查看</strong>，请立即复制。
+              这是 Key "{plainKey?.data.name}" 的明文。
+              {plainKey?.mode === 'rotated' ? (
+                <> 旧明文进入 7 天宽限期（期间仍可调用），请在此之前把下游换成这一条。</>
+              ) : plainKey?.mode === 'created' ? (
+                <> 请复制保存；日后也可在列表里点 Key 重新查看。</>
+              ) : (
+                <> 可随时从列表里的 Key 列重新查看。</>
+              )}
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
             <div className="relative">
               <Input
                 readOnly
-                type={showCreatedPlain ? 'text' : 'password'}
-                value={createdKey?.key ?? ''}
+                type={showPlain ? 'text' : 'password'}
+                value={plainKey?.data.key ?? ''}
                 className="pr-20 font-mono text-[13px]"
               />
               <div className="absolute inset-y-0 right-0 flex items-center pr-1">
@@ -508,17 +551,17 @@ export function ClientKeysPage() {
                   size="icon"
                   variant="ghost"
                   className="h-7 w-7"
-                  onClick={() => setShowCreatedPlain((v) => !v)}
-                  title={showCreatedPlain ? '隐藏' : '显示'}
+                  onClick={() => setShowPlain((v) => !v)}
+                  title={showPlain ? '隐藏' : '显示'}
                 >
-                  {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  {showPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
                 </Button>
                 <Button
                   type="button"
                   size="icon"
                   variant="ghost"
                   className="h-7 w-7"
-                  onClick={() => createdKey && copyText(createdKey.key)}
+                  onClick={() => plainKey && copyText(plainKey.data.key)}
                   title="复制"
                 >
                   <Copy className="h-3.5 w-3.5" />
@@ -530,7 +573,9 @@ export function ClientKeysPage() {
             </p>
           </div>
           <DialogFooter>
-            <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
+            <Button onClick={() => setPlainKey(null)}>
+              {plainKey?.mode === 'revealed' ? '关闭' : '我已保存好'}
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

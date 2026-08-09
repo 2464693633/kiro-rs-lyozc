@@ -21,7 +21,8 @@ use super::{
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        BillingConfigPayload, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        BillingConfigPayload, ClientKeyItem, ClientKeyPlaintextResponse, ClientKeysResponse,
+        CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
         ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
         SetDisabledRequest, SetGlobalProxyRequest, SetKeyFeedConfigRequest,
@@ -1311,6 +1312,41 @@ pub async fn set_client_key_disabled(
     }
 }
 
+/// GET /api/admin/client-keys/:id/reveal
+///
+/// 回看既有 Key 的明文。列表接口只给脱敏值，明文走这个单独端点按需取，
+/// 这样每 30s 的列表轮询不会把所有明文反复送上网络。
+///
+/// 明文本就以原值存在 `client_api_keys.json`（鉴权需要按原值比较，不做 hash），
+/// 所以这里不是"降低了安全等级"，只是把已有的信息交给已通过管理端鉴权的调用方。
+pub async fn reveal_client_key(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    match state.client_keys.get(id) {
+        Some(entry) => {
+            // 留一条审计痕迹：明文外泄排查时能知道何时被读过（只记 id/名称，不记明文）
+            tracing::info!(key_id = id, name = %entry.name, "管理端查看客户端 Key 明文");
+            Json(ClientKeyPlaintextResponse {
+                id: entry.id,
+                key: entry.key,
+                name: entry.name,
+                created_at: entry.created_at,
+            })
+            .into_response()
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response(),
+    }
+}
+
 /// POST /api/admin/client-keys/:id/reset-stats
 pub async fn reset_client_key_stats(
     State(state): State<AdminState>,
@@ -1333,7 +1369,8 @@ pub async fn reset_client_key_stats(
 
 /// POST /api/admin/client-keys/:id/rotate
 ///
-/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
+/// 轮换 Key 值：生成新明文返回。旧明文转为宽限 Key（7 天内仍可调用），
+/// 需要立刻掐断用 `ClientKeyManager::revoke_prev_key`。
 /// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
 pub async fn rotate_client_key(
     State(state): State<AdminState>,

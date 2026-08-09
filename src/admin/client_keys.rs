@@ -19,6 +19,13 @@ use subtle::ConstantTimeEq;
 
 use crate::anthropic::cache_engine::CacheEngineKind;
 
+/// 轮换后旧明文的宽限期：7 天。
+///
+/// 存在的理由是下游迁移需要时间 —— 轮换的瞬间就让旧明文失效，等于要求所有下游同时换完。
+/// 但宽限期**与应急撤销直接冲突**（泄露的那把在窗口内仍然有效），所以必须配合
+/// [`ClientKeyManager::revoke_prev_key`] 一起用：宽限是默认路径，撤销是逃生门。
+pub const PREV_KEY_GRACE_DAYS: i64 = 7;
+
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +33,21 @@ pub struct ClientKey {
     pub id: u64,
     /// 明文 Key（中转站场景，校验需原值，不做 hash）
     pub key: String,
+    /// 上一把明文（轮换后的宽限期内仍可鉴权）。`None` 表示没有处于宽限期的旧值。
+    ///
+    /// 只保留**一把** —— 连续轮换两次会丢掉更早的那把，否则宽限 Key 会无上限累积，
+    /// 每一把都是一个还能进门的凭据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_key: Option<String>,
+    /// `prev_key` 的到期时刻（RFC3339）。到点后鉴权拒绝，并在下次落盘时清掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_key_expires_at: Option<String>,
+    /// `prev_key` 最后一次被用于鉴权的时刻（RFC3339）。
+    ///
+    /// 这是「下游迁完了没有」的唯一可靠信号：宽限期内它一直在更新，就说明还有下游在用旧值；
+    /// 一直是 `None` 或很久没动，才敢提前撤销。持久化而非只记日志，是为了重启后仍然可见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_key_last_used_at: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -200,6 +222,9 @@ impl ClientKeyManager {
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
             cache_engine: CacheEngineKind::default(),
+            prev_key: None,
+            prev_key_expires_at: None,
+            prev_key_last_used_at: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -244,6 +269,9 @@ impl ClientKeyManager {
                     group: None,
                     is_system: true,
                     cache_engine: CacheEngineKind::default(),
+                    prev_key: None,
+                    prev_key_expires_at: None,
+                    prev_key_last_used_at: None,
                 },
             );
             changed = true;
@@ -353,6 +381,14 @@ impl ClientKeyManager {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
     }
 
+    /// 按 id 取整条快照（**含明文 `key` 字段**）。
+    ///
+    /// 供管理端「查看 Key 明文」使用：列表接口只回脱敏值，明文按需单独取，
+    /// 避免每 30s 的列表轮询把所有明文反复送上网络。
+    pub fn get(&self, id: u64) -> Option<ClientKey> {
+        self.inner.read().entries.get(&id).cloned()
+    }
+
     /// 返回指定 Key 选择的缓存模拟引擎；Key 不存在时回落默认（引擎 A）。
     pub fn cache_engine_of(&self, id: u64) -> CacheEngineKind {
         self.inner
@@ -431,15 +467,35 @@ impl ClientKeyManager {
         affected
     }
 
-    /// 生成新明文并保留 id、元数据、分组、统计及状态；旧明文立即失效。
+    /// 生成新明文并保留 id、元数据、分组、统计及状态。
+    ///
+    /// 旧明文**不立即失效**：转为宽限 Key，[`PREV_KEY_GRACE_DAYS`] 天内仍可进门，
+    /// 便于下游逐步迁移。需要立刻掐断（如明文泄露）用 [`Self::revoke_prev_key`]。
+    ///
     /// 系统 Key 的调用方必须同步 `config.apiKey`，否则重启时配置值会覆盖轮换结果。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
         let new_key = generate_client_key();
+        let expires_at = (Utc::now() + chrono::Duration::days(PREV_KEY_GRACE_DAYS)).to_rfc3339();
         let mut inner = self.inner.write();
+
+        // 更早的那把宽限 Key 在这里被丢弃：只保留一把，否则每轮换一次就多一个能进门的凭据。
+        let stale_prev = inner
+            .entries
+            .get_mut(&id)
+            .and_then(|e| e.prev_key.take())
+            .filter(|stale| *stale != new_key);
+        if let Some(stale) = stale_prev {
+            inner.by_key.remove(&stale);
+        }
+
         let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
-        inner.by_key.remove(&old_key);
+        // 刻意**不**从 by_key 移除 old_key —— 它转为宽限 Key，仍要对判重可见，
+        // 否则后续 create_with_key 可能生成一把与它相同的明文。
         let entry = inner.entries.get_mut(&id)?;
         entry.key = new_key.clone();
+        entry.prev_key = Some(old_key);
+        entry.prev_key_expires_at = Some(expires_at);
+        entry.prev_key_last_used_at = None;
         let snapshot = entry.clone();
         inner.by_key.insert(new_key, id);
         self.save_locked(&inner);
@@ -469,21 +525,60 @@ impl ClientKeyManager {
 
     /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
+        let now = Utc::now();
         let mut inner = self.inner.write();
-        let mut hit_id: Option<u64> = None;
+        // (id, 命中的是否为宽限期内的旧明文)
+        let mut hit: Option<(u64, bool)> = None;
+        // 已到期的宽限 Key：(id, 明文)。扫完后统一清理，不在比较循环里改状态。
+        let mut expired: Vec<(u64, String)> = Vec::new();
+
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
                 continue;
             }
             if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
-                hit_id = Some(*id);
+                hit = Some((*id, false));
                 // 不 break，继续完整扫描以保持常量时间
             }
+            if let Some(prev) = ck.prev_key.as_deref() {
+                // 缺时间戳或解析失败都按**已过期**处理 —— 一个坏时间戳不该换来无限期有效。
+                let live = ck
+                    .prev_key_expires_at
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|exp| exp.with_timezone(&Utc) > now)
+                    .unwrap_or(false);
+                // 比较**无条件**执行：宽限 Key 是否已过期，不该从耗时上被观测出来。
+                let matched: bool = prev.as_bytes().ct_eq(presented.as_bytes()).into();
+                if live {
+                    if matched {
+                        hit = Some((*id, true));
+                    }
+                } else {
+                    expired.push((*id, prev.to_string()));
+                }
+            }
         }
-        let id = hit_id?;
+
+        // 清理只在内存里做，落盘交给下一次 record_usage —— 与本函数「不为每次请求落盘」的
+        // 既有取舍一致。若进程在那之前重启，过期值会被重新读进来，但 verify 仍然拒绝它并再次清理。
+        for (id, stale) in expired {
+            inner.by_key.remove(&stale);
+            if let Some(e) = inner.entries.get_mut(&id) {
+                e.prev_key = None;
+                e.prev_key_expires_at = None;
+                e.prev_key_last_used_at = None;
+            }
+        }
+
+        let (id, via_grace) = hit?;
         if let Some(entry) = inner.entries.get_mut(&id) {
             entry.total_calls += 1;
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.last_used_at = Some(now.to_rfc3339());
+            if via_grace {
+                entry.prev_key_last_used_at = Some(now.to_rfc3339());
+                tracing::debug!(key_id = id, "客户端 Key 命中宽限期内的旧明文（下游尚未迁完）");
+            }
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
         Some(id)
@@ -750,14 +845,161 @@ mod tests {
         assert_eq!(rotated.group.as_deref(), Some("groupA"));
         assert_eq!(rotated.total_input_tokens, 100);
         assert_eq!(rotated.total_output_tokens, 50);
-        assert_eq!(mgr.verify_and_touch(&old_key), None);
+        // 行为已变更：旧明文进入 7 天宽限期，不再立即失效。
+        // 「立即失效」现在是 revoke_prev_key 的职责，见 grace_key_expiry_and_revoke。
+        assert_eq!(
+            mgr.verify_and_touch(&old_key),
+            Some(entry.id),
+            "轮换后旧明文应在宽限期内仍可鉴权"
+        );
         assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
+        assert_eq!(
+            rotated.prev_key.as_deref(),
+            Some(old_key.as_str()),
+            "旧明文应被记为 prev_key"
+        );
+        assert!(rotated.prev_key_expires_at.is_some(), "宽限期应有到期时刻");
     }
 
     #[test]
     fn rotate_unknown_id_returns_none() {
         let mgr = ClientKeyManager::new();
         assert!(mgr.rotate(999).is_none());
+    }
+
+    /// 造一份带 `prevKey` 的 JSON 再 load —— 用来精确控制到期时刻（等 7 天不现实），
+    /// 顺带覆盖新字段的反序列化路径。
+    fn load_with_grace(expires_at: &str) -> (ClientKeyManager, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-grace-{}-{:?}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            std::thread::current().id()
+        ));
+        let json = format!(
+            r#"[{{
+                "id": 1, "key": "sk-new", "name": "宽限测试",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "prevKey": "sk-old", "prevKeyExpiresAt": "{expires_at}"
+            }}]"#
+        );
+        std::fs::write(&path, json).unwrap();
+        let mgr = ClientKeyManager::load(&path).unwrap();
+        (mgr, path)
+    }
+
+    /// 宽限期内：新旧两把明文都能鉴权。
+    #[test]
+    fn grace_key_works_within_window() {
+        let future = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        let (mgr, path) = load_with_grace(&future);
+        assert_eq!(mgr.verify_and_touch("sk-old"), Some(1), "宽限期内旧明文应可用");
+        assert_eq!(mgr.verify_and_touch("sk-new"), Some(1), "当前明文应可用");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 过期后：旧明文必须失效，且被扫掉；当前明文不受影响。
+    #[test]
+    fn grace_key_rejected_after_expiry_and_swept() {
+        let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let (mgr, path) = load_with_grace(&past);
+        assert_eq!(mgr.verify_and_touch("sk-old"), None, "过期后旧明文必须失效");
+
+        let entry = mgr.get(1).expect("条目应存在");
+        assert!(entry.prev_key.is_none(), "过期的宽限 Key 应被清掉");
+        assert!(entry.prev_key_expires_at.is_none(), "到期时刻应一并清掉");
+        assert_eq!(mgr.verify_and_touch("sk-new"), Some(1), "当前明文不受影响");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 坏时间戳按**已过期**处理（fail closed）。
+    ///
+    /// 反过来（解析失败就当永久有效）会让一个手工编辑坏掉的 JSON 变成永不过期的后门。
+    #[test]
+    fn malformed_grace_expiry_fails_closed() {
+        let (mgr, path) = load_with_grace("not-a-timestamp");
+        assert_eq!(
+            mgr.verify_and_touch("sk-old"),
+            None,
+            "坏时间戳应按已过期处理，而不是换来无限期有效"
+        );
+        assert_eq!(mgr.verify_and_touch("sk-new"), Some(1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 连续轮换两次：更早那把必须被丢弃，否则宽限 Key 会无上限累积。
+    #[test]
+    fn second_rotation_drops_earlier_grace_key() {
+        let mgr = ClientKeyManager::new();
+        let v1 = mgr.create("k".into(), None, None, CacheEngineKind::default());
+        let k1 = v1.key.clone();
+
+        let v2 = mgr.rotate(v1.id).expect("第一次轮换应成功");
+        let k2 = v2.key.clone();
+        assert_eq!(mgr.verify_and_touch(&k1), Some(v1.id), "k1 应进入宽限期");
+
+        let v3 = mgr.rotate(v1.id).expect("第二次轮换应成功");
+        assert_eq!(mgr.verify_and_touch(&k1), None, "第二次轮换应丢掉 k1");
+        assert_eq!(mgr.verify_and_touch(&k2), Some(v1.id), "k2 成为新的宽限 Key");
+        assert_eq!(mgr.verify_and_touch(&v3.key), Some(v1.id), "v3 是当前明文");
+        assert_eq!(v3.prev_key.as_deref(), Some(k2.as_str()));
+    }
+
+    /// `prev_key_last_used_at` 是「下游迁完了没有」的信号，只该被宽限 Key 的命中更新。
+    #[test]
+    fn grace_key_hit_records_migration_signal() {
+        let mgr = ClientKeyManager::new();
+        let v1 = mgr.create("k".into(), None, None, CacheEngineKind::default());
+        let old = v1.key.clone();
+        let v2 = mgr.rotate(v1.id).expect("轮换应成功");
+        assert!(
+            v2.prev_key_last_used_at.is_none(),
+            "刚轮换时旧值还没被用过，信号应为空"
+        );
+
+        assert_eq!(mgr.verify_and_touch(&old), Some(v1.id));
+        let after_grace_hit = mgr.get(v1.id).expect("条目应存在").prev_key_last_used_at;
+        assert!(
+            after_grace_hit.is_some(),
+            "宽限 Key 被命中后应留下时间戳 —— 这是判断能否提前撤销的依据"
+        );
+
+        assert_eq!(mgr.verify_and_touch(&v2.key), Some(v1.id));
+        assert_eq!(
+            mgr.get(v1.id).expect("条目应存在").prev_key_last_used_at,
+            after_grace_hit,
+            "命中当前明文不该改动宽限信号"
+        );
+    }
+
+    /// `get` 供「查看 Key 明文」用：必须回完整明文，且轮换后只能回**新**值。
+    ///
+    /// 后半段是关键 —— 若 `get` 读到的是过期快照，管理端回看到旧明文，
+    /// 用户拿去配下游会得到 401，而界面看起来完全正常。
+    #[test]
+    fn get_returns_plaintext_and_follows_rotation() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create(
+            "回看".into(),
+            Some("desc".into()),
+            None,
+            CacheEngineKind::default(),
+        );
+
+        let fetched = mgr.get(entry.id).expect("已存在的 id 应能取到");
+        assert_eq!(fetched.key, entry.key, "应回完整明文而非脱敏值");
+        assert_eq!(fetched.name, "回看");
+        assert_eq!(fetched.description.as_deref(), Some("desc"));
+
+        assert!(mgr.get(9999).is_none(), "未知 id 应回 None（端点回 404）");
+
+        let old_key = entry.key.clone();
+        let rotated = mgr.rotate(entry.id).expect("rotate 应成功");
+        let after = mgr.get(entry.id).expect("轮换后仍应取到");
+        assert_eq!(after.key, rotated.key, "轮换后必须回新明文");
+        assert_ne!(after.key, old_key, "绝不能回已失效的旧明文");
     }
 
     #[test]

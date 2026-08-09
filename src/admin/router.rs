@@ -46,6 +46,7 @@ use super::{
         reset_client_key_stats,
         reset_failure_count,
         reset_success_count,
+        reveal_client_key,
         rollback_image_update,
         rotate_client_key,
         set_account_rpm_limit_config,
@@ -246,6 +247,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
             post(reset_client_key_stats),
         )
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
+        .route("/client-keys/{id}/reveal", get(reveal_client_key))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/stats/overview", get(stats_overview))

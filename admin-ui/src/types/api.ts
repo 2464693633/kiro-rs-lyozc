@@ -440,8 +440,21 @@ export interface CreateClientKeyRequest {
   cacheEngine?: CacheEngineKind
 }
 
-/** 创建响应：明文 Key 仅在此处返回一次 */
+/** 创建/轮换响应：返回刚生成的新明文 */
 export interface CreateClientKeyResponse {
+  id: number
+  key: string
+  name: string
+  createdAt: string
+}
+
+/**
+ * 查看既有 Key 明文的响应（`GET /client-keys/:id/reveal`）。
+ *
+ * 形状与 `CreateClientKeyResponse` 相同但不复用，与后端
+ * `ClientKeyPlaintextResponse` 一一对应：一个是「刚生成的新值」、一个是「回看旧值」。
+ */
+export interface ClientKeyPlaintextResponse {
   id: number
   key: string
   name: string
