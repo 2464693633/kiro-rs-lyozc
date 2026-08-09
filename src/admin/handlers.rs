@@ -1369,8 +1369,7 @@ pub async fn reset_client_key_stats(
 
 /// POST /api/admin/client-keys/:id/rotate
 ///
-/// 轮换 Key 值：生成新明文返回。旧明文转为宽限 Key（7 天内仍可调用），
-/// 需要立刻掐断用 `ClientKeyManager::revoke_prev_key`。
+/// 轮换 Key 值：生成新明文返回，**旧明文立即失效**（曾有 7 天宽限期，已移除）。
 /// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
 pub async fn rotate_client_key(
     State(state): State<AdminState>,

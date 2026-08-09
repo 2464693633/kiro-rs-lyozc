@@ -157,7 +157,7 @@ export function ClientKeysPage() {
     if (
       !(await confirm({
         title: '重新生成 Key',
-        description: `重新生成 Key "${item.name}"？旧明文进入 7 天宽限期，期间仍可正常调用，方便下游逐步换上新明文；7 天后自动失效。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
+        description: `重新生成 Key "${item.name}"？旧明文立即失效，使用旧明文的下游会马上收到 401，需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
         confirmText: '重新生成',
         destructive: true,
       }))
@@ -335,7 +335,7 @@ export function ClientKeysPage() {
                           </DropdownMenuItem>
                           <DropdownMenuItem onSelect={() => handleRotate(k)}>
                             <RefreshCw className="h-3.5 w-3.5" />
-                            重新生成 Key（旧 Key 保留 7 天宽限期）
+                            重新生成 Key（旧 Key 立即失效）
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
@@ -529,7 +529,7 @@ export function ClientKeysPage() {
             <DialogDescription>
               这是 Key "{plainKey?.data.name}" 的明文。
               {plainKey?.mode === 'rotated' ? (
-                <> 旧明文进入 7 天宽限期（期间仍可调用），请在此之前把下游换成这一条。</>
+                <> 旧明文已失效，使用旧明文的下游需要换上这一条才能继续调用。</>
               ) : plainKey?.mode === 'created' ? (
                 <> 请复制保存；日后也可在列表里点 Key 重新查看。</>
               ) : (
