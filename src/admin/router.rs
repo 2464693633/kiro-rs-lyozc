@@ -26,6 +26,7 @@ use super::{
         get_credential_models,
         get_current_models,
         get_global_proxy,
+        get_key_feed_config,
         get_load_balancing_mode,
         get_log_governance_config,
         get_proxy_pool,
@@ -39,6 +40,7 @@ use super::{
         poll_idc_relogin,
         poll_social_login,
         poll_social_relogin,
+        pull_key_feed,
         pull_update_image,
         reset_all_success_count,
         reset_client_key_stats,
@@ -55,6 +57,7 @@ use super::{
         set_credential_overage,
         set_credential_priority,
         set_global_proxy,
+        set_key_feed_config,
         set_load_balancing_mode,
         set_log_governance_config,
         set_proxy_enabled,
@@ -190,6 +193,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/config/update",
             get(get_update_config).put(set_update_config),
         )
+        .route(
+            "/config/key-feed",
+            get(get_key_feed_config).put(set_key_feed_config),
+        )
+        .route("/key-feed/pull", post(pull_key_feed))
         .route("/config/admin-key", put(update_admin_key))
         .route("/system/update/pull", post(pull_update_image))
         .route("/system/update/apply", post(apply_image_update))

@@ -348,6 +348,10 @@ async fn main() {
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();
 
+            // 启动 API Key 订阅源轮询调度器：keyFeed.enabled 关闭时空转，
+            // 从 UI 打开开关即热生效，无需重启。
+            admin_state.service.start_key_feed_scheduler();
+
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由

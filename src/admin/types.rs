@@ -784,6 +784,137 @@ pub struct SetUpdateConfigRequest {
     pub auto_apply_time: Option<String>,
 }
 
+/// API Key 订阅源配置（响应）。
+///
+/// 与 [`UpdateConfigResponse`] 的 `github_token_set` 同思路：token 只回布尔，
+/// 不回明文，避免管理面板前端持有可直接换号的凭证。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyFeedConfigResponse {
+    /// 是否启用后台轮询
+    pub enabled: bool,
+    /// 订阅源 URL（已剥离 token 查询参数）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// 是否已配置访问令牌（仅布尔，不回明文）
+    pub token_set: bool,
+    /// 令牌的查询参数名（不同源可能叫 token / key / accessKey）
+    pub token_param: String,
+    /// 生效的轮询间隔（秒，已夹到下限）
+    pub interval_secs: u64,
+    /// 导入时是否验活
+    pub verify: bool,
+    /// 导入凭据的优先级
+    pub priority: u32,
+    /// 导入凭据所属分组
+    pub groups: Vec<String>,
+    /// 导入凭据使用的端点名
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// 是否清理本源导入且已被自动禁用的凭据
+    pub reap_disabled: bool,
+    /// 最近一次拉取结果（进程内存，重启后清空）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_pull: Option<KeyFeedPullResult>,
+}
+
+/// 更新 API Key 订阅源配置（请求）。所有字段可选，未传表示保持原值。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetKeyFeedConfigRequest {
+    /// 是否启用后台轮询
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 订阅源 URL。可直接粘贴含 `?token=` 的完整链接，服务端会自动拆分出 token。
+    /// 空字符串表示清除。
+    #[serde(default)]
+    pub url: Option<String>,
+    /// 访问令牌。空字符串表示清除；未传保持原值。
+    #[serde(default)]
+    pub token: Option<String>,
+    /// 令牌的查询参数名（默认 `token`）。空字符串按默认处理。
+    ///
+    /// 与 `url` 同一请求传入时，会先用这个名字去拆 URL 里的令牌。
+    #[serde(default)]
+    pub token_param: Option<String>,
+    /// 轮询间隔（秒），低于下限会被夹取
+    #[serde(default)]
+    pub interval_secs: Option<u64>,
+    /// 导入时是否验活
+    #[serde(default)]
+    pub verify: Option<bool>,
+    /// 导入凭据的优先级
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// 导入凭据所属分组
+    #[serde(default)]
+    pub groups: Option<Vec<String>>,
+    /// 导入凭据使用的端点名。空字符串表示清除（回退 defaultEndpoint）。
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// 是否清理本源导入且已被自动禁用的凭据
+    #[serde(default)]
+    pub reap_disabled: Option<bool>,
+}
+
+/// 一次订阅源拉取的结果汇总。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyFeedPullResult {
+    /// 拉取时间（RFC3339）
+    pub pulled_at: String,
+    /// 是否成功完成拉取（`false` 时看 `error`）
+    pub success: bool,
+    /// 订阅源返回的号位总数
+    pub total: usize,
+    /// 过滤后可导入的候选数
+    pub candidates: usize,
+    /// 本轮新导入（含验活成功）的数量
+    pub imported: usize,
+    /// 命中去重、已在库中的数量
+    pub duplicate: usize,
+    /// 导入失败的数量
+    pub failed: usize,
+    /// 本轮被 reaper 清理的凭据数
+    pub reaped: usize,
+    /// 本轮所有候选号位中最早的保修截止时间（RFC3339）。
+    ///
+    /// 「下一个号什么时候到期」是运维最常问的问题，单独抽出来免得翻明细。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earliest_warranty_until: Option<String>,
+    /// 订阅源返回的提示文案（如「暂无可用号，正在补货」）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// 失败原因（token 已脱敏）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 逐条明细（不含密钥）
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<KeyFeedItemResult>,
+}
+
+/// 单条号位的导入结果（不含密钥）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyFeedItemResult {
+    /// 号位标识，形如 `渠道名#claimId`
+    pub label: String,
+    /// `imported` / `verified` / `duplicate` / `failed`
+    pub status: String,
+    /// 导入成功后的凭据 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    /// AWS 区域
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_region: Option<String>,
+    /// 保修截止时间（RFC3339）。仅展示，不触发自动删除。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warranty_until: Option<String>,
+    /// 失败原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// 在线更新操作结果
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -962,8 +1093,12 @@ pub struct CacheEnginesConfigPayload {
     pub nocache: Option<crate::model::config::CacheEngineNoCacheConfig>,
     /// 引擎 A 使用的全局膨胀倍率。
     ///
-    /// 纳入本 payload 是为了「一个窗口调完四套引擎」，与 `/config/token-inflation`
-    /// 是同一份存储的两个入口（不是两份数据）。顶栏那个入口保持不变，避免破坏现有用法。
+    /// 纳入本 payload 是为了「一个窗口调完四套引擎 + 全局」，与 `/config/token-inflation`
+    /// 是同一份存储的两个入口（不是两份数据）—— 两条路径都走
+    /// `token_manager.set_token_inflation_config`，校验区间同为 [1.0, 100.0]。
+    ///
+    /// `/config/token-inflation` 端点保持可用（供直接调 API 的使用者），
+    /// 但管理面板已把 UI 入口收敛到本 payload，不再提供两个改同一份数据的按钮。
     #[serde(default)]
     pub global: Option<GlobalInflationPayload>,
 }

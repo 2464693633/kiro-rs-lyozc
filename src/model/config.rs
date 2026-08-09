@@ -304,9 +304,158 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// API Key 订阅源（拼车链接）自动导入配置。
+    #[serde(default)]
+    pub key_feed: KeyFeedConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
+}
+
+/// API Key 订阅源自动导入配置。
+///
+/// 面向「拼车链接」这类持续发号的 HTTP 源：定期 GET 一个返回 API Key 列表的
+/// JSON 接口，把其中的新 key 自动导入为 `api_key` 类型凭据。
+///
+/// 去重完全依赖 `MultiTokenManager::add_credential` 已有的
+/// `sha256(kiroApiKey)` 指纹（在任何网络调用之前就 bail），所以轮询天然幂等，
+/// 无需本模块自己记账「哪些 key 已导入过」。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyFeedConfig {
+    /// 是否启用后台轮询。关闭时调度器空转，手动拉取端点仍可用。
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// 订阅源 URL（不含 token 查询参数）。
+    ///
+    /// token 单独存在 [`Self::token`]，便于 Admin API 只回 `tokenSet` 布尔而不回显明文。
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// 订阅源访问令牌，作为 `?{tokenParam}=` 拼到 [`Self::url`] 上。
+    #[serde(default)]
+    pub token: Option<String>,
+
+    /// 令牌的查询参数名，默认 `token`。
+    ///
+    /// 不同订阅源的鉴权参数名不一样（`token` / `key` / `accessKey`…）。做成可配置是为了
+    /// **让脱敏对任意源都成立**：只有参数名匹配，才能把令牌拆到 [`Self::token`] 单独存，
+    /// Admin API 才能只回 `tokenSet` 而不回显明文。否则令牌会留在 `url` 里被接口回显。
+    #[serde(default = "default_key_feed_token_param")]
+    pub token_param: String,
+
+    /// 轮询间隔（秒）。下限 60 秒，避免把上游发号接口打成限流。
+    #[serde(default = "default_key_feed_interval_secs")]
+    pub interval_secs: u64,
+
+    /// 导入时是否验活（拉一次余额）。
+    ///
+    /// 建议保持 `true`：`supports_opus()` 在 `subscription_title` 为 `None` 时返回
+    /// `true`，未验活的 Free key 会被放进 Opus 调度然后失败；验活顺带把订阅等级填上。
+    #[serde(default = "default_key_feed_verify")]
+    pub verify: bool,
+
+    /// 导入的凭据优先级（数字越小越优先）。
+    #[serde(default)]
+    pub priority: u32,
+
+    /// 导入的凭据所属分组。空数组表示不绑定分组。
+    #[serde(default)]
+    pub groups: Vec<String>,
+
+    /// 导入的凭据使用的端点名。`None` 表示回退 `defaultEndpoint`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// 是否清理本订阅源导入且**已被自动禁用**的凭据。
+    ///
+    /// 默认关闭。开启后每轮拉取结束会删除满足全部条件的凭据：
+    /// - `sourceChannel` 带本模块的 `keyfeed:` 前缀（不误伤手工添加的号）；
+    /// - 已禁用，且禁用原因不是 `Manual`（手动禁用视为运维显式意图，保留）。
+    ///
+    /// 注意这里不按 `warrantyUntil` 到点删：保修期过了 key 未必失效，硬删会浪费
+    /// 还能用的号。交给现有失败计数 / 自愈机制自然淘汰，这里只做善后。
+    #[serde(default)]
+    pub reap_disabled: bool,
+}
+
+impl Default for KeyFeedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            token: None,
+            token_param: default_key_feed_token_param(),
+            interval_secs: default_key_feed_interval_secs(),
+            verify: default_key_feed_verify(),
+            priority: 0,
+            groups: Vec::new(),
+            endpoint: None,
+            reap_disabled: false,
+        }
+    }
+}
+
+/// 轮询间隔的绝对下限（秒）。防止误配成个位数秒把上游打挂。
+pub const KEY_FEED_MIN_INTERVAL_SECS: u64 = 60;
+
+fn default_key_feed_interval_secs() -> u64 {
+    300
+}
+
+fn default_key_feed_verify() -> bool {
+    true
+}
+
+/// 令牌查询参数名的默认值。
+pub fn default_key_feed_token_param() -> String {
+    "token".to_string()
+}
+
+impl KeyFeedConfig {
+    /// 夹取到合法区间后的轮询间隔。
+    pub fn effective_interval_secs(&self) -> u64 {
+        self.interval_secs.max(KEY_FEED_MIN_INTERVAL_SECS)
+    }
+
+    /// 生效的令牌参数名（空配置回退到默认 `token`）。
+    pub fn effective_token_param(&self) -> &str {
+        let trimmed = self.token_param.trim();
+        if trimmed.is_empty() {
+            "token"
+        } else {
+            trimmed
+        }
+    }
+
+    /// 拼出完整请求 URL（`url` + `?{tokenParam}=`）。
+    ///
+    /// 未配置 `url` 时返回 `None`。`token` 为空时只返回 base URL —— 有些源把凭证放在
+    /// 路径里，或参数已经写在 `url` 上，不强制要求单独的 token。
+    pub fn request_url(&self) -> Option<String> {
+        let base = self.url.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        let token = self
+            .token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let Some(token) = token else {
+            return Some(base.to_string());
+        };
+
+        // base 可能自带查询串（用户直接粘了带其它参数的链接）
+        let separator = if base.contains('?') { '&' } else { '?' };
+        Some(format!(
+            "{}{}{}={}",
+            base,
+            separator,
+            urlencoding::encode(self.effective_token_param()),
+            urlencoding::encode(token)
+        ))
+    }
 }
 
 /// rust 缓存模拟引擎（`anthropic::cache_metering`）参数。
@@ -853,6 +1002,7 @@ impl Default for Config {
             cache_engine_nocache: CacheEngineNoCacheConfig::default(),
             billing: BillingConfig::default(),
             custom_models: Vec::new(),
+            key_feed: KeyFeedConfig::default(),
             config_path: None,
         }
     }

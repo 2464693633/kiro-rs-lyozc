@@ -24,7 +24,8 @@ use super::{
         BillingConfigPayload, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
         CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
         ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
+        SetDisabledRequest, SetGlobalProxyRequest, SetKeyFeedConfigRequest,
+        SetLoadBalancingModeRequest,
         SetLogGovernanceConfigRequest, SetPriorityRequest, SetSelfHealConfigRequest,
         SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
         StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
@@ -959,6 +960,32 @@ pub async fn set_global_proxy(
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/config/key-feed
+/// 获取 API Key 订阅源配置（token 只回布尔，不回明文）
+pub async fn get_key_feed_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_key_feed_config())
+}
+
+/// PUT /api/admin/config/key-feed
+/// 更新 API Key 订阅源配置（热生效 + 落盘）
+pub async fn set_key_feed_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetKeyFeedConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_key_feed_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/key-feed/pull
+///
+/// 立即拉取一次订阅源并导入其中的新 key。与后台调度共用同一把互斥锁，
+/// 不会与正在进行的自动轮询并发。
+pub async fn pull_key_feed(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.pull_key_feed().await)
 }
 
 /// GET /api/admin/config/update

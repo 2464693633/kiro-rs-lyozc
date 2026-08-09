@@ -27,9 +27,10 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
 };
-use crate::model::config::Config;
+use crate::model::config::{Config, KEY_FEED_MIN_INTERVAL_SECS, KeyFeedConfig};
 
 use super::error::AdminServiceError;
+use super::key_feed;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AccountRpmLimitConfigResponse,
@@ -68,6 +69,10 @@ use super::types::{
     SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest,
+    KeyFeedConfigResponse,
+    KeyFeedItemResult,
+    KeyFeedPullResult,
+    SetKeyFeedConfigRequest,
     SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest,
     SetSelfHealConfigRequest,
@@ -217,6 +222,7 @@ fn normalize_upstream_base_url(value: &str) -> Result<String, AdminServiceError>
 }
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImportStatus {
     Verified,
     /// 直接导入（未验活）成功
@@ -234,16 +240,22 @@ pub(crate) struct ImportItemResult {
     pub rolled_back: bool,
 }
 
-impl ImportItemResult {
-    /// 转换为 SSE 事件（携带在数组中的下标）
-    pub fn into_event(self, index: usize) -> BatchImportEvent {
-        let status = match self.status {
+impl ImportStatus {
+    /// 对外的稳定字符串表示（SSE 事件与订阅源明细共用）
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
             ImportStatus::Verified => "verified",
             ImportStatus::Imported => "imported",
             ImportStatus::Duplicate => "duplicate",
             ImportStatus::Failed => "failed",
         }
-        .to_string();
+    }
+}
+
+impl ImportItemResult {
+    /// 转换为 SSE 事件（携带在数组中的下标）
+    pub fn into_event(self, index: usize) -> BatchImportEvent {
+        let status = self.status.as_str().to_string();
         BatchImportEvent {
             index: Some(index),
             status,
@@ -332,6 +344,13 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    /// API Key 订阅源运行时配置（改后热生效，同时落盘）
+    key_feed_config: Mutex<KeyFeedConfig>,
+    /// 最近一次订阅源拉取结果（仅进程内存，重启后清空）
+    key_feed_last_pull: Mutex<Option<KeyFeedPullResult>>,
+    /// 订阅源拉取互斥：手动触发与后台调度可能同时发生，串行化避免
+    /// 两轮并发导入同一批 key（去重虽能兜住，但会白跑一堆上游验活请求）
+    key_feed_pull_lock: tokio::sync::Mutex<()>,
 }
 
 /// Social 登录会话状态
@@ -652,6 +671,7 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
+        let key_feed_config = token_manager.config().key_feed.clone();
 
         let svc = Self {
             token_manager,
@@ -666,6 +686,9 @@ impl AdminService {
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
+            key_feed_config: Mutex::new(key_feed_config),
+            key_feed_last_pull: Mutex::new(None),
+            key_feed_pull_lock: tokio::sync::Mutex::new(()),
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -1315,6 +1338,365 @@ impl AdminService {
 
                 // 30 秒粒度足以可靠命中目标分钟，又不会在系统时间漂移下错过
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
+
+    // ==================== API Key 订阅源（拼车链接）自动导入 ====================
+
+    /// 读取订阅源配置（token 只回布尔）。
+    pub fn get_key_feed_config(&self) -> KeyFeedConfigResponse {
+        let config = self.key_feed_config.lock().clone();
+        let last_pull = self.key_feed_last_pull.lock().clone();
+        Self::key_feed_response(&config, last_pull)
+    }
+
+    fn key_feed_response(
+        config: &KeyFeedConfig,
+        last_pull: Option<KeyFeedPullResult>,
+    ) -> KeyFeedConfigResponse {
+        KeyFeedConfigResponse {
+            enabled: config.enabled,
+            url: config.url.clone(),
+            token_set: config
+                .token
+                .as_deref()
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false),
+            token_param: config.effective_token_param().to_string(),
+            interval_secs: config.effective_interval_secs(),
+            verify: config.verify,
+            priority: config.priority,
+            groups: config.groups.clone(),
+            endpoint: config.endpoint.clone(),
+            reap_disabled: config.reap_disabled,
+            last_pull,
+        }
+    }
+
+    /// 更新订阅源配置（热生效 + 落盘）。
+    ///
+    /// `url` 允许直接粘贴含 `?token=` 的完整链接：这里会拆出 token 存到独立字段，
+    /// 使 Admin API 的响应不回显明文（前端只看到 `tokenSet`）。
+    pub fn set_key_feed_config(
+        &self,
+        req: SetKeyFeedConfigRequest,
+    ) -> Result<KeyFeedConfigResponse, AdminServiceError> {
+        // 端点名校验：与 add_credential 一致，未注册的端点会让每轮导入全量失败
+        if let Some(raw) = req.endpoint.as_deref()
+            && !raw.trim().is_empty()
+            && !self.known_endpoints.contains(raw.trim())
+        {
+            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
+            known.sort();
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "未知端点 \"{}\"，已注册端点: {:?}",
+                raw.trim(),
+                known
+            )));
+        }
+
+        // 令牌参数名：本轮请求带了就用新的，否则沿用现有配置（拆分 URL 时要用）
+        let token_param = req
+            .token_param
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| self.key_feed_config.lock().effective_token_param().to_string());
+
+        // URL 拆分：非空则必须是可解析的 http(s) URL，否则每轮拉取都白跑
+        let mut url_update: Option<Option<String>> = None;
+        let mut token_from_url: Option<String> = None;
+        if let Some(raw) = req.url.as_deref() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                url_update = Some(None);
+            } else {
+                let (base, token) = key_feed::split_url_and_token(trimmed, &token_param);
+                let parsed = reqwest::Url::parse(&base).map_err(|e| {
+                    AdminServiceError::InvalidCredential(format!("订阅源 URL 无法解析: {}", e))
+                })?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(AdminServiceError::InvalidCredential(
+                        "订阅源 URL 必须为 http 或 https".to_string(),
+                    ));
+                }
+                url_update = Some(Some(base));
+                token_from_url = token;
+            }
+        }
+
+        // token 优先级：显式传入的 token > 从 URL 里拆出来的 > 保持原值。
+        // 显式空串表示清除。
+        let token_update: Option<Option<String>> = match req.token.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                Some(if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                })
+            }
+            None => token_from_url.map(Some),
+        };
+
+        let endpoint_update: Option<Option<String>> = req.endpoint.as_deref().map(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        let groups_update = req.groups.map(|groups| {
+            groups
+                .into_iter()
+                .map(|g| g.trim().to_string())
+                .filter(|g| !g.is_empty())
+                .collect::<Vec<String>>()
+        });
+
+        let apply = |target: &mut KeyFeedConfig| {
+            if let Some(enabled) = req.enabled {
+                target.enabled = enabled;
+            }
+            if req.token_param.is_some() {
+                target.token_param = token_param.clone();
+            }
+            if let Some(url) = &url_update {
+                target.url = url.clone();
+            }
+            if let Some(token) = &token_update {
+                target.token = token.clone();
+            }
+            if let Some(interval) = req.interval_secs {
+                // 落盘前就夹到下限，让配置文件与实际行为一致。若存原始值（如 30），
+                // 将来下限一旦调低，这个值会静默变成生效值 —— 那是个隐蔽的意外。
+                target.interval_secs = interval.max(KEY_FEED_MIN_INTERVAL_SECS);
+            }
+            if let Some(verify) = req.verify {
+                target.verify = verify;
+            }
+            if let Some(priority) = req.priority {
+                target.priority = priority;
+            }
+            if let Some(groups) = &groups_update {
+                target.groups = groups.clone();
+            }
+            if let Some(endpoint) = &endpoint_update {
+                target.endpoint = endpoint.clone();
+            }
+            if let Some(reap) = req.reap_disabled {
+                target.reap_disabled = reap;
+            }
+        };
+
+        {
+            let mut runtime = self.key_feed_config.lock();
+            apply(&mut runtime);
+        }
+        self.update_config_file(|c| apply(&mut c.key_feed));
+
+        Ok(self.get_key_feed_config())
+    }
+
+    /// 拉取一次订阅源并导入其中的新 key。
+    ///
+    /// 幂等：已入库的 key 命中 `sha256(kiroApiKey)` 去重后在任何网络调用之前就被
+    /// 拒绝，所以重复拉到存量 key 的代价是零次上游请求。
+    ///
+    /// 全程持 [`Self::key_feed_pull_lock`]，手动触发与后台调度不会并发导入同一批 key。
+    pub async fn pull_key_feed(&self) -> KeyFeedPullResult {
+        let _guard = self.key_feed_pull_lock.lock().await;
+
+        let config = self.key_feed_config.lock().clone();
+        let pulled_at = Utc::now().to_rfc3339();
+
+        let mut result = KeyFeedPullResult {
+            pulled_at,
+            success: false,
+            total: 0,
+            candidates: 0,
+            imported: 0,
+            duplicate: 0,
+            failed: 0,
+            reaped: 0,
+            earliest_warranty_until: None,
+            message: None,
+            error: None,
+            items: Vec::new(),
+        };
+
+        let proxy = self.token_manager.proxy();
+        let tls_backend = self.token_manager.config().tls_backend;
+
+        let feed = match key_feed::fetch(&config, proxy.as_ref(), tls_backend).await {
+            Ok(feed) => feed,
+            Err(e) => {
+                result.error = Some(e.to_string());
+                self.store_key_feed_result(&result);
+                return result;
+            }
+        };
+
+        result.success = true;
+        result.total = feed.data.len();
+        result.message = feed
+            .msg
+            .clone()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+
+        let candidates = key_feed::to_candidates(&feed, &config);
+        result.candidates = candidates.len();
+        // RFC3339 在同一时区偏移下按字典序即时间序；这里全部由 ms_to_rfc3339 生成
+        // （统一 UTC 偏移），故可直接 min。
+        result.earliest_warranty_until = candidates
+            .iter()
+            .filter_map(|c| c.warranty_until.clone())
+            .min();
+
+        // 串行导入：一轮通常只有个位数新 key，验活各一次上游往返，
+        // 串行足够快且对上游最友好（与 refresh_all_balances 的取舍一致）。
+        for candidate in candidates {
+            let api_region = candidate.request.api_region.clone();
+            let outcome = self
+                .import_one_credential(candidate.request, config.verify)
+                .await;
+
+            let status = outcome.status.as_str().to_string();
+            match status.as_str() {
+                "imported" | "verified" => result.imported += 1,
+                "duplicate" => result.duplicate += 1,
+                _ => result.failed += 1,
+            }
+
+            // 去重是预期常态（存量 key 每轮都会命中），不记明细也不打日志，
+            // 否则 20 个号位每 5 分钟刷 20 行噪音。
+            if status != "duplicate" {
+                if status == "failed" {
+                    tracing::warn!(
+                        "订阅源导入号位 {} 失败: {}",
+                        candidate.label,
+                        outcome.error.as_deref().unwrap_or("未知错误")
+                    );
+                } else {
+                    tracing::info!(
+                        "订阅源导入号位 {} 成功，凭据 #{}",
+                        candidate.label,
+                        outcome
+                            .credential_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    );
+                }
+                result.items.push(KeyFeedItemResult {
+                    label: candidate.label,
+                    status,
+                    credential_id: outcome.credential_id,
+                    api_region,
+                    warranty_until: candidate.warranty_until,
+                    error: outcome.error,
+                });
+            }
+        }
+
+        if config.reap_disabled {
+            result.reaped = self.reap_key_feed_credentials();
+        }
+
+        self.store_key_feed_result(&result);
+        result
+    }
+
+    fn store_key_feed_result(&self, result: &KeyFeedPullResult) {
+        *self.key_feed_last_pull.lock() = Some(result.clone());
+    }
+
+    /// 清理由订阅源导入、且已被**自动**禁用的凭据。
+    ///
+    /// 只删同时满足全部条件的凭据，任一不满足就跳过：
+    /// - `source_channel` 带 `keyfeed:` 前缀 → 不误伤手工添加或其它渠道的号；
+    /// - 已禁用 → 还在服务的号绝不动；
+    /// - 禁用原因不是 `Manual` → 运维手动禁用是显式意图（例如留着排查），保留。
+    ///
+    /// 返回实际删除的条数。
+    fn reap_key_feed_credentials(&self) -> usize {
+        let snapshot = self.token_manager.snapshot();
+        let targets: Vec<u64> = snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.disabled
+                    && key_feed::is_feed_source(entry.source_channel.as_deref())
+                    && entry.disabled_reason.as_deref() != Some("Manual")
+            })
+            .map(|entry| entry.id)
+            .collect();
+
+        let mut reaped = 0_usize;
+        for id in targets {
+            match self.delete_credential(id) {
+                Ok(()) => {
+                    reaped += 1;
+                    tracing::info!("订阅源清理：已删除自动禁用的凭据 #{}", id);
+                }
+                Err(e) => {
+                    tracing::warn!("订阅源清理凭据 #{} 失败: {}", id, e);
+                }
+            }
+        }
+        reaped
+    }
+
+    /// 启动订阅源后台轮询调度器。
+    ///
+    /// 任务始终运行，每轮先读运行时配置：未启用或未配置 URL 就静默跳过，
+    /// 这样从 UI 打开开关无需重启即可生效。间隔按当前配置动态取值（有 60 秒下限）。
+    pub fn start_key_feed_scheduler(self: &Arc<Self>) {
+        let svc = Arc::clone(self);
+        tokio::spawn(async move {
+            // 让 TokenManager / 网络就绪，避免启动瞬间的首轮拉取撞上未初始化状态
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+            loop {
+                let config = svc.key_feed_config.lock().clone();
+                let interval = std::time::Duration::from_secs(config.effective_interval_secs());
+
+                if config.enabled && config.request_url().is_some() {
+                    let started = std::time::Instant::now();
+                    let result = svc.pull_key_feed().await;
+                    if result.success {
+                        // 一轮全是去重（存量号位）是常态，降到 debug 免刷屏；
+                        // 有实际变化时才 info。
+                        if result.imported > 0 || result.failed > 0 || result.reaped > 0 {
+                            tracing::info!(
+                                "订阅源轮询完成：号位 {}，新增 {}，重复 {}，失败 {}，清理 {}，耗时 {:.1}s",
+                                result.total,
+                                result.imported,
+                                result.duplicate,
+                                result.failed,
+                                result.reaped,
+                                started.elapsed().as_secs_f32()
+                            );
+                        } else {
+                            tracing::debug!(
+                                "订阅源轮询完成：号位 {}，全部已在库，耗时 {:.1}s",
+                                result.total,
+                                started.elapsed().as_secs_f32()
+                            );
+                        }
+                    } else {
+                        tracing::warn!(
+                            "订阅源轮询失败：{}",
+                            result.error.as_deref().unwrap_or("未知错误")
+                        );
+                    }
+                }
+
+                tokio::time::sleep(interval).await;
             }
         });
     }

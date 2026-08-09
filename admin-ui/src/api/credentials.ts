@@ -544,7 +544,7 @@ export interface CacheEngineNoCacheConfig {
   outputMultiplier: number
 }
 
-/** 引擎 A 未显式设置倍率时的回退来源（同时也是顶栏「Token 膨胀倍率」那一套） */
+/** 引擎 A 未显式设置倍率时的回退来源（即配置文件里的 *InflationMultiplier 三项） */
 export interface GlobalInflationConfig {
   inputMultiplier: number
   outputMultiplier: number
@@ -557,10 +557,12 @@ export interface CacheEnginesConfig {
   real?: CacheEngineRealConfig
   nocache?: CacheEngineNoCacheConfig
   /**
-   * 全局膨胀倍率。纳入本 payload 是为了「一个窗口调完四套引擎」——
-   * 它与 `/config/token-inflation` 是同一份存储的两个入口，不是两份数据。
+   * 全局膨胀倍率。纳入本 payload 是为了「一个窗口调完四套引擎 + 全局」——
+   * 它与 `/config/token-inflation` 是同一份存储的两个入口，不是两份数据
+   * （后端两条路径都走 `token_manager.set_token_inflation_config`）。
    *
-   * 作用有两处：① 引擎 A 的倍率为 null 时逐项回退到这里；② 顶栏那个入口。
+   * 作用有两处：① 引擎 A 的倍率为 null 时逐项回退到这里；
+   * ② UI 上全局倍率的唯一编辑入口（顶栏原先那个独立按钮已移除）。
    */
   global?: GlobalInflationConfig
 }
@@ -598,6 +600,97 @@ export async function setCacheEnginesConfig(
 /** 获取两套引擎的运行计数器 */
 export async function getCacheEnginesStats(): Promise<CacheEnginesStats> {
   const { data } = await api.get<CacheEnginesStats>('/cache-engines/stats')
+  return data
+}
+
+// ==== API Key 订阅源（拼车链接）自动导入 ====
+
+/** 单个号位的导入结果（后端已剥离密钥） */
+export interface KeyFeedItemResult {
+  /** 号位标识，形如 `渠道名#claimId seatN [zone]` */
+  label: string
+  status: 'imported' | 'verified' | 'duplicate' | 'failed'
+  credentialId?: number
+  apiRegion?: string
+  /** 保修截止（RFC3339）；仅展示，不触发自动删除 */
+  warrantyUntil?: string
+  error?: string
+}
+
+/** 一次拉取的汇总结果 */
+export interface KeyFeedPullResult {
+  pulledAt: string
+  success: boolean
+  total: number
+  candidates: number
+  imported: number
+  duplicate: number
+  failed: number
+  reaped: number
+  earliestWarrantyUntil?: string
+  /** 订阅源返回的提示文案（如「暂无可用号，正在补货」） */
+  message?: string
+  error?: string
+  /** 明细。去重条目不入列表，避免存量号位每轮刷屏 */
+  items?: KeyFeedItemResult[]
+}
+
+export interface KeyFeedConfig {
+  enabled: boolean
+  /** 已剥离令牌查询参数的 URL */
+  url?: string
+  /** 是否已配置访问令牌。后端从不回显明文 */
+  tokenSet: boolean
+  /** 令牌的查询参数名（不同源可能叫 token / key / accessKey） */
+  tokenParam: string
+  intervalSecs: number
+  verify: boolean
+  priority: number
+  groups: string[]
+  endpoint?: string
+  reapDisabled: boolean
+  /** 最近一次拉取结果（进程内存，重启后清空） */
+  lastPull?: KeyFeedPullResult
+}
+
+/** 更新订阅源配置。未传的字段保持原值；空串表示清除。 */
+export interface KeyFeedConfigPatch {
+  enabled?: boolean
+  /** 可直接粘贴完整链接，后端按 tokenParam 自动拆出令牌 */
+  url?: string
+  token?: string
+  /** 令牌参数名，默认 token */
+  tokenParam?: string
+  intervalSecs?: number
+  verify?: boolean
+  priority?: number
+  groups?: string[]
+  endpoint?: string
+  reapDisabled?: boolean
+}
+
+/** 获取订阅源配置（token 只回布尔） */
+export async function getKeyFeedConfig(): Promise<KeyFeedConfig> {
+  const { data } = await api.get<KeyFeedConfig>('/config/key-feed')
+  return data
+}
+
+/** 更新订阅源配置（落盘 + 热生效，无需重启） */
+export async function setKeyFeedConfig(patch: KeyFeedConfigPatch): Promise<KeyFeedConfig> {
+  const { data } = await api.put<KeyFeedConfig>('/config/key-feed', patch)
+  return data
+}
+
+/**
+ * 立即拉取一次订阅源。
+ *
+ * 与后台轮询共用同一把服务端互斥锁，不会并发导入同一批 key。
+ * 验活开启时每个新 key 要走一次上游往返，故超时给得比常规请求宽。
+ */
+export async function pullKeyFeed(): Promise<KeyFeedPullResult> {
+  const { data } = await api.post<KeyFeedPullResult>('/key-feed/pull', undefined, {
+    timeout: 180_000,
+  })
   return data
 }
 
