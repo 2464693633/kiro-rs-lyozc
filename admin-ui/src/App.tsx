@@ -252,8 +252,14 @@ function DesktopTabs({
   onSwitchTab: (next: Tab) => void;
   tab: Tab;
 }) {
+  // min-w-0 + overflow-x-auto 是护栏，不是主要修复：
+  // 父级 HeaderBrand 是 flex-1 min-w-0，但本容器此前没有 min-w-0，
+  // flex item 的默认 min-width:auto 让它按内容撑开、溢出父级，
+  // 又被 shrink-0 的 HeaderActions 覆盖 —— 表现为「请求日志」tab 被盖住且点不动。
+  // 真正的修复是把工具区从约 900px 收进齿轮菜单（见 topbar-tools 的 FullTools）；
+  // 这里保证即便将来又塞东西，也只会变成可横向滚动，而不是静默盖住 tab。
   return (
-    <div className="ml-4 hidden items-center gap-1 rounded-full border border-border/60 p-0.5 2xl:flex">
+    <div className="ml-4 hidden min-w-0 items-center gap-1 overflow-x-auto rounded-full border border-border/60 p-0.5 2xl:flex [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {TABS.map((t) => (
         <TabButton
           key={t.key}

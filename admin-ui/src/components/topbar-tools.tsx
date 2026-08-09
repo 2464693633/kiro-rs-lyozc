@@ -1,15 +1,12 @@
-import { forwardRef, useEffect, useState, type ComponentPropsWithoutRef } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
   Boxes,
   Database,
-  Gauge,
-  HeartCrack,
-  HeartPulse,
   MoreHorizontal,
+  Rss,
   ShieldAlert,
   ShieldCheck,
-  TrendingUp,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -27,7 +24,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
-  useTokenInflationConfig, useSetTokenInflationConfig,
+  useTokenInflationConfig,
   useAccountRpmLimitConfig, useSetAccountRpmLimitConfig,
   useSelfHealConfig, useSetSelfHealConfig,
 } from '@/hooks/use-credentials'
@@ -36,6 +33,7 @@ import { updateAdminKey, type SelfHealConfigPatch } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheEngineDialog } from '@/components/cache-engine-dialog'
+import { KeyFeedDialog } from '@/components/key-feed-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
@@ -54,18 +52,17 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
   const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
-  const { data: inflationConfig, isLoading: isLoadingInflation } = useTokenInflationConfig()
-  const { mutate: setInflationConfig, isPending: isSettingInflation } = useSetTokenInflationConfig()
+  // 只读：全局倍率的编辑入口已并入「缓存引擎」弹窗的「下发倍率」矩阵
+  // （那里的 global 段与 /config/token-inflation 是同一份存储，后端走同一个
+  // set_token_inflation_config）。这里保留读取，仅用于齿轮上的「非默认」状态点。
+  const { data: inflationConfig } = useTokenInflationConfig()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
   const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
-  const [inflationDialogOpen, setInflationDialogOpen] = useState(false)
   const [cacheEngineDialogOpen, setCacheEngineDialogOpen] = useState(false)
-  const [inflationInput, setInflationInput] = useState('1.0')
-  const [inflationOutput, setInflationOutput] = useState('1.0')
-  const [inflationCache, setInflationCache] = useState('1.0')
+  const [keyFeedDialogOpen, setKeyFeedDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -77,31 +74,6 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     queryClient.invalidateQueries({ queryKey: ['current-credential-models'] })
     queryClient.invalidateQueries({ queryKey: ['credential-models'] })
     toast.success('已刷新')
-  }
-
-  const openInflationDialog = () => {
-    setInflationInput(String(inflationConfig?.inputMultiplier ?? 1.0))
-    setInflationOutput(String(inflationConfig?.outputMultiplier ?? 1.0))
-    setInflationCache(String(inflationConfig?.cacheMultiplier ?? 1.0))
-    setInflationDialogOpen(true)
-  }
-
-  const handleSaveInflation = (e: React.FormEvent) => {
-    e.preventDefault()
-    const input = parseFloat(inflationInput)
-    const output = parseFloat(inflationOutput)
-    const cache = parseFloat(inflationCache)
-    if ([input, output, cache].some(v => isNaN(v) || v < 1.0 || v > 100.0)) {
-      toast.error('倍率必须在 1.0 ~ 100.0 之间')
-      return
-    }
-    setInflationConfig({ inputMultiplier: input, outputMultiplier: output, cacheMultiplier: cache }, {
-      onSuccess: () => {
-        toast.success('Token 膨胀倍率已更新')
-        setInflationDialogOpen(false)
-      },
-      onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
-    })
   }
 
   const handleToggleLoadBalancing = () => {
@@ -161,11 +133,10 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openImageUpdate: () => setImageUpdateOpen(true),
     openModels: () => setModelsDialogOpen(true),
     openKeyDialog,
-    openInflationDialog,
     openCacheEngineDialog: () => setCacheEngineDialogOpen(true),
+    openKeyFeedDialog: () => setKeyFeedDialogOpen(true),
     throttleConfig,
     inflationConfig,
-    isLoadingInflation,
     updateCheck,
     updateCooldown: (secs: number) =>
       setThrottleConfig({ cooldownSecs: secs }, {
@@ -184,78 +155,12 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
         onOpenChange={setModelsDialogOpen}
       />
 
-      <Dialog
-        open={inflationDialogOpen}
-        onOpenChange={(open) => { if (!isSettingInflation) setInflationDialogOpen(open) }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <TrendingUp className="h-4 w-4" />
-              Token 用量膨胀倍率（rust 引擎）
-            </DialogTitle>
-            <DialogDescription>
-              设置返回给客户端的 token 用量膨胀倍率（1.0 = 不膨胀）。
-              这里的倍率作用于 <strong>rust 缓存引擎</strong>（引擎 A，默认）的 Key。
-              选了 <strong>go 引擎</strong> 的 Key 不受此处影响，它用「缓存引擎」里自己的三个倍率。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleSaveInflation} className="space-y-3 py-2">
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Input 倍率</label>
-              <Input
-                type="number"
-                step="0.1"
-                min="1"
-                max="100"
-                value={inflationInput}
-                onChange={(e) => setInflationInput(e.target.value)}
-                disabled={isSettingInflation}
-                className="font-mono text-[13px]"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Output 倍率</label>
-              <Input
-                type="number"
-                step="0.1"
-                min="1"
-                max="100"
-                value={inflationOutput}
-                onChange={(e) => setInflationOutput(e.target.value)}
-                disabled={isSettingInflation}
-                className="font-mono text-[13px]"
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs text-muted-foreground">Cache 倍率</label>
-              <Input
-                type="number"
-                step="0.1"
-                min="1"
-                max="100"
-                value={inflationCache}
-                onChange={(e) => setInflationCache(e.target.value)}
-                disabled={isSettingInflation}
-                className="font-mono text-[13px]"
-              />
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setInflationDialogOpen(false)} disabled={isSettingInflation}>
-                取消
-              </Button>
-              <Button type="submit" disabled={isSettingInflation}>
-                {isSettingInflation ? '保存中…' : '保存'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
       <CacheEngineDialog
         open={cacheEngineDialogOpen}
         onOpenChange={setCacheEngineDialogOpen}
       />
+
+      <KeyFeedDialog open={keyFeedDialogOpen} onOpenChange={setKeyFeedDialogOpen} />
 
       <Dialog
         open={keyDialogOpen}
@@ -362,71 +267,166 @@ interface ToolControls {
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
   openKeyDialog: () => void
-  openInflationDialog: () => void
   openCacheEngineDialog: () => void
+  openKeyFeedDialog: () => void
   openModels: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
+  /** 只读：编辑入口在缓存引擎弹窗，这里仅用于状态点与菜单后缀 */
   inflationConfig?: { inputMultiplier: number; outputMultiplier: number; cacheMultiplier: number }
-  isLoadingInflation: boolean
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
 }
 
+/**
+ * 宽屏工具栏：三个高频动作留成独立图标，其余配置类全部收进「设置」菜单。
+ *
+ * **为什么不再平铺那 6 个带文字的配置按钮**：它们合计约 900px 且 `shrink-0`，
+ * 而 `HeaderActions` 与 `DesktopTabs` 同处一行、共享 `max-w-[1400px]`。
+ * 实测（CDP 量 1536/1600/1700/1920/2560 五档）tab 行右边界恒定越过工具区左边界
+ * 120px，「请求日志」tab 被盖住且 `elementFromPoint` 命中的不是它自己 —— 即**点不动**。
+ * 且该重叠量与视口宽度无关，把窗口拉多宽都不会自愈。
+ *
+ * 收进菜单后工具区从约 900px 降到约 190px，tab 行不再被挤出。
+ * 状态可见性没有丢：菜单项用的就是 `*CompactItems`，展开即见当前值。
+ */
 function FullTools({ controls }: { controls: ToolControls }) {
   return (
     <>
-      <LoadBalancingButton controls={controls} />
-      <ThrottleConfigButton
-        config={controls.throttleConfig}
-        loading={controls.isLoadingThrottle}
-        saving={controls.isSettingThrottle}
-        onToggleFailover={controls.handleToggleFailover}
-        onChangeCooldown={controls.updateCooldown}
-      />
-      <InflationButton controls={controls} />
-      <CacheEngineButton onOpen={controls.openCacheEngineDialog} />
-      <SelfHealConfigButton />
-      <AccountRpmLimitButton />
       <ModelsButton onOpen={controls.openModels} />
       <RefreshButton onRefresh={controls.handleRefresh} />
       <ImageUpdateButton controls={controls} />
-      <KeySettingsMenu onOpenKeyDialog={controls.openKeyDialog} />
+      <SettingsMenu controls={controls} />
     </>
   )
 }
 
-function CompactTools({ controls }: { controls: ToolControls }) {
-  const throttleProps = {
-    config: controls.throttleConfig,
-    loading: controls.isLoadingThrottle,
-    saving: controls.isSettingThrottle,
-    onToggleFailover: controls.handleToggleFailover,
-    onChangeCooldown: controls.updateCooldown,
-  }
-
+/**
+ * 「设置」齿轮菜单：负载均衡、故障转移、膨胀倍率、缓存引擎、订阅源、自愈、
+ * 限流、登录密钥 —— 全部配置项的唯一入口（宽屏用）。
+ */
+function SettingsMenu({ controls }: { controls: ToolControls }) {
   return (
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" size="icon" title="更多操作">
-          <MoreHorizontal className="h-4 w-4" />
+        <Button variant="ghost" size="icon" title="设置与参数" className="relative">
+          <Settings className="h-4 w-4" />
+          {hasNonDefaultState(controls) && <SettingsDot />}
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="end"
         className="max-h-[calc(100dvh-4.5rem)] w-72 max-w-[calc(100dvw-1rem)] overflow-x-hidden overflow-y-auto overscroll-contain"
       >
-        <DropdownMenuLabel>系统操作</DropdownMenuLabel>
-        <DropdownMenuItem
-          disabled={controls.isLoadingMode || controls.isSettingMode}
-          onSelect={controls.handleToggleLoadBalancing}
-        >
-          <Activity />
-          {controls.isLoadingMode
-            ? '负载均衡加载中'
-            : controls.loadBalancingMode === 'priority'
-              ? '切换到均衡负载'
-              : '切换到优先级'}
-        </DropdownMenuItem>
+        <SettingsMenuItems controls={controls} />
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/**
+ * 配置类菜单项。宽屏的齿轮菜单与窄屏的 ⋯ 菜单共用这一份，
+ * 避免两套入口的项目集合漂移（历史上就是这么漂移出不一致的）。
+ */
+function SettingsMenuItems({ controls }: { controls: ToolControls }) {
+  return (
+    <>
+      <DropdownMenuLabel>调度与限流</DropdownMenuLabel>
+      <DropdownMenuItem
+        disabled={controls.isLoadingMode || controls.isSettingMode}
+        onSelect={controls.handleToggleLoadBalancing}
+      >
+        <Activity />
+        {controls.isLoadingMode
+          ? '负载均衡加载中'
+          : controls.loadBalancingMode === 'priority'
+            ? '当前：优先级 → 切换到均衡负载'
+            : '当前：均衡负载 → 切换到优先级'}
+      </DropdownMenuItem>
+      <ThrottleCompactItems
+        config={controls.throttleConfig}
+        loading={controls.isLoadingThrottle}
+        saving={controls.isSettingThrottle}
+        onToggleFailover={controls.handleToggleFailover}
+        onChangeCooldown={controls.updateCooldown}
+      />
+      <SelfHealCompactItems />
+      <AccountRpmLimitCompactItems />
+
+      <DropdownMenuLabel>计量与缓存</DropdownMenuLabel>
+      {/*
+        四套引擎的倍率 + 全局倍率都在这一个弹窗里。原先另有一个「Token 膨胀倍率」入口，
+        但它写的就是这里的 global 段（后端同一个 set_token_inflation_config，
+        同样的 [1.0, 100.0] 校验）—— 两个入口改同一份数据只会让人以为是两份，故已移除。
+      */}
+      <DropdownMenuItem onSelect={controls.openCacheEngineDialog}>
+        <Database />
+        缓存引擎与下发倍率{inflationSuffix(controls)}
+      </DropdownMenuItem>
+
+      <DropdownMenuLabel>凭据来源</DropdownMenuLabel>
+      <DropdownMenuItem onSelect={controls.openKeyFeedDialog}>
+        <Rss />API Key 订阅源
+      </DropdownMenuItem>
+
+      <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
+      <DropdownMenuItem onSelect={controls.openKeyDialog}>
+        <Key />修改登录API密钥（管理面板登录）
+      </DropdownMenuItem>
+    </>
+  )
+}
+
+/** 全局倍率在菜单项上的状态后缀（收起后仍能一眼看出是否非默认）。 */
+function inflationSuffix(controls: ToolControls) {
+  return hasInflation(controls) ? '（倍率生效中）' : ''
+}
+
+function hasInflation(controls: ToolControls) {
+  const c = controls.inflationConfig
+  return !!c && (c.inputMultiplier > 1 || c.outputMultiplier > 1 || c.cacheMultiplier > 1)
+}
+
+/**
+ * 齿轮上的状态点：存在「非默认」配置时才显示。
+ *
+ * 平铺按钮收进菜单后，最大的损失是「膨胀中 / 故障转移关」这类非默认状态不再一眼可见。
+ * 这个点把该信号补回来 —— 不展开也知道有东西被调过。
+ */
+function hasNonDefaultState(controls: ToolControls) {
+  const throttleOff = controls.throttleConfig
+    ? !controls.throttleConfig.failover
+    : false
+  return hasInflation(controls) || throttleOff
+}
+
+function SettingsDot() {
+  return (
+    <span className="absolute right-1.5 top-1.5 inline-flex h-1.5 w-1.5">
+      <span className="inline-flex h-full w-full rounded-full bg-amber-500" />
+    </span>
+  )
+}
+
+/**
+ * 窄屏工具栏：连三个高频图标也放不下，全部收进一个 ⋯ 菜单。
+ *
+ * 配置项直接复用 [`SettingsMenuItems`]，与宽屏齿轮菜单同一份，不会两边漂移。
+ * 这里额外多出「刷新 / 可用模型 / 在线更新」三项 —— 宽屏它们是独立图标，窄屏没地方放。
+ */
+function CompactTools({ controls }: { controls: ToolControls }) {
+  return (
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <Button variant="outline" size="icon" title="更多操作" className="relative">
+          <MoreHorizontal className="h-4 w-4" />
+          {(hasNonDefaultState(controls) || controls.updateCheck?.hasUpdate) && <SettingsDot />}
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="max-h-[calc(100dvh-4.5rem)] w-72 max-w-[calc(100dvw-1rem)] overflow-x-hidden overflow-y-auto overscroll-contain"
+      >
+        <DropdownMenuLabel>常用操作</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.handleRefresh}>
           <RefreshCw />刷新数据
         </DropdownMenuItem>
@@ -434,86 +434,19 @@ function CompactTools({ controls }: { controls: ToolControls }) {
           <Boxes />可用模型
         </DropdownMenuItem>
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
-          <UploadCloud />镜像在线更新
+          <UploadCloud />
+          镜像在线更新
+          {controls.updateCheck?.hasUpdate && (
+            <span className="ml-auto text-[10px] text-red-500">有新版</span>
+          )}
         </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openInflationDialog}>
-          <TrendingUp />Token 膨胀倍率
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={controls.openCacheEngineDialog}>
-          <Database />缓存模拟引擎参数
-        </DropdownMenuItem>
-        <ThrottleCompactItems {...throttleProps} />
-        <SelfHealCompactItems />
-        <AccountRpmLimitCompactItems />
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={controls.openKeyDialog}>
-          <Key />修改登录API密钥（管理面板登录）
-        </DropdownMenuItem>
+
+        <SettingsMenuItems controls={controls} />
       </DropdownMenuContent>
     </DropdownMenu>
   )
 }
 
-function LoadBalancingButton({ controls }: { controls: ToolControls }) {
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={controls.handleToggleLoadBalancing}
-      disabled={controls.isLoadingMode || controls.isSettingMode}
-      title="切换负载均衡模式"
-    >
-      <Activity className="h-3.5 w-3.5" />
-      <span className="hidden md:inline">
-        {controls.isLoadingMode
-          ? '加载中…'
-          : controls.loadBalancingMode === 'priority'
-            ? '优先级'
-            : '均衡负载'}
-      </span>
-    </Button>
-  )
-}
-
-function InflationButton({ controls }: { controls: ToolControls }) {
-  const hasInflation = controls.inflationConfig && (
-    controls.inflationConfig.inputMultiplier > 1 ||
-    controls.inflationConfig.outputMultiplier > 1 ||
-    controls.inflationConfig.cacheMultiplier > 1
-  )
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={controls.openInflationDialog}
-      disabled={controls.isLoadingInflation}
-      title="Token 膨胀倍率设置"
-    >
-      <TrendingUp className={`h-3.5 w-3.5 ${hasInflation ? 'text-orange-500' : ''}`} />
-      <span className="hidden md:inline">
-        {controls.isLoadingInflation
-          ? '加载中…'
-          : hasInflation
-            ? '膨胀中'
-            : '倍率 1x'}
-      </span>
-    </Button>
-  )
-}
-
-function CacheEngineButton({ onOpen }: { onOpen: () => void }) {
-  return (
-    <Button
-      variant="outline"
-      size="sm"
-      onClick={onOpen}
-      title="缓存模拟引擎参数（go 引擎专属倍率在此处）"
-    >
-      <Database className="h-3.5 w-3.5" />
-      <span className="hidden md:inline">缓存引擎</span>
-    </Button>
-  )
-}
 
 function ModelsButton({ onOpen }: { onOpen: () => void }) {
   return (
@@ -543,24 +476,6 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
       <UploadCloud className="h-4 w-4" />
       {controls.updateCheck?.hasUpdate && <UpdateDot />}
     </Button>
-  )
-}
-
-function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="设置">
-          <Settings className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <DropdownMenuItem onSelect={onOpenKeyDialog}>
-          <Key />修改登录API密钥（管理面板登录）
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
   )
 }
 
@@ -600,12 +515,6 @@ interface CustomCooldownFormProps {
   onSubmit: (e: React.FormEvent) => void
 }
 
-interface ThrottleTriggerProps extends ComponentPropsWithoutRef<typeof Button> {
-  loading: boolean
-  saving: boolean
-  state: ThrottleState
-}
-
 const COOLDOWN_PRESETS = [
   { label: '5 分钟', secs: 5 * 60 },
   { label: '15 分钟', secs: 15 * 60 },
@@ -626,116 +535,6 @@ const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
  * - 顶部一个 Switch 切换 failover
  * - 5 个预设时长 + 一个自定义输入（分钟）
  */
-function ThrottleConfigButton({
-  config, loading, saving, onToggleFailover, onChangeCooldown,
-}: ThrottleConfigButtonProps) {
-  const [open, setOpen] = useState(false)
-  const [customMin, setCustomMin] = useState('')
-  const state = readThrottleState(config)
-
-  useEffect(() => {
-    if (!open) setCustomMin('')
-  }, [open])
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
-    }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setOpen(false)
-  }
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <ThrottleTrigger loading={loading} saving={saving} state={state} />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <ThrottleStatusPanel
-          saving={saving}
-          state={state}
-          onToggleFailover={onToggleFailover}
-        />
-        <ThrottleCooldownPanel
-          customMin={customMin}
-          saving={saving}
-          state={state}
-          onChangeCooldown={onChangeCooldown}
-          onCustomMinChange={setCustomMin}
-          onDone={() => setOpen(false)}
-          onSubmitCustom={submitCustom}
-        />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
-  function ThrottleTrigger({ loading, saving, state, ...props }, ref) {
-    return (
-      <Button
-        {...props}
-        ref={ref}
-        variant="outline"
-        size="sm"
-        disabled={loading || saving}
-        title={throttleTitle(loading, state)}
-      >
-        {state.failover ? (
-          <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
-        ) : (
-          <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
-        )}
-        <span className="hidden md:inline">
-          {throttleTriggerText(loading, state)}
-        </span>
-      </Button>
-    )
-  },
-)
-
-function ThrottleStatusPanel({
-  saving, state, onToggleFailover,
-}: {
-  saving: boolean
-  state: ThrottleState
-  onToggleFailover: () => void
-}) {
-  return (
-    <>
-      <DropdownMenuLabel>账号级风控故障转移</DropdownMenuLabel>
-      <div className="px-2 pb-2">
-        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-          <ThrottleStatusText failover={state.failover} />
-          <Switch
-            checked={state.failover}
-            disabled={saving}
-            onCheckedChange={() => onToggleFailover()}
-          />
-        </div>
-      </div>
-    </>
-  )
-}
-
-function ThrottleStatusText({ failover }: { failover: boolean }) {
-  return (
-    <div className="text-xs">
-      <div className="font-medium text-foreground">
-        {failover ? '开启' : '关闭'}
-      </div>
-      <div className="text-muted-foreground leading-snug">
-        {failover
-          ? '上游对当前账号触发临时限速时，自动冷却该凭据并切换到下一个可用凭据'
-          : '上游对当前账号触发临时限速时，仅按瞬态错误重试，不切换凭据'}
-      </div>
-    </div>
-  )
-}
-
 function ThrottleCooldownPanel({
   customMin, saving, state, onChangeCooldown, onCustomMinChange, onDone, onSubmitCustom,
 }: {
@@ -900,36 +699,6 @@ function useSelfHealPanelState(resetInput: boolean) {
 
 type SelfHealPanelState = ReturnType<typeof useSelfHealPanelState>
 
-function SelfHealConfigButton() {
-  const [open, setOpen] = useState(false)
-  const panel = useSelfHealPanelState(!open)
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={panel.busy}
-          title={panel.enabled ? '凭据自愈：已启用' : '凭据自愈：已关闭'}
-        >
-          {panel.enabled ? (
-            <HeartPulse className="h-3.5 w-3.5 text-emerald-600" />
-          ) : (
-            <HeartCrack className="h-3.5 w-3.5 text-amber-500" />
-          )}
-          <span className="hidden md:inline">
-            {panel.isLoading ? '自愈…' : panel.enabled ? '自愈开' : '自愈关'}
-          </span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        <SelfHealConfigPanel {...panel} />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
 function SelfHealConfigPanel({
   busy,
   config,
@@ -1092,32 +861,6 @@ function useAccountRpmLimitPanelState(resetInput: boolean) {
 
 type AccountRpmLimitPanelState = ReturnType<typeof useAccountRpmLimitPanelState>
 
-function AccountRpmLimitButton() {
-  const [open, setOpen] = useState(false)
-  const panel = useAccountRpmLimitPanelState(!open)
-
-  return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <Button
-          variant="outline"
-          size="sm"
-          disabled={panel.busy}
-          title={panel.enabled ? `单账号限流：${panel.limit} 次/分钟` : '单账号限流：已关闭'}
-        >
-          <Gauge className={panel.enabled ? 'h-3.5 w-3.5 text-emerald-600' : 'h-3.5 w-3.5 text-muted-foreground'} />
-          <span className="hidden md:inline">
-            {panel.isLoading ? '限流…' : panel.enabled ? `限流 ${panel.limit}/分` : '限流关'}
-          </span>
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-72">
-        <AccountRpmLimitPanel {...panel} />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
 function AccountRpmLimitPanel({
   busy,
   enabled,
@@ -1262,18 +1005,6 @@ function readThrottleState(
     cooldownSecs,
     failover: config?.failover ?? true,
   }
-}
-
-function throttleTitle(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '账号级风控故障转移：关闭'
-  return `账号级风控故障转移：开启（冷却 ${state.cooldownMin} 分钟）`
-}
-
-function throttleTriggerText(loading: boolean, state: ThrottleState) {
-  if (loading) return '加载中…'
-  if (!state.failover) return '不切换'
-  return `故障转移 · ${state.cooldownMin}m`
 }
 
 function compactThrottleText(loading: boolean, state: ThrottleState) {
