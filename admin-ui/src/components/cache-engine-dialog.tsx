@@ -312,12 +312,18 @@ export function CacheEngineDialog({
             </p>
           </div>
 
-          {/* 全局倍率：A 的回退来源，同时也是顶栏那个入口的同一份存储 */}
+          {/*
+            全局倍率：引擎 A 的回退来源，也是全局倍率的唯一编辑入口。
+            顶栏原先那个独立的「Token 膨胀倍率」按钮已移除 —— 它写的就是这一段
+            （后端同一个 set_token_inflation_config），两个入口改同一份数据只会
+            让人误以为是两份配置。
+          */}
           <div className="space-y-2 rounded-md border p-3">
             <div>
               <div className="text-[13px] font-medium">全局膨胀倍率</div>
               <p className="text-[11px] text-muted-foreground">
-                引擎 A 未显式设置某项时回退到这里。与顶栏「Token 膨胀倍率」是同一份存储。
+                引擎 A 上面留空的项回退到这里。这里也是全局倍率的唯一设置入口
+                （对应配置文件的 <code>inputInflationMultiplier</code> 等三项）。
               </p>
             </div>
             <div className="grid gap-2 sm:grid-cols-3">

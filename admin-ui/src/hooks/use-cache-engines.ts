@@ -15,7 +15,7 @@ export function useCacheEnginesConfig(enabled = true) {
   })
 }
 
-// 更新两套引擎参数（后端落盘 + 热生效）
+// 更新四套引擎参数 + 全局倍率（后端落盘 + 热生效）
 export function useSetCacheEnginesConfig() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -23,6 +23,10 @@ export function useSetCacheEnginesConfig() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['cacheEnginesConfig'] })
       queryClient.invalidateQueries({ queryKey: ['cacheEnginesStats'] })
+      // payload 的 global 段与 /config/token-inflation 是同一份存储。
+      // 顶栏齿轮的「非默认」状态点读的是 tokenInflationConfig，不一起失效
+      // 就会在这里改完倍率后继续显示旧状态。
+      queryClient.invalidateQueries({ queryKey: ['tokenInflationConfig'] })
     },
   })
 }

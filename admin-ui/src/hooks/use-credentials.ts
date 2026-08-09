@@ -243,7 +243,7 @@ export function useSetAccountThrottleConfig() {
   })
 }
 
-// 获取 Token 膨胀倍率配置
+// 读取全局倍率（顶栏用它判断「是否非默认」，编辑入口在缓存引擎弹窗）
 export function useTokenInflationConfig() {
   return useQuery({
     queryKey: ['tokenInflationConfig'],
@@ -251,13 +251,23 @@ export function useTokenInflationConfig() {
   })
 }
 
-// 更新 Token 膨胀倍率配置
+/**
+ * 写全局倍率。**当前前端无调用方** —— 编辑入口已并入「缓存引擎」弹窗，
+ * 那里通过 `setCacheEnginesConfig` 的 `global` 段写同一份存储
+ * （后端两条路径都走 `token_manager.set_token_inflation_config`）。
+ *
+ * 保留是为了与仍然存在的 `PUT /api/admin/config/token-inflation` 端点保持
+ * 接口层对等，供直接调 API 的使用者参照；不要因为「没人用」就当死代码删掉后
+ * 又在别处重写一遍。
+ */
 export function useSetTokenInflationConfig() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: setTokenInflationConfig,
     onSuccess: () => {
+      // 缓存引擎弹窗与本 hook 写的是同一份数据，故两个 key 一起失效
       queryClient.invalidateQueries({ queryKey: ['tokenInflationConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['cacheEnginesConfig'] })
     },
   })
 }
