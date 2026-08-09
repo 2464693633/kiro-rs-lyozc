@@ -883,36 +883,28 @@ pub async fn post_messages(
         // 缓存模拟：WebSearch 也要走 begin()，否则这条路径的请求既拿不到模拟
         // 缓存（cache_* 恒为 0），也不进缓存表 —— 会话中间夹一次 WebSearch 就
         // 断掉后续请求的前缀链。引擎 B 的写入在下面 record("success") 时提交。
-        let (ws_cache_usage, _ws_multipliers, ws_pending, _ws_mode) =
+        // 全局倍率单独留一份：`set_upstream_billing_usage` 收的是原始全局三元组
+        // （它内部按引擎再解析一次），而 `handle_upstream_*` 收的是已解析的四元组。
+        let ws_global_muls = provider.get_inflation_multipliers();
+        let (ws_cache_usage, ws_multipliers, ws_pending, ws_mode) =
             state
                 .cache_engines
-                .begin(
-                    &payload,
-                    key_ctx.key_id,
-                    key_ctx.cache_engine,
-                    provider.get_inflation_multipliers(),
-                );
+                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine, ws_global_muls);
         hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
         hook.set_pending_cache(ws_pending);
 
-        let resp = websearch::handle_websearch_request(
+        return dispatch_websearch(
             provider,
             &payload,
             input_tokens,
-            key_ctx.group.as_deref(),
+            &key_ctx,
+            hook,
             ws_cache_usage,
+            ws_multipliers,
+            ws_mode,
+            ws_global_muls,
         )
         .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        // 记账口径与下发给客户端的 usage 保持一致（同一 split 结果）
-        let (rec_input, rec_cc, rec_cr) = ws_cache_usage.split_against_total(input_tokens);
-        hook.record(0, rec_input, 0, rec_cc, rec_cr, 0.0, status);
-        return resp;
     }
 
     let payload_stream = payload.stream;
@@ -1080,6 +1072,108 @@ pub async fn post_messages(
         )
         .await
     }
+}
+
+/// 派发 WebSearch 请求并按凭据类型记账。
+///
+/// `/v1/messages` 与其 beta 变体两条路径共用此函数 —— 它们此前各写一份等价逻辑，
+/// 结果上游直通的修复只落在一处、另一处继续沿用旧行为。同一份代码可避免再次分叉。
+///
+/// 记账分两种口径：
+/// - **上游凭据直通**：上游报的真实 usage + 膨胀倍率，与普通上游直通一致；
+/// - **Kiro MCP 路径**：本地估算，`credential_id` 记 0（走 /mcp 端点，无凭据上下文）。
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_websearch(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    payload: &MessagesRequest,
+    input_tokens: i32,
+    key_ctx: &KeyContext,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    multipliers: super::cache_engine::UsageMultipliers,
+    usage_mode: super::cache_engine::UsageMode,
+    global_muls: (f64, f64, f64),
+) -> Response {
+    let (resp, upstream_usage) = websearch::handle_websearch_request(
+        provider,
+        payload,
+        input_tokens,
+        key_ctx.group.as_deref(),
+        cache_usage,
+        multipliers,
+        usage_mode,
+    )
+    .await;
+    let status = if resp.status().is_success() {
+        "success"
+    } else {
+        "error"
+    };
+
+    match upstream_usage {
+        Some(websearch::UpstreamWebSearchUsage::Stream {
+            credential_id,
+            usage_rx,
+        }) => {
+            // 流末尾才知道真实用量，故在后台任务里记账，不阻塞响应下发
+            tokio::spawn(async move {
+                let usage = usage_rx.await.unwrap_or_default();
+                let _ = hook.set_upstream_billing_usage(
+                    usage.raw_usage,
+                    ClientTokens {
+                        input: usage.input_tokens,
+                        output: usage.output_tokens,
+                        cache_creation: usage.cache_creation_tokens,
+                        cache_read: usage.cache_read_tokens,
+                    },
+                    global_muls,
+                );
+                hook.record(
+                    credential_id,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_creation_tokens,
+                    usage.cache_read_tokens,
+                    0.0,
+                    status,
+                );
+            });
+        }
+        Some(websearch::UpstreamWebSearchUsage::NonStream {
+            credential_id,
+            input_tokens: in_tok,
+            output_tokens: out_tok,
+            cache_creation,
+            cache_read,
+            raw_usage,
+        }) => {
+            let _ = hook.set_upstream_billing_usage(
+                raw_usage,
+                ClientTokens {
+                    input: in_tok,
+                    output: out_tok,
+                    cache_creation,
+                    cache_read,
+                },
+                global_muls,
+            );
+            hook.record(
+                credential_id,
+                in_tok,
+                out_tok,
+                cache_creation,
+                cache_read,
+                0.0,
+                status,
+            );
+        }
+        None => {
+            // 记账口径与下发给客户端的 usage 保持一致（同一 split 结果）
+            let (rec_input, rec_cc, rec_cr) = cache_usage.split_against_total(input_tokens);
+            hook.record(0, rec_input, 0, rec_cc, rec_cr, 0.0, status);
+        }
+    }
+    resp
 }
 
 /// 处理流式请求
@@ -1956,34 +2050,26 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
         // 与 /v1/messages 同处理：WebSearch 也要走 begin()，见该处注释。
-        let (ws_cache_usage, _ws_multipliers, ws_pending, _ws_mode) =
+        let ws_global_muls = provider.get_inflation_multipliers();
+        let (ws_cache_usage, ws_multipliers, ws_pending, ws_mode) =
             state
                 .cache_engines
-                .begin(
-                    &payload,
-                    key_ctx.key_id,
-                    key_ctx.cache_engine,
-                    provider.get_inflation_multipliers(),
-                );
+                .begin(&payload, key_ctx.key_id, key_ctx.cache_engine, ws_global_muls);
         hook.set_billing_request(key_ctx.cache_engine, ws_cache_usage);
         hook.set_pending_cache(ws_pending);
 
-        let resp = websearch::handle_websearch_request(
+        return dispatch_websearch(
             provider,
             &payload,
             input_tokens,
-            key_ctx.group.as_deref(),
+            &key_ctx,
+            hook,
             ws_cache_usage,
+            ws_multipliers,
+            ws_mode,
+            ws_global_muls,
         )
         .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        let (rec_input, rec_cc, rec_cr) = ws_cache_usage.split_against_total(input_tokens);
-        hook.record(0, rec_input, 0, rec_cc, rec_cr, 0.0, status);
-        return resp;
     }
 
     let payload_stream = payload.stream;

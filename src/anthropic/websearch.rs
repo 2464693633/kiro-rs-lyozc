@@ -593,14 +593,42 @@ fn render_websearch_response(
     }
 }
 
+/// 上游 WebSearch 直通产生的用量，供调用方接到 `hook` 上，
+/// 使这条路径的计费口径与普通上游直通一致。
+///
+/// 不含 Response —— 它始终是 [`handle_websearch_request`] 的第一个返回值，
+/// 避免「响应到底该从哪个字段取」的歧义。
+pub enum UpstreamWebSearchUsage {
+    /// 流式：用量要等整条流跑完才知道，故用 `oneshot` 回传。
+    Stream {
+        credential_id: u64,
+        usage_rx: tokio::sync::oneshot::Receiver<super::upstream::UpstreamStreamUsage>,
+    },
+    /// 非流式：用量当场就有（膨胀前的客户端口径 + 上游真实值）。
+    NonStream {
+        credential_id: u64,
+        input_tokens: i32,
+        output_tokens: i32,
+        cache_creation: i32,
+        cache_read: i32,
+        raw_usage: crate::admin::usage_stats::TokenUsageBreakdown,
+    },
+}
+
 /// 处理 WebSearch 请求
+///
+/// 返回 `(Response, Option<UpstreamWebSearchUsage>)`：Response 始终是要下发给客户端的那个。
+/// - `None` 表示走的是 Kiro 的 MCP 搜索路径，调用方按原有方式记账；
+/// - `Some(..)` 表示上游凭据直通，调用方需按其中的用量记账。
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
     cache_usage: super::cache_metering::CacheUsage,
-) -> Response {
+    multipliers: super::cache_engine::UsageMultipliers,
+    usage_mode: super::cache_engine::UsageMode,
+) -> (Response, Option<UpstreamWebSearchUsage>) {
     // 上游凭据直通：Anthropic 原生支持 web_search_20250610 tool，直接透传请求。
     // 提前 acquire 一次以判断凭据类型（后续 call_api_dual 内部会再 acquire，
     // 但因为同一 group 且短时间内，走同一凭据的概率极高）。
@@ -614,55 +642,97 @@ pub async fn handle_websearch_request(
                 Ok(b) => b,
                 Err(e) => {
                     return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(ErrorResponse::new(
-                            "internal_error",
-                            &format!("序列化请求失败: {}", e),
-                        )),
-                    )
-                        .into_response();
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(ErrorResponse::new(
+                                "internal_error",
+                                &format!("序列化请求失败: {}", e),
+                            )),
+                        )
+                            .into_response(),
+                        None,
+                    );
                 }
             };
             // 透传给上游，由 Anthropic 原生处理 web_search tool
             // 使用 call_api_dual_for_credential(ctx.id, ...) 而非 call_api_dual，
             // 避免内部再次 acquire_context：balanced 模式下第二次 acquire 可能路由
             // 到 Kiro 凭据，导致 Anthropic body 发给 Kiro 端点产生 400 错误。
-            return match provider
+            let call_result = match provider
                 .call_api_dual_for_credential(ctx.id, &anthropic_body, &anthropic_body)
                 .await
             {
-                Ok(result) => {
-                    // 上游响应是 reqwest::Response，转为 axum Response
-                    let status = result.response.status();
-                    match result.response.bytes().await {
-                        Ok(body) => {
-                            let mut response = axum::response::Response::new(axum::body::Body::from(body));
-                            *response.status_mut() = status;
-                            response.headers_mut().insert(
-                                axum::http::header::CONTENT_TYPE,
-                                axum::http::HeaderValue::from_static("application/json"),
-                            );
-                            response
-                        }
-                        Err(e) => {
-                            tracing::warn!("读取上游 WebSearch 响应失败: {}", e);
-                            (
-                                StatusCode::BAD_GATEWAY,
-                                Json(ErrorResponse::new("upstream_error", &format!("读取响应失败: {}", e))),
-                            )
-                                .into_response()
-                        }
-                    }
-                }
+                Ok(result) => result,
                 Err(e) => {
                     tracing::warn!("上游 WebSearch 请求失败: {}", e);
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse::new("upstream_error", &e.to_string())),
-                    )
-                        .into_response()
+                    return (
+                        (
+                            StatusCode::BAD_GATEWAY,
+                            Json(ErrorResponse::new("upstream_error", &e.to_string())),
+                        )
+                            .into_response(),
+                        None,
+                    );
                 }
             };
+
+            // 必须按 `stream` 分流，且复用普通上游直通那两个函数。
+            //
+            // 此前这里无论流式与否都 `bytes().await` 整体缓冲、再把 content-type 硬写成
+            // `application/json`：而 Claude Code 的 WebSearch 请求带 `stream: true`，
+            // 上游回的是 SSE。客户端按 SSE 解析一个标称 JSON 的响应，什么都取不到 ——
+            // 表面现象就是「WebSearch 不返回结果」。
+            //
+            // 顺带把计费接上：原先这条路径既不应用膨胀倍率、也不回报上游真实 usage。
+            let (input_mul, output_mul, cache_mul, cache_creation_mul) = multipliers.resolve();
+            let simulated_total_input = cache_usage.prompt_total_est.max(1);
+
+            if payload.stream {
+                let (response, usage_rx) =
+                    super::upstream::handle_upstream_stream_response_with_inflation(
+                        call_result.response,
+                        input_mul,
+                        output_mul,
+                        cache_mul,
+                        cache_creation_mul,
+                        simulated_total_input,
+                        cache_usage,
+                        usage_mode,
+                        input_tokens,
+                    );
+                return (
+                    response,
+                    Some(UpstreamWebSearchUsage::Stream {
+                        credential_id: call_result.credential_id,
+                        usage_rx,
+                    }),
+                );
+            }
+
+            let (response, in_tok, out_tok, cc, cr, raw_usage) =
+                super::upstream::handle_upstream_non_stream_response(
+                    call_result.response,
+                    input_mul,
+                    output_mul,
+                    cache_mul,
+                    cache_creation_mul,
+                    simulated_total_input,
+                    cache_usage,
+                    usage_mode,
+                    input_tokens,
+                )
+                .await;
+            return (
+                response,
+                Some(UpstreamWebSearchUsage::NonStream {
+                    credential_id: call_result.credential_id,
+                    input_tokens: in_tok,
+                    output_tokens: out_tok,
+                    cache_creation: cc,
+                    cache_read: cr,
+                    raw_usage,
+                }),
+            );
         }
         Ok(_) => {
             // Kiro 凭据走 MCP 路径（现有逻辑）
@@ -670,10 +740,13 @@ pub async fn handle_websearch_request(
         Err(e) => {
             tracing::warn!("WebSearch acquire_context 失败: {}", e);
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(ErrorResponse::new("no_available_credentials", &e.to_string())),
-            )
-                .into_response();
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse::new("no_available_credentials", &e.to_string())),
+                )
+                    .into_response(),
+                None,
+            );
         }
     }
 
@@ -684,13 +757,16 @@ pub async fn handle_websearch_request(
         Some(q) => q,
         None => {
             return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "无法从消息中提取搜索查询",
-                )),
-            )
-                .into_response();
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse::new(
+                        "invalid_request_error",
+                        "无法从消息中提取搜索查询",
+                    )),
+                )
+                    .into_response(),
+                None,
+            );
         }
     };
 
@@ -702,18 +778,21 @@ pub async fn handle_websearch_request(
     // 3. 调用 Kiro MCP API
     let search_results = match finish_mcp_call(call_mcp_api(&provider, &mcp_request, group).await) {
         Ok(results) => results,
-        Err(response) => return response,
+        Err(response) => return (response, None),
     };
 
     // 4. 按请求模式生成响应
-    render_websearch_response(
-        payload.stream,
-        payload.model.clone(),
-        query,
-        tool_use_id,
-        search_results,
-        input_tokens,
-        cache_usage,
+    (
+        render_websearch_response(
+            payload.stream,
+            payload.model.clone(),
+            query,
+            tool_use_id,
+            search_results,
+            input_tokens,
+            cache_usage,
+        ),
+        None,
     )
 }
 

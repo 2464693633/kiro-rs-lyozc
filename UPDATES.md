@@ -9,6 +9,41 @@
 
 ---
 
+## 2026-08-09 — 上游凭据的 WebSearch 无返回（SSE 被当 JSON 缓冲）
+
+**现象**：上游 API 项目本身支持 Claude Code 的 WebSearch，但接到 kiro-rs 作为上游后
+WebSearch 不返回结果。
+
+**根因**：上游 WebSearch 直通分支把响应当**完整 JSON** 处理 —— `bytes().await` 整体
+缓冲，再把 `content-type` 硬写成 `application/json`。而 Claude Code 的 WebSearch 请求
+带 `stream: true`，上游回的是 SSE。客户端按 `application/json` 去解析一段 SSE 文本，
+什么都取不出来。
+
+反向验证（把修复条件临时改成 `false` 重跑同一套断言）给出了精确判据：
+`content-type=application/json`、`chunks=1`（一次收完而非逐事件），**而 SSE 文本仍在
+body 里**。所以不是内容丢失，是包装错了 —— 这也解释了为什么表现为「静默无结果」
+而不是报错。
+
+对比：普通聊天的上游直通走
+[`handle_upstream_stream_response_with_inflation`](src/anthropic/upstream.rs#L397)，
+是正确的流式转发。WebSearch 分支绕过了它、自己手写了一个只处理非流式的版本。
+kiro2cc-proxy 没有这个「按凭据类型分叉」的逻辑，所以不受影响。
+
+**修复**：按 `payload.stream` 分流，复用普通上游直通已在用的那两个函数，不再自己拼响应。
+
+**两处并行路径**：`/v1/messages` 与其 beta 变体各写了一份等价的 WebSearch 派发逻辑。
+若只改一处，另一处会继续沿用旧行为 —— 已抽成 `dispatch_websearch` 共用，避免再次分叉。
+
+**顺带修好计费**：这条路径原先既不应用膨胀倍率、也不回报上游真实 usage
+（`begin()` 返回的 `multipliers` / `mode` 被 `_` 丢弃了）。现在与普通上游直通同口径，
+`credential_id` 也记真实值而非 0。
+
+**实测**（mock 上游 + 15 条断言，脚本已删）：流式回 `text/event-stream`、6 个 chunk
+逐事件到达、`message_start` / `content_block_delta` / `message_stop` 齐全、搜索内容
+送达客户端；非流式回 `application/json` 且 `usage` 存在；普通聊天回归未受影响。
+
+---
+
 ## 2026-08-09 — 客户端 Key 支持回看明文
 
 **问题**：Key 明文只在创建/轮换的那一次弹窗里出现，关掉就再也看不到。列表里只有
