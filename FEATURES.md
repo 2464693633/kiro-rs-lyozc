@@ -754,6 +754,13 @@ PUT  /api/admin/client-keys/{id}     可修改
 - **问题**：`cache_metering_go.rs` 的 `compute_for_account` 里三处 `drop(inner)`，而 `inner` 是 `&mut TrackerInner`（从 guard 借出）。drop 一个引用什么都不做，锁一直持到函数返回。编译器报 `argument has type &mut TrackerInner`
 - **修复**：改 `drop(all)`（guard 本体）。NLL 下合法 —— 那些位置之后 `inner` 不再被用，借用已结束。原本想要的提前解锁现在真的生效
 
+**P13 — 上游凭据流式响应中模拟缓存在流末尾被上游原值覆盖**
+
+- **触发**：客户端 Key 使用任意模拟引擎（A/B/C/D）+ 上游 API 凭据 + 流式请求
+- **原因**：Anthropic 官方规定 `message_delta.usage` 的 token 计数是**累积**口径，客户端 SDK 用它覆盖 `message_start` 的快照。`upstream.rs` 的 `inflate_sse_event` 在 `message_delta` 分支只改写了 `output_tokens`，`input_tokens` / `cache_creation_input_tokens` / `cache_read_input_tokens` 三项原样透传上游真值 —— 于是 `message_start` 里刚写好的引擎口径在流末尾被上游原值顶掉，客户端最终显示的完全等于上游真值，四个引擎的模拟全部等于没生效。Kiro 路径不受影响，因为它自己生成 `message_delta`（`SseStateManager::generate_final_events` 填的是模拟值），没有上游字段可漏
+- **修复**：`inflate_sse_event` 的 `message_delta` 分支对上游下发的 input / cache 三项同样走 `resolve_tokens` 重建并乘倍率；`update_stream_stats` 同步跟上，保证客户端所见与用量日志同源。上游未下发某项时不补写（保留 `message_start` 基线）；部分下发时缺失项回落 `raw_usage` 里 `message_start` 存下的真值，不补 0
+- **测试**：`message_delta_rewrites_cumulative_input_and_cache` / `message_delta_without_cumulative_fields_adds_nothing` / `stream_stats_follow_message_delta_cumulative_fields` / `real_mode_partial_message_delta_falls_back_to_message_start` / `nocache_message_delta_keeps_local_input_and_zero_cache`
+
 ---
 
 ### 🟡 中严重度

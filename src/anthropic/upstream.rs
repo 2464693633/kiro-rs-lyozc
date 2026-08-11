@@ -250,8 +250,15 @@ pub async fn handle_upstream_non_stream_response(
 
 /// 对单条 SSE 事件文本应用膨胀倍率（模拟缓存）。
 ///
-/// 仅重写 `message_start`（usage.input_tokens / cache_* 字段）和
-/// `message_delta`（usage.output_tokens 字段），其余事件原样透传。
+/// 仅重写 `message_start` 与 `message_delta` 两类事件的 usage，其余原样透传。
+/// **两者都要改全部四项**：`message_delta.usage` 的计数按官方约定是**累积**的
+/// （"The token counts shown in the usage field of the message_delta event are
+/// cumulative"），客户端 SDK 的 accumulate 用它覆盖 `message_start` 的快照。
+/// 若这里只改 output、把 input / cache 原样透传，`message_start` 刚写好的引擎
+/// 口径会在流末尾被上游真值顶掉 —— 客户端最终显示的就是上游原值，四个引擎的
+/// 模拟全部等于没生效。Kiro 路径不受影响是因为它自己生成 `message_delta`
+/// （[`super::stream::SseStateManager::generate_final_events`] 填的是模拟值），
+/// 没有上游字段可漏。
 ///
 /// `local_input` 是客户端请求的本地 token 估算（引擎 D 用它取代上游 input）。
 /// `local_output` 是本地累积算出的输出量，仅引擎 D 在 `message_delta` 时用 ——
@@ -306,25 +313,65 @@ fn inflate_sse_event(
         }
         (Some("message_delta"), Some(data)) => {
             if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(data) {
+                // 全部在改写前读出：下面的写入会就地覆盖同一对象。
                 // 用 pointer 而非 get_mut("usage")：上游可能整个 usage 对象都没下发，
                 // 若把改写整体套在 `if let Some(usage)` 里，引擎 D 就会因为「没有可改
                 // 的对象」而一个字都不写，客户端拿到 output_tokens 缺失。
-                let upstream_output = json.pointer("/usage/output_tokens").and_then(|v| v.as_i64());
+                let usage_val = json.pointer("/usage");
+                let read = |key: &str| usage_val.and_then(|u| u.get(key)).and_then(|v| v.as_i64());
+                let upstream_output = read("output_tokens");
+                // input / cache 三项同样是**累积**口径，上游给了就必须按引擎口径改写 ——
+                // 原样透传会把 message_start 里刚写好的模拟值顶掉（见函数头注释）。
+                let real_input = read("input_tokens");
+                let real_cc = read("cache_creation_input_tokens");
+                let real_cr = read("cache_read_input_tokens");
+                let (base_input, base_cc, base_cr) = mode.resolve_tokens(
+                    cache_usage,
+                    simulated_total_input,
+                    (
+                        real_input.unwrap_or(0) as i32,
+                        real_cc.unwrap_or(0) as i32,
+                        real_cr.unwrap_or(0) as i32,
+                    ),
+                    local_input,
+                );
                 // 引擎 D 的 output 口径与上游无关：上游没给也必须补出本地值，故下面
                 // 按需**创建** usage 对象（与非流式路径的 `entry().or_insert_with` 同策）。
                 // 其余三引擎沿用原行为：只在上游确实给了字段时才改写，不凭空造字段。
-                let base = match mode {
+                let base_output = match mode {
                     UsageMode::NoCache => {
                         Some(mode.resolve_output(upstream_output.unwrap_or(0) as i32, local_output))
                     }
                     _ => upstream_output.map(|v| v as i32),
                 };
-                if let Some(base) = base {
-                    let scaled = serde_json::json!((base as f64 * output_mul).round() as i64);
-                    if let Some(obj) = json.as_object_mut() {
-                        let usage = obj.entry("usage").or_insert_with(|| serde_json::json!({}));
-                        if let Some(usage) = usage.as_object_mut() {
-                            usage.insert("output_tokens".to_string(), scaled);
+                let needs_write = base_output.is_some()
+                    || real_input.is_some()
+                    || real_cc.is_some()
+                    || real_cr.is_some();
+                if needs_write && let Some(obj) = json.as_object_mut() {
+                    let usage = obj.entry("usage").or_insert_with(|| serde_json::json!({}));
+                    if let Some(usage) = usage.as_object_mut() {
+                        let scale =
+                            |v: i32, mul: f64| serde_json::json!((v as f64 * mul).round() as i64);
+                        if let Some(base) = base_output {
+                            usage.insert("output_tokens".to_string(), scale(base, output_mul));
+                        }
+                        // 三项各自只在上游给了时改写：`message_start` 已建立基线，凭空
+                        // 补出上游刻意省略的累积字段只会多一处口径来源。
+                        if real_input.is_some() {
+                            usage.insert("input_tokens".to_string(), scale(base_input, input_mul));
+                        }
+                        if real_cc.is_some() {
+                            usage.insert(
+                                "cache_creation_input_tokens".to_string(),
+                                scale(base_cc, cache_creation_mul),
+                            );
+                        }
+                        if real_cr.is_some() {
+                            usage.insert(
+                                "cache_read_input_tokens".to_string(),
+                                scale(base_cr, cache_mul),
+                            );
                         }
                     }
                 }
@@ -374,7 +421,9 @@ fn update_stream_stats(
         }
         (Some("message_delta"), Some(data)) => {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
-                let upstream_output = json.pointer("/usage/output_tokens").and_then(|v| v.as_i64());
+                let usage_val = json.pointer("/usage");
+                let read = |key: &str| usage_val.and_then(|u| u.get(key)).and_then(|v| v.as_i64());
+                let upstream_output = read("output_tokens");
                 // raw_usage 恒为上游真值，且只在上游确实下发该字段时写 —— 否则会把
                 // "上游没给"记成 0，污染计费对比表的"上游真实"列。
                 if let Some(v) = upstream_output {
@@ -383,6 +432,39 @@ fn update_stream_stats(
                 // 引擎 D 用本地累积值，且上游缺字段时也要记；其余引擎沿用上游真值。
                 stats.output_tokens =
                     mode.resolve_output(upstream_output.unwrap_or(0) as i32, local_output);
+
+                // `message_delta` 的 input / cache 也是累积口径，与 inflate_sse_event
+                // 必须同源：客户端看到的是这条事件改写后的值，记账若还停在
+                // `message_start` 那一版，两者会分叉。仅在上游确实下发时覆盖 ——
+                // 上游省略该字段时 `message_start` 已写好的值就是最终值。
+                let real_input = read("input_tokens");
+                let real_cc = read("cache_creation_input_tokens");
+                let real_cr = read("cache_read_input_tokens");
+                if real_input.is_some() || real_cc.is_some() || real_cr.is_some() {
+                    if let Some(v) = real_input {
+                        stats.raw_usage.input_tokens = v.max(0) as u64;
+                    }
+                    if let Some(v) = real_cc {
+                        stats.raw_usage.cache_creation_tokens = v.max(0) as u64;
+                    }
+                    if let Some(v) = real_cr {
+                        stats.raw_usage.cache_read_tokens = v.max(0) as u64;
+                    }
+                    // 缺失项回落 raw_usage 里 message_start 存下的真值，而非 0 ——
+                    // 引擎 C 会原样采用这三元组，补 0 等于凭空抹掉一项真实消耗。
+                    let real = (
+                        real_input.unwrap_or(stats.raw_usage.input_tokens as i64).max(0) as i32,
+                        real_cc
+                            .unwrap_or(stats.raw_usage.cache_creation_tokens as i64)
+                            .max(0) as i32,
+                        real_cr.unwrap_or(stats.raw_usage.cache_read_tokens as i64).max(0) as i32,
+                    );
+                    let (input, creation, read_tok) =
+                        mode.resolve_tokens(cache_usage, simulated_total_input, real, local_input);
+                    stats.input_tokens = input;
+                    stats.cache_creation_tokens = creation;
+                    stats.cache_read_tokens = read_tok;
+                }
             }
         }
         _ => {}
@@ -764,6 +846,174 @@ mod tests {
         );
         assert!(!acc.is_empty());
         assert_eq!(acc.estimate(), 8, "redacted_thinking 固定 8 token");
+    }
+
+    /// P13 回归：`message_delta` 的 input / cache 是**累积**口径，会覆盖
+    /// `message_start`。只改 output 会让四个引擎的模拟在流末尾被上游真值顶掉 ——
+    /// 这正是「上游凭据下客户端显示的 token 恒等于上游原值」的成因。
+    #[test]
+    fn message_delta_rewrites_cumulative_input_and_cache() {
+        let cache_usage = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 100,
+            prompt_total_est: 200,
+        };
+        assert!(cache_usage.is_simulated());
+
+        // 官方 web_search 流式示例的形状：message_delta 带完整四项。
+        let event = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"input_tokens\":10682,\"cache_creation_input_tokens\":0,",
+            "\"cache_read_input_tokens\":0,\"output_tokens\":510,",
+            "\"server_tool_use\":{\"web_search_requests\":1}}}\n\n"
+        );
+
+        let rendered = inflate_sse_event(
+            event, 1.0, 1.0, 1.0, 1.0, 200, cache_usage,
+            UsageMode::Simulated, -999, Some(-999),
+        );
+        let data = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("message_delta 必须包含 data");
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["usage"];
+
+        // 模拟口径：total=200、覆盖 50% → input=100, cc=50, cr=50。
+        // 上游的 10682 不得穿到客户端。
+        assert_eq!(usage["input_tokens"], serde_json::json!(100), "累积 input 必须是模拟值");
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(50));
+        assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(50));
+        assert_eq!(usage["output_tokens"], serde_json::json!(510), "output 沿用上游真值");
+        // 不认识的字段原样保留（server_tool_use 是官方字段，客户端要用）。
+        assert_eq!(
+            usage["server_tool_use"]["web_search_requests"],
+            serde_json::json!(1),
+            "未参与改写的 usage 字段不得被丢弃"
+        );
+    }
+
+    /// 官方基础流式示例：`message_delta` 只有 `output_tokens`。此时不得凭空补出
+    /// input / cache —— `message_start` 已建立基线，补字段等于多一处口径来源。
+    #[test]
+    fn message_delta_without_cumulative_fields_adds_nothing() {
+        let event = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":15}}\n\n"
+        );
+
+        let rendered = inflate_sse_event(
+            event, 3.0, 1.0, 3.0, 3.0, 200,
+            CacheUsage { cache_read: 50, cache_covered_est: 100, prompt_total_est: 200 },
+            UsageMode::Simulated, -999, Some(-999),
+        );
+        let data = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["usage"];
+
+        assert_eq!(usage["output_tokens"], serde_json::json!(15));
+        assert!(usage.get("input_tokens").is_none(), "上游未给 input 时不得补写");
+        assert!(usage.get("cache_creation_input_tokens").is_none());
+        assert!(usage.get("cache_read_input_tokens").is_none());
+    }
+
+    /// 记账必须与下发同源：客户端看到改写值、日志记上游真值就会对不上账。
+    #[test]
+    fn stream_stats_follow_message_delta_cumulative_fields() {
+        let cache_usage = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 100,
+            prompt_total_est: 200,
+        };
+        let mut stats = UpstreamStreamUsage::default();
+
+        // 先喂 message_start（上游报的是小数值），再喂累积的 message_delta。
+        update_stream_stats(
+            concat!(
+                "event: message_start\n",
+                "data: {\"message\":{\"usage\":{\"input_tokens\":2679,",
+                "\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0}}}\n\n"
+            ),
+            &mut stats, 200, cache_usage, UsageMode::Simulated, -999, None,
+        );
+        update_stream_stats(
+            concat!(
+                "event: message_delta\n",
+                "data: {\"usage\":{\"input_tokens\":10682,\"cache_creation_input_tokens\":0,",
+                "\"cache_read_input_tokens\":0,\"output_tokens\":510}}\n\n"
+            ),
+            &mut stats, 200, cache_usage, UsageMode::Simulated, -999, None,
+        );
+
+        // 客户端口径：模拟分摊，与 inflate_sse_event 一致。
+        assert_eq!(stats.input_tokens, 100);
+        assert_eq!(stats.cache_creation_tokens, 50);
+        assert_eq!(stats.cache_read_tokens, 50);
+        assert_eq!(stats.output_tokens, 510);
+        // raw_usage 取累积后的上游真值（10682，不是 message_start 的 2679）。
+        assert_eq!(stats.raw_usage.input_tokens, 10682, "上游真实列应取累积终值");
+        assert_eq!(stats.raw_usage.output_tokens, 510);
+    }
+
+    /// 引擎 C 原样采用上游真值：`message_delta` 部分下发时，缺失项必须回落
+    /// `message_start` 存下的真值，不能补 0 抹掉一项真实消耗。
+    #[test]
+    fn real_mode_partial_message_delta_falls_back_to_message_start() {
+        let mut stats = UpstreamStreamUsage::default();
+
+        update_stream_stats(
+            concat!(
+                "event: message_start\n",
+                "data: {\"message\":{\"usage\":{\"input_tokens\":800,",
+                "\"cache_creation_input_tokens\":120,\"cache_read_input_tokens\":400}}}\n\n"
+            ),
+            &mut stats, 0, CacheUsage::default(), UsageMode::Real, 0, None,
+        );
+        assert_eq!(stats.cache_read_tokens, 400);
+
+        // 只带 input_tokens 的累积更新：cache 两项不该被抹成 0。
+        update_stream_stats(
+            "event: message_delta\ndata: {\"usage\":{\"input_tokens\":950,\"output_tokens\":7}}\n\n",
+            &mut stats, 0, CacheUsage::default(), UsageMode::Real, 0, None,
+        );
+
+        assert_eq!(stats.input_tokens, 950, "input 取累积终值");
+        assert_eq!(stats.cache_creation_tokens, 120, "上游未重报，保留 message_start 的值");
+        assert_eq!(stats.cache_read_tokens, 400, "不得被补 0 抹掉");
+        assert_eq!(stats.raw_usage.cache_read_tokens, 400);
+    }
+
+    /// 引擎 D 的 cache 恒为 0、input 取本地估算 —— 累积事件同样不得让上游值漏出。
+    #[test]
+    fn nocache_message_delta_keeps_local_input_and_zero_cache() {
+        let event = concat!(
+            "event: message_delta\n",
+            "data: {\"usage\":{\"input_tokens\":10682,\"cache_creation_input_tokens\":300,",
+            "\"cache_read_input_tokens\":900,\"output_tokens\":510}}\n\n"
+        );
+
+        let rendered = inflate_sse_event(
+            event, 2.0, 1.0, 1.0, 1.0, 0, CacheUsage::default(),
+            UsageMode::NoCache,
+            1234,      // local_input
+            Some(77),  // local_output
+        );
+        let data = rendered
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["usage"];
+
+        assert_eq!(usage["input_tokens"], serde_json::json!(2468), "1234×2，与上游 10682 无关");
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(0), "D 的 cache 恒为 0");
+        assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(0));
+        assert_eq!(usage["output_tokens"], serde_json::json!(77), "本地估算，output_mul=1.0");
     }
 
     /// 有模拟数据时行为不变（防止 P1 修复回归到"永远走真实值"）。
