@@ -9,6 +9,36 @@
 
 ---
 
+## 2026-08-09 — 合并上游：opus-5 纳入 1M 上下文窗口
+
+上游 [PR #61](https://github.com/ZyphrZero/kiro.rs/pull/61)（`eb309f7`），改一个文件、
+一个函数。**自动合并零冲突**。
+
+**修的是什么**：`get_context_window_size` 的 1M 模型名单里漏了 `claude-opus-5`。名单里
+已有 opus-4.6/4.7/4.8、sonnet-4.6/4.8/5、fable-5，opus-5 掉了。
+
+**后果不在请求侧，在 usage 侧**：该返回值用于 `Event::ContextUsage` 把上游只回报的
+**百分比**换算成 token 数（`pct × window / 100`）。漏配 → 按 200k 而非 1M 换算 →
+**usage 上报缩小 5 倍** → 客户端的上下文进度条与自动压缩阈值全部失准（实际用了 50 万
+token，显示成 10 万，压缩迟迟不触发）。发往上游的请求不受影响。
+
+**与本 fork 的关系**：我们在用 `claude-opus-5`，所以这个修复直接相关。之前那次
+`Input is too long` 里，压缩不及时可能是其中一环 —— 但不是直接成因（那个报错的根因是
+上游转换后载荷超 Kiro 单次请求体上限，见 2026-08-04 那节）。
+
+**为什么没冲突**：上游改的是该函数的 match 分支，我方在同一函数的改动
+（`custom_models::lookup` 优先返回，位于第 286 / 305 行）在其**上方**，两处不重叠。
+合并后已核实我方那段仍在。
+
+上游同时补了两个回归测试 —— `test_context_window_opus_5`（含别名 / 后缀变体，以及
+「`opus-4-5` 不得被误匹配为 `opus-5`」）与 `test_context_window_1m_family`（整个 1M 名单
+的正反校验）。后者是防再次漏配的：新增 1M 模型时若忘了同步名单，它会失败。
+
+验证：`cargo test` **767 passed / 0 failed**（合并前 744 + 上游新增），
+`cargo check --all-targets` 零 warning。
+
+---
+
 ## 2026-08-09 — 上游凭据的 WebSearch 无返回（SSE 被当 JSON 缓冲）
 
 **现象**：上游 API 项目本身支持 Claude Code 的 WebSearch，但接到 kiro-rs 作为上游后
