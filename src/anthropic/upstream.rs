@@ -237,6 +237,10 @@ pub async fn handle_upstream_non_stream_response(
             serde_json::json!((sim_cr as f64 * cache_mul).round() as i64),
         );
     }
+    // 嵌套 cache_creation：与流式两处同策，扁平值改了它就必须跟着改。
+    if let Some(usage) = json.get_mut("usage") {
+        rescale_nested_cache_creation(usage, (sim_cc as f64 * cache_creation_mul).round() as i64);
+    }
 
     let resp = Response::builder()
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::OK))
@@ -246,6 +250,48 @@ pub async fn handle_upstream_non_stream_response(
 
     // 返回膨胀前的客户端口径供 hook.record 记录（引擎 D 时 output 为本地估算值）
     (resp, sim_input, client_output, sim_cc, sim_cr, raw_usage)
+}
+
+/// 把嵌套 `usage.cache_creation` 重标定到给定的 creation 总量。
+///
+/// Anthropic 的 usage 里 creation 有**两种表达**：扁平的
+/// `cache_creation_input_tokens`，以及嵌套对象 `cache_creation`
+/// （`ephemeral_5m_input_tokens` + `ephemeral_1h_input_tokens`，两项之和等于扁平值）。
+/// 只改扁平值会让两者自相矛盾 —— 客户端若读嵌套项（SDK 的
+/// `usage.cache_creation.ephemeral_5m_input_tokens`）拿到的仍是上游真值，模拟等于没生效。
+///
+/// 重标定保留上游的 5m/1h 配比（那是 TTL 归属，不是可模拟的量），只把总量换成本
+/// 引擎口径；残差补给 5m 使两项之和**恒等于** target。上游未下发该对象时不创建 ——
+/// 与扁平字段同策，不凭空造上游没给的字段。
+fn rescale_nested_cache_creation(usage: &mut serde_json::Value, target_cc: i64) {
+    let Some(nested) = usage.get("cache_creation").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let read = |k: &str| nested.get(k).and_then(|v| v.as_i64()).unwrap_or(0).max(0);
+    let m5 = read("ephemeral_5m_input_tokens");
+    let h1 = read("ephemeral_1h_input_tokens");
+    let sum = m5 + h1;
+    let target = target_cc.max(0);
+    // 上游两项全 0（或无该键）时整体归 5m：5m 是 ephemeral 的缺省 TTL。
+    let new_1h = if sum > 0 {
+        (((h1 as f64) * (target as f64) / (sum as f64)).round() as i64).clamp(0, target)
+    } else {
+        0
+    };
+    let new_5m = target - new_1h;
+    if let Some(nested) = usage
+        .get_mut("cache_creation")
+        .and_then(|v| v.as_object_mut())
+    {
+        nested.insert(
+            "ephemeral_5m_input_tokens".to_string(),
+            serde_json::json!(new_5m),
+        );
+        nested.insert(
+            "ephemeral_1h_input_tokens".to_string(),
+            serde_json::json!(new_1h),
+        );
+    }
 }
 
 /// 对单条 SSE 事件文本应用膨胀倍率（模拟缓存）。
@@ -303,9 +349,12 @@ fn inflate_sse_event(
                     // 四引擎的口径分歧全在 resolve_tokens 里，此处不再自行分支。
                     let (base_input, base_cc, base_cr) =
                         mode.resolve_tokens(cache_usage, simulated_total_input, real, local_input);
+                    let scaled_cc = (base_cc as f64 * cache_creation_mul).round() as i64;
                     usage["input_tokens"] = serde_json::json!((base_input as f64 * input_mul).round() as i64);
-                    usage["cache_creation_input_tokens"] = serde_json::json!((base_cc as f64 * cache_creation_mul).round() as i64);
+                    usage["cache_creation_input_tokens"] = serde_json::json!(scaled_cc);
                     usage["cache_read_input_tokens"] = serde_json::json!((base_cr as f64 * cache_mul).round() as i64);
+                    // 嵌套对象与扁平字段是同一个量的两种表达，必须一起改。
+                    rescale_nested_cache_creation(usage, scaled_cc);
                 }
                 return format!("event: message_start\ndata: {}\n\n", json);
             }
@@ -373,6 +422,14 @@ fn inflate_sse_event(
                                 scale(base_cr, cache_mul),
                             );
                         }
+                    }
+                    // 嵌套 cache_creation 同为累积口径，与扁平字段一起重标定。
+                    // 在 as_object_mut 之外做：helper 要同时读写该对象。
+                    if let Some(usage) = obj.get_mut("usage") {
+                        rescale_nested_cache_creation(
+                            usage,
+                            (base_cc as f64 * cache_creation_mul).round() as i64,
+                        );
                     }
                 }
                 return format!("event: message_delta\ndata: {}\n\n", json);
@@ -1014,6 +1071,138 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(0), "D 的 cache 恒为 0");
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(0));
         assert_eq!(usage["output_tokens"], serde_json::json!(77), "本地估算，output_mul=1.0");
+    }
+
+    /// P14 回归：嵌套 `usage.cache_creation` 必须与扁平字段一起重标定。
+    ///
+    /// creation 在 Anthropic usage 里有两种表达，只改扁平值会让客户端读嵌套项时
+    /// 仍拿到上游真值 —— 模拟对读嵌套项的 SDK 等于没生效，且两者自相矛盾。
+    #[test]
+    fn nested_cache_creation_is_rescaled_with_flat_field() {
+        let cache_usage = CacheUsage {
+            cache_read: 50,
+            cache_covered_est: 100,
+            prompt_total_est: 200,
+        };
+        // 官方 usage 形状：嵌套对象与扁平字段并存，且两项之和 == 扁平值。
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"usage\":{\"input_tokens\":2679,",
+            "\"cache_creation_input_tokens\":1024,\"cache_read_input_tokens\":0,",
+            "\"cache_creation\":{\"ephemeral_5m_input_tokens\":768,",
+            "\"ephemeral_1h_input_tokens\":256},\"output_tokens\":3}}}\n\n"
+        );
+        let rendered = inflate_sse_event(
+            event, 1.0, 1.0, 1.0, 1.0, 200, cache_usage,
+            UsageMode::Simulated, 5000, None,
+        );
+        let data = rendered.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["message"]["usage"];
+
+        // 模拟口径 cc=50。嵌套两项之和必须恒等于扁平值，且保留 768:256 = 3:1 配比。
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(50));
+        let m5 = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_i64().unwrap();
+        let h1 = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_i64().unwrap();
+        assert_eq!(m5 + h1, 50, "嵌套两项之和必须等于扁平值，否则自相矛盾");
+        assert_eq!(h1, 13, "保留上游 1/4 配比：50×0.25≈13");
+        assert_eq!(m5, 37, "残差补给 5m，保证和恒等");
+    }
+
+    /// 引擎 D 的 cache 恒为 0 —— 嵌套对象同样必须归零，不得漏出上游值。
+    #[test]
+    fn nested_cache_creation_zeroed_for_nocache_engine() {
+        let event = concat!(
+            "event: message_start\n",
+            "data: {\"message\":{\"usage\":{\"input_tokens\":2679,",
+            "\"cache_creation_input_tokens\":1024,\"cache_read_input_tokens\":512,",
+            "\"cache_creation\":{\"ephemeral_5m_input_tokens\":768,",
+            "\"ephemeral_1h_input_tokens\":256}}}}\n\n"
+        );
+        let rendered = inflate_sse_event(
+            event, 1.0, 1.0, 1.0, 1.0, 0, CacheUsage::default(),
+            UsageMode::NoCache, 1234, None,
+        );
+        let data = rendered.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(data).unwrap();
+        let usage = &json["message"]["usage"];
+
+        assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(0));
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], serde_json::json!(0));
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], serde_json::json!(0));
+    }
+
+    /// 上游未下发嵌套对象时不得凭空创建 —— 与扁平字段同策。
+    #[test]
+    fn nested_cache_creation_not_fabricated_when_absent() {
+        let mut usage = serde_json::json!({"cache_creation_input_tokens": 50});
+        rescale_nested_cache_creation(&mut usage, 50);
+        assert!(
+            usage.get("cache_creation").is_none(),
+            "上游没给嵌套对象就不该造一个出来"
+        );
+    }
+
+    /// 上游嵌套两项全 0 但目标非 0（如 Kiro 转发链路）：整体归 5m（ephemeral 缺省 TTL）。
+    #[test]
+    fn nested_cache_creation_all_zero_upstream_defaults_to_5m() {
+        let mut usage = serde_json::json!({
+            "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 0}
+        });
+        rescale_nested_cache_creation(&mut usage, 120);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], serde_json::json!(120));
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], serde_json::json!(0));
+    }
+
+    /// 非流式路径同样要重标定嵌套对象 —— 三个改写点必须同策。
+    #[test]
+    fn non_stream_rescales_nested_cache_creation() {
+        // 直接验 helper 在非流式那种 usage 形状上的行为（handle_upstream_non_stream_response
+        // 需要 reqwest::Response，无法在单测里构造）。
+        let mut usage = serde_json::json!({
+            "input_tokens": 2679,
+            "cache_creation_input_tokens": 1024,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1024, "ephemeral_1h_input_tokens": 0}
+        });
+        rescale_nested_cache_creation(&mut usage, 75);
+        assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], serde_json::json!(75));
+        assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], serde_json::json!(0));
+    }
+
+    /// 设计意图钉子：上游路径**刻意**用 `prompt_total_est` 作分摊分母，使客户端
+    /// 所见完全等于引擎自算，上游影响为零。
+    ///
+    /// 这个选择极容易被误判成 bug 并"修正"成 `count_all_tokens`（两者都是本地值，
+    /// 只是换了估算器）—— 审阅时确实按那个方向质疑过一轮。差别在语义：
+    /// `prompt_total_est` 让 `split_against_total` 退化成恒等式，输出就是引擎的原始
+    /// 估算；换任何别的分母都会把引擎估算重新投影一次，客户端所见不再是引擎自己
+    /// 算出来的那个数。
+    ///
+    /// 代价是已知且被接受的：引擎 A / B 用不同分词器，故同一请求在上游路径上两者
+    /// 报出的**总量**不同（见 `cache_engine::tests::both_engines_produce_usable_usage_for_same_request`
+    /// 断言 `b.prompt_total_est > a.prompt_total_est`）。这正是并存两套引擎做对比的
+    /// 意义，不是缺陷。Kiro 路径另有 `contextUsageEvent` 真值可锚，故那条路用真实
+    /// 总量 × 引擎比例 —— 两条路的锚点不同是刻意的。
+    #[test]
+    fn upstream_denominator_makes_output_pure_engine_estimate() {
+        let usage = CacheUsage {
+            cache_read: 3000,
+            cache_covered_est: 6000,
+            prompt_total_est: 8000,
+        };
+        // 上游路径的实际接线：handlers.rs 三处 `cache_usage.prompt_total_est.max(1)`。
+        let denom = usage.prompt_total_est.max(1);
+
+        // 上游真值与本地估算都给成极端值：结果必须一个字都不受影响。
+        for real in [(0, 0, 0), (2679, 1024, 0), (999_999, 888_888, 777_777)] {
+            for local in [0, 1234, 999_999] {
+                assert_eq!(
+                    UsageMode::Simulated.resolve_tokens(usage, denom, real, local),
+                    (2000, 3000, 3000),
+                    "引擎自算 =(8000−6000, 6000−3000, 3000)，不得受 real={real:?} local={local} 影响"
+                );
+            }
+        }
     }
 
     /// 有模拟数据时行为不变（防止 P1 修复回归到"永远走真实值"）。

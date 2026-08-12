@@ -754,6 +754,13 @@ PUT  /api/admin/client-keys/{id}     可修改
 - **问题**：`cache_metering_go.rs` 的 `compute_for_account` 里三处 `drop(inner)`，而 `inner` 是 `&mut TrackerInner`（从 guard 借出）。drop 一个引用什么都不做，锁一直持到函数返回。编译器报 `argument has type &mut TrackerInner`
 - **修复**：改 `drop(all)`（guard 本体）。NLL 下合法 —— 那些位置之后 `inner` 不再被用，借用已结束。原本想要的提前解锁现在真的生效
 
+**P14 — 嵌套 `usage.cache_creation` 漏出上游真值**
+
+- **触发**：上游下发嵌套 `cache_creation` 对象（官方 usage 形状，与扁平字段并存）+ 任意模拟引擎
+- **原因**：creation 在 Anthropic usage 里有**两种表达** —— 扁平 `cache_creation_input_tokens`，以及嵌套 `cache_creation.{ephemeral_5m_input_tokens, ephemeral_1h_input_tokens}`（两项之和等于扁平值）。三个改写点（`message_start` / `message_delta` / 非流式）都只改扁平字段，嵌套对象原样透传。读嵌套项的客户端拿到的仍是上游真值，且两个字段自相矛盾（实测扁平 50 vs 嵌套 1024）
+- **修复**：新增 `rescale_nested_cache_creation`，与扁平字段同步重标定。保留上游的 5m/1h 配比（那是 TTL 归属，不是可模拟的量），只把总量换成引擎口径，残差补给 5m 使两项之和恒等于扁平值。上游未下发该对象时不创建 —— 与扁平字段同策，不凭空造上游没给的字段
+- **测试**：`nested_cache_creation_is_rescaled_with_flat_field` / `nested_cache_creation_zeroed_for_nocache_engine` / `nested_cache_creation_not_fabricated_when_absent` / `nested_cache_creation_all_zero_upstream_defaults_to_5m` / `non_stream_rescales_nested_cache_creation`
+
 **P13 — 上游凭据流式响应中模拟缓存在流末尾被上游原值覆盖**
 
 - **触发**：客户端 Key 使用任意模拟引擎（A/B/C/D）+ 上游 API 凭据 + 流式请求
@@ -787,6 +794,25 @@ PUT  /api/admin/client-keys/{id}     可修改
 - **影响**：可设置 1000× 等极端值。倍率只影响下发数字与计费记录，不影响上游真实成本
 
 ---
+
+### 📌 刻意如此（不是待修项）
+
+**上游路径的分摊分母 = 引擎自己的估算**
+
+两条路的锚点不同，这是设计选择：
+
+| 路径 | 分摊分母 | 客户端所见 |
+|---|---|---|
+| Kiro | `contextUsageEvent` 百分比 × 窗口（真值），缺失时回落 `count_all_tokens` | 真实总量 × 引擎比例 |
+| 上游 | `cache_usage.prompt_total_est`（引擎自算） | **纯引擎估算**，上游影响为零 |
+
+原因在于两个协议缺的东西不同：Kiro **不下发** cache_creation / cache_read（四引擎存在的理由），但会给出真实上下文占用，故总量可锚真值、引擎只决定切分；上游 Anthropic API 三项全是真值，无缺口可补，那条路上的「模拟」是刻意用引擎自算替换真值。
+
+**引擎本身从不产出真值。** `CacheUsage` 三个字段全是各自分词器的估算，引擎真正产出的是一个**比例**（`cache_covered_est / prompt_total_est`）。上游路径把 `prompt_total_est` 传给 `split_against_total` 使其退化成恒等式，输出即引擎原始估算 —— 换任何别的分母（包括 `count_all_tokens`，同样是本地值）都会把估算重新投影一次，客户端所见不再是引擎自己算出来的那个数。
+
+**已知代价**：引擎 A / B 分词器不同，同一请求在上游路径上两者报出的**总量**不同（`both_engines_produce_usable_usage_for_same_request` 断言 `b.prompt_total_est > a.prompt_total_est`）。这正是并存两套引擎做对比的意义。
+
+该行为由 `upstream_denominator_makes_output_pure_engine_estimate` 钉住 —— 它极易被误判成 bug 并"修正"成 `count_all_tokens`，审阅时按那个方向质疑过一轮。
 
 ### ⚠️ 使用注意
 
