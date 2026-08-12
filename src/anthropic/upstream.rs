@@ -17,9 +17,9 @@ use super::cache_metering::CacheUsage;
 use super::types::ErrorResponse;
 use crate::admin::usage_stats::TokenUsageBreakdown;
 
-/// 引擎 D 的流式输出累积器。
+/// 流式输出累积器（**四引擎共用**）。
 ///
-/// 引擎 D 的 `output_tokens` 必须本地算 —— 上游可能是另一个 kiro-rs 反代，它报的
+/// `output_tokens` 必须本地算 —— 上游可能是另一个 kiro-rs 反代，它报的
 /// output 已被膨胀过一轮。但本地算需要**完整**输出文本，而流式是逐 delta 到达的。
 ///
 /// 为什么按 block index 重建 content 数组、而不是把所有 delta 拼成一条字符串：
@@ -188,21 +188,19 @@ pub async fn handle_upstream_non_stream_response(
         cache_read_tokens: real_cr.max(0) as u64,
     };
 
-    // 引擎 D 的 output 同样不取上游值：从响应 `content` 数组本地估算。
+    // **四引擎一律**从响应 `content` 数组本地估算 output，不取上游值。
     //
     // 与流式路径共用 `estimate_output_tokens`，且都是"先攒齐完整文本再算一次" ——
     // `count_tokens` 是非线性的（<100 token 乘 1.5，>=800 乘 1.0），逐块分别计算
     // 再求和会让每个小块都吃到 1.5 倍而显著高估。两条路径必须同口径，否则同一次
     // 对话切换 stream 开关就会看到不同的 output_tokens。
     //
-    // 其余引擎用不到，故按 mode 惰性计算，不给 A/B/C 增加无谓开销。
-    let local_output = if matches!(mode, UsageMode::NoCache) {
-        json.get("content")
-            .and_then(|c| c.as_array())
-            .map(|blocks| crate::token::estimate_output_tokens(blocks))
-    } else {
-        None
-    };
+    // `content` 缺失 / 非数组时为 None → resolve_output 回落上游值（宁可报上游数
+    // 也不报 0）。
+    let local_output = json
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|blocks| crate::token::estimate_output_tokens(blocks));
 
     // 客户端 usage 的口径由 mode 决定（模拟分摊 / 上游真值 / 本地估算），
     // 三分支收敛在 UsageMode::resolve_tokens —— 与计费快照共用同一套规则。
@@ -248,7 +246,7 @@ pub async fn handle_upstream_non_stream_response(
         .body(Body::from(json.to_string()))
         .unwrap();
 
-    // 返回膨胀前的客户端口径供 hook.record 记录（引擎 D 时 output 为本地估算值）
+    // 返回膨胀前的客户端口径供 hook.record 记录（四项全为本地/引擎口径）
     (resp, sim_input, client_output, sim_cc, sim_cr, raw_usage)
 }
 
@@ -307,7 +305,7 @@ fn rescale_nested_cache_creation(usage: &mut serde_json::Value, target_cc: i64) 
 /// 没有上游字段可漏。
 ///
 /// `local_input` 是客户端请求的本地 token 估算（引擎 D 用它取代上游 input）。
-/// `local_output` 是本地累积算出的输出量，仅引擎 D 在 `message_delta` 时用 ——
+/// `local_output` 是本地累积算出的输出量，四引擎在 `message_delta` 时都用 ——
 /// 由调用方在流末尾从 [`StreamOutputAccumulator`] 取得。
 #[allow(clippy::too_many_arguments)]
 fn inflate_sse_event(
@@ -384,15 +382,12 @@ fn inflate_sse_event(
                     ),
                     local_input,
                 );
-                // 引擎 D 的 output 口径与上游无关：上游没给也必须补出本地值，故下面
+                // 四引擎的 output 口径都与上游无关：上游没给也必须补出本地值，故下面
                 // 按需**创建** usage 对象（与非流式路径的 `entry().or_insert_with` 同策）。
-                // 其余三引擎沿用原行为：只在上游确实给了字段时才改写，不凭空造字段。
-                let base_output = match mode {
-                    UsageMode::NoCache => {
-                        Some(mode.resolve_output(upstream_output.unwrap_or(0) as i32, local_output))
-                    }
-                    _ => upstream_output.map(|v| v as i32),
-                };
+                //
+                // 仅当本地值与上游值都拿不到时才整项跳过 —— 那种情况没有任何可写的数。
+                let base_output = (local_output.is_some() || upstream_output.is_some())
+                    .then(|| mode.resolve_output(upstream_output.unwrap_or(0) as i32, local_output));
                 let needs_write = base_output.is_some()
                     || real_input.is_some()
                     || real_cc.is_some()
@@ -486,7 +481,7 @@ fn update_stream_stats(
                 if let Some(v) = upstream_output {
                     stats.raw_usage.output_tokens = v.max(0) as u64;
                 }
-                // 引擎 D 用本地累积值，且上游缺字段时也要记；其余引擎沿用上游真值。
+                // 四引擎一律用本地累积值，且上游缺字段时也要记（见 resolve_output）。
                 stats.output_tokens =
                     mode.resolve_output(upstream_output.unwrap_or(0) as i32, local_output);
 
@@ -554,10 +549,13 @@ pub fn handle_upstream_stream_response_with_inflation(
         let mut buffer = String::new();
         let mut stats = UpstreamStreamUsage::default();
         let mut byte_stream = response.bytes_stream();
-        // 引擎 D 专用：累积输出内容，供流末尾自行估算 output_tokens。
-        // 其余引擎不喂它（免掉整条流的字符串累积开销）。
+        // 四引擎共用：累积输出内容，供流末尾自行估算 output_tokens。
+        //
+        // 早先只有引擎 D 累积，A/B/C 直接用上游 output。改成全引擎本地估算后这里
+        // 恒开 —— 代价是每条上游流都要在内存里攒一份完整响应文本（10 万 token 的
+        // 回复约 400KB）。这是「上游影响为零」的必要开销：不攒完整文本就没法用
+        // 与非流式同一个估算器，而两条路径口径不一致会让切 stream 开关看到不同数。
         let mut accumulator = LocalOutputAccumulator::default();
-        let counting_output = matches!(mode, UsageMode::NoCache);
 
         while let Some(chunk) = byte_stream.next().await {
             let bytes = match chunk {
@@ -576,25 +574,21 @@ pub fn handle_upstream_stream_response_with_inflation(
                 let event_text = buffer[..pos + 2].to_string();
                 buffer = buffer[pos + 2..].to_string();
 
-                // 引擎 D：先喂累积器。Anthropic SSE 里 content_block_* 全部先于
+                // 先喂累积器。Anthropic SSE 里 content_block_* 全部先于
                 // message_delta 到达，故 message_delta 被处理时累积必然已完整 ——
                 // 这正是"流开头写 input、流末尾写 output"能成立的原因。
-                let local_output = if counting_output {
-                    match parse_sse_event(&event_text) {
-                        Some((etype, data)) => {
-                            accumulator.feed(etype, &data);
-                            // 只在 message_delta 上求值：estimate() 要重建 content
-                            // 数组并整体计数，每个事件都算一遍纯属浪费。
-                            //
-                            // is_empty 判断保留空流语义：一个字都没输出时应报 0，
-                            // 而 estimate_output_tokens 有 `.max(1)` 会报 1。
-                            (etype == "message_delta" && !accumulator.is_empty())
-                                .then(|| accumulator.estimate())
-                        }
-                        None => None,
+                let local_output = match parse_sse_event(&event_text) {
+                    Some((etype, data)) => {
+                        accumulator.feed(etype, &data);
+                        // 只在 message_delta 上求值：estimate() 要重建 content
+                        // 数组并整体计数，每个事件都算一遍纯属浪费。
+                        //
+                        // is_empty 判断保留空流语义：一个字都没输出时应报 0，
+                        // 而 estimate_output_tokens 有 `.max(1)` 会报 1。
+                        (etype == "message_delta" && !accumulator.is_empty())
+                            .then(|| accumulator.estimate())
                     }
-                } else {
-                    None
+                    None => None,
                 };
 
                 // 提取膨胀前用量（在 inflate 之前）
@@ -822,7 +816,9 @@ mod tests {
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(0));
     }
 
-    /// 引擎 D 的 output 取本地累积估算，且**上游省略该字段时也必须写出**。
+    /// output 取本地累积估算，且**上游省略该字段时也必须写出**。
+    ///
+    /// 用引擎 D 举例，但四引擎同策（见 `all_engines_localize_output_in_message_delta`）。
     #[test]
     fn nocache_writes_local_output_even_when_upstream_omits_it() {
         // 上游 message_delta 不带 usage.output_tokens
@@ -928,7 +924,9 @@ mod tests {
 
         let rendered = inflate_sse_event(
             event, 1.0, 1.0, 1.0, 1.0, 200, cache_usage,
-            UsageMode::Simulated, -999, Some(-999),
+            // local_input 用哨兵：Simulated 的 input 三元组不看它，被误用会立刻显形。
+            // local_output 给真实值：四引擎的 output 现已一律本地化。
+            UsageMode::Simulated, -999, Some(613),
         );
         let data = rendered
             .lines()
@@ -942,7 +940,10 @@ mod tests {
         assert_eq!(usage["input_tokens"], serde_json::json!(100), "累积 input 必须是模拟值");
         assert_eq!(usage["cache_creation_input_tokens"], serde_json::json!(50));
         assert_eq!(usage["cache_read_input_tokens"], serde_json::json!(50));
-        assert_eq!(usage["output_tokens"], serde_json::json!(510), "output 沿用上游真值");
+        assert_eq!(
+            usage["output_tokens"], serde_json::json!(613),
+            "output 也必须是本地估算，上游的 510 不得穿透"
+        );
         // 不认识的字段原样保留（server_tool_use 是官方字段，客户端要用）。
         assert_eq!(
             usage["server_tool_use"]["web_search_requests"],
@@ -964,7 +965,7 @@ mod tests {
         let rendered = inflate_sse_event(
             event, 3.0, 1.0, 3.0, 3.0, 200,
             CacheUsage { cache_read: 50, cache_covered_est: 100, prompt_total_est: 200 },
-            UsageMode::Simulated, -999, Some(-999),
+            UsageMode::Simulated, -999, Some(21),
         );
         let data = rendered
             .lines()
@@ -973,7 +974,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(data).unwrap();
         let usage = &json["usage"];
 
-        assert_eq!(usage["output_tokens"], serde_json::json!(15));
+        // output 取本地估算（output_mul=1.0），上游的 15 不参与。
+        assert_eq!(usage["output_tokens"], serde_json::json!(21));
         assert!(usage.get("input_tokens").is_none(), "上游未给 input 时不得补写");
         assert!(usage.get("cache_creation_input_tokens").is_none());
         assert!(usage.get("cache_read_input_tokens").is_none());
@@ -1167,6 +1169,62 @@ mod tests {
         rescale_nested_cache_creation(&mut usage, 75);
         assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], serde_json::json!(75));
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], serde_json::json!(0));
+    }
+
+    /// 四引擎的 `output_tokens` 一律取本地估算 —— 上游报的数不得穿透。
+    ///
+    /// 早先只有引擎 D 本地化，A/B/C 用上游真值，使「引擎自算」在 output 上留了缺口。
+    /// 这条遍历三个 mode 端到端验证：同一条上游 `message_delta`，无论哪个引擎，
+    /// 客户端看到的都是本地累积值。
+    #[test]
+    fn all_engines_localize_output_in_message_delta() {
+        // 上游报 output=99999，本地累积算出 613。
+        let event = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},",
+            "\"usage\":{\"output_tokens\":99999}}\n\n"
+        );
+
+        for mode in [UsageMode::Simulated, UsageMode::Real, UsageMode::NoCache] {
+            let rendered = inflate_sse_event(
+                event, 1.0, 1.0, 1.0, 1.0, 200,
+                CacheUsage { cache_read: 50, cache_covered_est: 100, prompt_total_est: 200 },
+                mode, 5000, Some(613),
+            );
+            let data = rendered.lines().find_map(|l| l.strip_prefix("data: ")).unwrap();
+            let json: serde_json::Value = serde_json::from_str(data).unwrap();
+            assert_eq!(
+                json["usage"]["output_tokens"], serde_json::json!(613),
+                "{mode:?} 的 output 必须是本地估算 613，不得取上游的 99999"
+            );
+        }
+    }
+
+    /// 流式累积器对**所有**引擎都必须开着 —— 早先 `counting_output` 只在 NoCache
+    /// 时为 true，A/B/C 拿不到 `local_output`，output 就回落上游值。
+    ///
+    /// 这条通过 `update_stream_stats` 间接验证：给出本地值时记账必须采用它。
+    #[test]
+    fn stream_stats_localize_output_for_all_engines() {
+        let event = "event: message_delta\ndata: {\"usage\":{\"output_tokens\":99999}}\n\n";
+
+        for mode in [UsageMode::Simulated, UsageMode::Real, UsageMode::NoCache] {
+            let mut stats = UpstreamStreamUsage::default();
+            update_stream_stats(
+                event, &mut stats, 200,
+                CacheUsage { cache_read: 50, cache_covered_est: 100, prompt_total_est: 200 },
+                mode, 5000, Some(613),
+            );
+            assert_eq!(
+                stats.output_tokens, 613,
+                "{mode:?} 记账的 output 必须是本地估算"
+            );
+            // raw_usage 仍保留上游真值，供计费对比表的「上游真实」列。
+            assert_eq!(
+                stats.raw_usage.output_tokens, 99999,
+                "{mode:?} 的上游真实列不受本地化影响"
+            );
+        }
     }
 
     /// 设计意图钉子：上游路径**刻意**用 `prompt_total_est` 作分摊分母，使客户端

@@ -393,7 +393,7 @@ call_api_with_retry_for_credential()
   │
   ├── 按引擎口径重建 usage（UsageMode::resolve_tokens）
   │     input_tokens                 ← 模拟分摊 / 上游真值 / 本地估算
-  │     output_tokens                ← 上游真值，或引擎 D 的本地估算
+  │     output_tokens                ← 本地估算（四引擎一律，见 P15）
   │     cache_creation_input_tokens  ← 同上口径
   │     cache_read_input_tokens      ← 同上口径
   │   再各乘该引擎对应倍率
@@ -754,6 +754,14 @@ PUT  /api/admin/client-keys/{id}     可修改
 - **问题**：`cache_metering_go.rs` 的 `compute_for_account` 里三处 `drop(inner)`，而 `inner` 是 `&mut TrackerInner`（从 guard 借出）。drop 一个引用什么都不做，锁一直持到函数返回。编译器报 `argument has type &mut TrackerInner`
 - **修复**：改 `drop(all)`（guard 本体）。NLL 下合法 —— 那些位置之后 `inner` 不再被用，借用已结束。原本想要的提前解锁现在真的生效
 
+**P15 — 上游路径的 `output_tokens` 仍取上游真值（引擎 A/B/C）**
+
+- **触发**：客户端 Key 用引擎 A / B / C + 上游 API 凭据
+- **原因**：`UsageMode::resolve_output` 只对 `NoCache` 走本地估算，A/B/C 一律 `=> real_output`。流式侧 `counting_output = matches!(mode, UsageMode::NoCache)` 使累积器只在引擎 D 时开启，A/B/C 根本拿不到 `local_output`；非流式侧同理按 mode 惰性计算。于是 input / cache 三项已换成引擎口径、`output_tokens` 却仍是上游数字 —— 「引擎自算」在 output 这一项上留了缺口
+- **修复**：`resolve_output` 简化为 `local_output.unwrap_or(real_output)`，四引擎一律本地化；流式累积器恒开；非流式恒计算 `local_output`。`message_start` 的 `output_tokens` 不动 —— 那个位置是占位符（Kiro 路径硬编码 `1`），真正的 output 在 `message_delta` 写
+- **代价（已知并接受）**：每条上游流都要在内存里攒一份完整响应文本（10 万 token 的回复约 400KB）；`estimate_output_tokens` 是启发式，与真实分词有偏差。这是「上游影响为零」的必要开销
+- **测试**：`resolve_output_localizes_for_all_engines` / `all_engines_localize_output_in_message_delta` / `stream_stats_localize_output_for_all_engines`
+
 **P14 — 嵌套 `usage.cache_creation` 漏出上游真值**
 
 - **触发**：上游下发嵌套 `cache_creation` 对象（官方 usage 形状，与扁平字段并存）+ 任意模拟引擎
@@ -805,6 +813,10 @@ PUT  /api/admin/client-keys/{id}     可修改
 |---|---|---|
 | Kiro | `contextUsageEvent` 百分比 × 窗口（真值），缺失时回落 `count_all_tokens` | 真实总量 × 引擎比例 |
 | 上游 | `cache_usage.prompt_total_est`（引擎自算） | **纯引擎估算**，上游影响为零 |
+
+上游路径的四项**全部**是本地口径：input / cache 两项来自引擎估算，`output_tokens` 来自
+`estimate_output_tokens`（见 P15，早先只有引擎 D 如此）。该路径上客户端所见没有任何一项
+取自上游 usage。`raw_usage` 仍记上游真值，但只进计费对比表的「上游真实」列，不下发客户端。
 
 原因在于两个协议缺的东西不同：Kiro **不下发** cache_creation / cache_read（四引擎存在的理由），但会给出真实上下文占用，故总量可锚真值、引擎只决定切分；上游 Anthropic API 三项全是真值，无缺口可补，那条路上的「模拟」是刻意用引擎自算替换真值。
 

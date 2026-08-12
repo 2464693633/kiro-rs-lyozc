@@ -300,16 +300,18 @@ impl UsageMode {
 
     /// 决定客户端应看到的 `output_tokens`（**膨胀前**）。
     ///
-    /// 引擎 D 用本地估算的实际下发内容（不信上游）；其余三个引擎沿用上游真值 ——
-    /// 它们的 output 从来就没被模拟过，改动会超出各自契约。
+    /// **四个引擎一律用本地估算**（`token::estimate_output_tokens`），上游报的
+    /// output 不参与。这与 input / cache 三项的口径一致：客户端所见完全等于本
+    /// 中转站自己算出来的数，上游影响为零 —— 上游可能本就是另一个 kiro-rs 反代，
+    /// 它报的 output 已被膨胀过一轮。
     ///
-    /// `local_output` 为 `None` 时回落上游真值：流式在累积完成前取不到本地值，
-    /// 此时宁可报上游数也不报 0。
+    /// 早先只有引擎 D 本地化，A/B/C 沿用上游真值。那使「引擎自算」在 output 这
+    /// 一项上留了缺口：input 换成了引擎口径，output 却仍是上游数字。
+    ///
+    /// `local_output` 为 `None` 时回落上游真值 —— 流式在累积完成前取不到本地值
+    /// （`message_start` 阶段一个字都还没输出），此时宁可报上游数也不报 0。
     pub fn resolve_output(self, real_output: i32, local_output: Option<i32>) -> i32 {
-        match self {
-            UsageMode::NoCache => local_output.unwrap_or(real_output),
-            _ => real_output,
-        }
+        local_output.unwrap_or(real_output)
     }
 }
 
@@ -1328,32 +1330,26 @@ mod tests {
         );
     }
 
-    /// output 的口径分歧：只有引擎 D 用本地估算，其余三个用上游真值。
+    /// **四引擎一律**用本地估算的 output，上游报的数不参与。
+    ///
+    /// 早先只有 D 本地化、A/B/C 取上游真值，那使「引擎自算」在 output 这一项上留了
+    /// 缺口 —— input 换成引擎口径、output 却仍是上游数字。这条钉住全引擎一致。
     #[test]
-    fn resolve_output_only_localizes_for_nocache() {
-        // 引擎 D：有本地值就用本地值。
-        assert_eq!(
-            UsageMode::NoCache.resolve_output(9999, Some(42)),
-            42,
-            "引擎 D 的 output 必须是本地估算，不是上游报的数"
-        );
-
-        // 其余三个引擎：即便本地值在场也不采用。
-        for mode in [UsageMode::Simulated, UsageMode::Real] {
+    fn resolve_output_localizes_for_all_engines() {
+        for mode in [UsageMode::Simulated, UsageMode::Real, UsageMode::NoCache] {
             assert_eq!(
                 mode.resolve_output(9999, Some(42)),
+                42,
+                "{mode:?} 的 output 必须是本地估算，不得取上游的 9999"
+            );
+            // 本地值缺失（上游未下发 content / 空流 / message_start 阶段）：回落上游值，
+            // 不得凭空报 0 —— 那会让客户端以为没产生输出。
+            assert_eq!(
+                mode.resolve_output(9999, None),
                 9999,
-                "{mode:?} 的 output 应取上游真值"
+                "{mode:?} 本地估算不可得时必须回落上游值"
             );
         }
-
-        // 引擎 D 但本地值缺失（如上游未下发 content / 空流）：回落上游值，
-        // 不得凭空报 0 —— 那会让客户端以为没产生输出。
-        assert_eq!(
-            UsageMode::NoCache.resolve_output(9999, None),
-            9999,
-            "本地估算不可得时必须回落上游值"
-        );
     }
 
     /// 两引擎共用同一张 `CacheUsage` 出口，但数值口径不同 —— 这是并存对比的前提。
