@@ -19,7 +19,6 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::error::UpstreamRateLimitError;
-use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
 use crate::kiro::model::available_models::{ListAvailableModelsResponse, UpstreamModel};
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
@@ -536,17 +535,75 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
-fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
-    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
-    // only for the streaming endpoint and makes this legacy request malformed.
+fn profile_arn_query(profile_arn: Option<&str>) -> String {
+    match profile_arn {
+        Some(arn) if !arn.trim().is_empty() => {
+            format!("&profileArn={}", urlencoding::encode(arn.trim()))
+        }
+        None => String::new(),
+        Some(_) => String::new(),
+    }
+}
+
+/// 用量类接口的候选顺序：每个区域先尝试凭据中的 ARN，再尝试无 ARN。
+///
+/// Enterprise / IdC 账号在请求前会把占位符解析为真实 ARN；Builder ID 账号在
+/// 部分租户需要官方 IDE 使用的占位 ARN，另一些租户则要求省略它。因此两种形态
+/// 都保留，并由请求响应决定是否回退。
+fn usage_api_attempts<'a>(
+    credentials: &'a KiroCredentials,
+    candidates: &[&'static str],
+) -> Vec<(&'static str, Option<&'a str>)> {
+    let profile_arn = if credentials.is_api_key_credential() {
+        None
+    } else {
+        credentials
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty())
+    };
+    let mut attempts = Vec::with_capacity(candidates.len() * 2);
+    for region in candidates {
+        if let Some(arn) = profile_arn {
+            attempts.push((*region, Some(arn)));
+        }
+        attempts.push((*region, None));
+    }
+    attempts
+}
+
+/// 带 ARN 的请求遇到租户兼容性错误时，回退到旧版无 ARN 形态。
+fn should_retry_usage_api_without_profile_arn(
+    status: u16,
+    body: &str,
+    profile_arn: Option<&str>,
+) -> bool {
+    if profile_arn.is_none() {
+        return false;
+    }
+
+    let body = body.to_ascii_lowercase();
+    status == 403
+        || (status == 400
+            && (body.contains("improperly formed request")
+                || body.contains("invalid profilearn")))
+}
+
+fn usage_limits_url(host: &str, profile_arn: Option<&str>) -> String {
     format!(
-        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
-        host
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
+        host,
+        profile_arn_query(profile_arn)
     )
 }
 
-fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
-    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+fn available_models_url(host: &str, profile_arn: Option<&str>) -> String {
+    format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
+        host,
+        profile_arn_query(profile_arn)
+    )
 }
 
 /// 获取使用额度信息
@@ -563,9 +620,7 @@ pub(crate) async fn get_usage_limits(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    // 用量类接口固定用 USAGE_API_KIRO_VERSION：新版 IDE 会强制要求 profileArn，
-    // 对 Enterprise/IdC 账号失败；该版本无需 profileArn。
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = crate::kiro::kiro_version::usage_api();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -578,10 +633,11 @@ pub(crate) async fn get_usage_limits(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = usage_limits_url(&host, credentials);
+        let url = usage_limits_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -612,12 +668,19 @@ pub(crate) async fn get_usage_limits(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403，或带 ARN 时出现已知的 400 格式错误，尝试下一候选。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "getUsageLimits 在 {} 返回 403，尝试备用端点 {}",
+                "getUsageLimits 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                status,
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -658,7 +721,7 @@ pub(crate) async fn get_available_models(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = crate::kiro::kiro_version::usage_api();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -671,10 +734,11 @@ pub(crate) async fn get_available_models(
 
     let client = build_client(proxy, 60, config.tls_backend)?;
 
+    let attempts = usage_api_attempts(credentials, &candidates);
     let mut last_error: Option<String> = None;
-    for (idx, region) in candidates.iter().enumerate() {
+    for (idx, (region, profile_arn)) in attempts.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = available_models_url(&host, credentials);
+        let url = available_models_url(&host, *profile_arn);
 
         let mut request = client
             .get(&url)
@@ -705,12 +769,19 @@ pub(crate) async fn get_available_models(
             return Err(error.into());
         }
 
-        // 403 且仍有备用端点时，尝试下一个区域端点（Enterprise/IdC 跨区兼容）
-        if status.as_u16() == 403 && idx + 1 < candidates.len() {
+        // 403，或带 ARN 时出现已知的 400 格式错误，尝试下一候选。
+        let should_try_next = status.as_u16() == 403
+            || should_retry_usage_api_without_profile_arn(
+                status.as_u16(),
+                &body_text,
+                *profile_arn,
+            );
+        if should_try_next && idx + 1 < attempts.len() {
             tracing::debug!(
-                "ListAvailableModels 在 {} 返回 403，尝试备用端点 {}",
+                "ListAvailableModels 在 {} 返回 {}（profileArn={}），尝试下一候选",
                 region,
-                candidates[idx + 1]
+                status,
+                profile_arn.is_some()
             );
             last_error = Some(format!("{} {}", status, body_text));
             continue;
@@ -807,7 +878,7 @@ pub(crate) async fn list_available_profiles(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = crate::kiro::kiro_version::usage_api();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -898,7 +969,7 @@ pub(crate) async fn set_user_preference(
     let sso_region = credentials.effective_auth_region(config);
     let candidates = rest_api_region_candidates(sso_region);
     let machine_id = machine_id::generate_from_credentials(credentials, config);
-    let kiro_version = USAGE_API_KIRO_VERSION;
+    let kiro_version = crate::kiro::kiro_version::usage_api();
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
@@ -1293,6 +1364,11 @@ pub struct MultiTokenManager {
     account_rpm_limit: AtomicU32,
     /// 是否识别 403 封禁文案并立即禁用（运行时可修改）
     suspended_detection_enabled: AtomicBool,
+    /// 上游直通凭据的故障转移检测配置（运行时可修改）。
+    ///
+    /// 含 `Vec<String>` 文案列表，无法拆成原子量，整体放 Mutex。读取只在
+    /// 上游请求**失败**时发生（错误路径），锁竞争可忽略。
+    upstream_failover: Mutex<crate::model::config::UpstreamFailoverConfig>,
     /// 全账号自愈总开关（运行时可修改）
     self_heal_enabled: AtomicBool,
     /// 两次自愈的最小冷却间隔（秒，运行时可修改）
@@ -1525,6 +1601,7 @@ impl MultiTokenManager {
         let rpm_limit_enabled = config.account_rpm_limit_enabled;
         let rpm_limit = config.account_rpm_limit;
         let suspended_detection_enabled = config.suspended_detection_enabled;
+        let upstream_failover = config.upstream_failover.clone();
         let self_heal_enabled = config.self_heal_enabled;
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
@@ -1546,6 +1623,7 @@ impl MultiTokenManager {
             account_rpm_limit_enabled: AtomicBool::new(rpm_limit_enabled),
             account_rpm_limit: AtomicU32::new(rpm_limit),
             suspended_detection_enabled: AtomicBool::new(suspended_detection_enabled),
+            upstream_failover: Mutex::new(upstream_failover),
             self_heal_enabled: AtomicBool::new(self_heal_enabled),
             self_heal_min_interval_secs: AtomicU64::new(self_heal_min_interval_secs),
             self_heal_max_consecutive_rounds: AtomicU32::new(self_heal_max_consecutive_rounds),
@@ -1719,7 +1797,22 @@ impl MultiTokenManager {
         let generation = self.model_cache_generation(id);
         let epoch = self.model_cache_epoch.load(Ordering::Relaxed);
         let _permit = self.model_refresh_semaphore.acquire().await?;
-        let (token, credentials) = self.prepare_request_token(id).await?;
+        let (token, mut credentials) = self.prepare_request_token(id).await?;
+
+        // Enterprise / IdC 账号的真实 profileArn 不在导出文件或刷新响应中，
+        // 先按需解析并回填；Builder ID 无 profile 时由查询候选自动回退。
+        if !credentials.is_upstream_credential() {
+            match self.resolve_profile_arn_for(id, &token).await {
+                Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "凭据 #{} 查询模型列表前解析 profileArn 失败: {}",
+                    id,
+                    error
+                ),
+            }
+        }
+
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
         // 上游直通凭据没有 Kiro refreshToken，ListAvailableModels 认不了它的 key，
@@ -3660,7 +3753,7 @@ impl MultiTokenManager {
             }
         };
 
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3668,6 +3761,20 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // Enterprise / IdC 账号的真实 profileArn 需要从上游 profile 列表解析；
+        // Builder ID 账号解析不到时保留其兼容候选（占位 ARN/无 ARN）。
+        if !credentials.is_upstream_credential() {
+            match self.resolve_profile_arn_for(id, &token).await {
+                Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "凭据 #{} 查询用量前解析 profileArn 失败: {}",
+                    id,
+                    error
+                ),
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -3921,7 +4028,7 @@ impl MultiTokenManager {
         };
 
         // 重新读取最新的凭据快照（refresh 可能已修改 access_token 之外的字段）
-        let credentials = {
+        let mut credentials = {
             let entries = self.entries.lock();
             entries
                 .iter()
@@ -3929,6 +4036,19 @@ impl MultiTokenManager {
                 .map(|e| e.credentials.clone())
                 .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
         };
+
+        // 与余额/模型查询保持一致：企业账号先解析真实 profileArn。
+        if !credentials.is_upstream_credential() {
+            match self.resolve_profile_arn_for(id, &token).await {
+                Ok(Some(arn)) => credentials.profile_arn = Some(arn),
+                Ok(None) => {}
+                Err(error) => tracing::debug!(
+                    "凭据 #{} 设置用户偏好前解析 profileArn 失败: {}",
+                    id,
+                    error
+                ),
+            }
+        }
 
         let global_proxy = self.proxy.lock().clone();
         let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
@@ -4593,6 +4713,84 @@ impl MultiTokenManager {
             config.account_throttle_failover = failover;
             config.account_throttle_cooldown_secs = cooldown_secs;
         })
+    }
+
+    /// 获取上游直通凭据的故障转移检测配置（请求路径 + Admin API 共用）。
+    pub fn get_upstream_failover_config(&self) -> crate::model::config::UpstreamFailoverConfig {
+        self.upstream_failover.lock().clone()
+    }
+
+    /// 更新上游故障转移检测配置（Admin API）。
+    ///
+    /// 任一参数传 `None` 表示不修改该字段。运行时立即生效并持久化到
+    /// config.json；持久化失败时回滚内存值。
+    pub fn set_upstream_failover_config(
+        &self,
+        enabled: Option<bool>,
+        quota_patterns: Option<Vec<String>>,
+        suspended_patterns: Option<Vec<String>>,
+        throttle_failover: Option<bool>,
+        throttle_cooldown_secs: Option<u64>,
+    ) -> anyhow::Result<()> {
+        if let Some(secs) = throttle_cooldown_secs {
+            // 与账号级风控同规则：1 秒到 24 小时
+            if !(1..=86_400).contains(&secs) {
+                anyhow::bail!("冷却时长必须在 1..=86400 秒内: {}", secs);
+            }
+        }
+        // 文案列表允许为空（= 关闭该类检测），但不允许全是空白串 ——
+        // 那多半是 UI 提交了未清理的输入，落盘后规则静默失效还查不出原因。
+        let sanitize = |patterns: Vec<String>, name: &str| -> anyhow::Result<Vec<String>> {
+            let cleaned: Vec<String> = patterns
+                .into_iter()
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if cleaned.iter().any(|p| p.len() < 4) {
+                anyhow::bail!("{} 中存在过短的检测文案（<4 字节），过短的子串极易误伤普通错误", name);
+            }
+            Ok(cleaned)
+        };
+        let quota_patterns = quota_patterns
+            .map(|p| sanitize(p, "quotaPatterns"))
+            .transpose()?;
+        let suspended_patterns = suspended_patterns
+            .map(|p| sanitize(p, "suspendedPatterns"))
+            .transpose()?;
+
+        let _update_guard = self.runtime_config_update_lock.lock();
+
+        let prev = self.get_upstream_failover_config();
+        let new_config = crate::model::config::UpstreamFailoverConfig {
+            enabled: enabled.unwrap_or(prev.enabled),
+            quota_patterns: quota_patterns.unwrap_or_else(|| prev.quota_patterns.clone()),
+            suspended_patterns: suspended_patterns
+                .unwrap_or_else(|| prev.suspended_patterns.clone()),
+            throttle_failover: throttle_failover.unwrap_or(prev.throttle_failover),
+            throttle_cooldown_secs: throttle_cooldown_secs
+                .unwrap_or(prev.throttle_cooldown_secs),
+        };
+
+        *self.upstream_failover.lock() = new_config.clone();
+
+        let persisted = new_config.clone();
+        if let Err(err) = self.update_config_file(move |config| {
+            config.upstream_failover = persisted;
+        }) {
+            // 回滚内存值，保证内存与磁盘一致
+            *self.upstream_failover.lock() = prev;
+            return Err(err);
+        }
+
+        tracing::info!(
+            "上游故障转移配置已更新: enabled={}, quota_patterns={}, suspended_patterns={}, throttle_failover={}, cooldown={}s",
+            new_config.enabled,
+            new_config.quota_patterns.len(),
+            new_config.suspended_patterns.len(),
+            new_config.throttle_failover,
+            new_config.throttle_cooldown_secs,
+        );
+        Ok(())
     }
 
     /// 获取单账号 RPM 限流配置（Admin API）。返回：(是否启用, 每分钟上限)。
@@ -5405,6 +5603,88 @@ mod tests {
 
         assert_eq!(token, "sk-upstream-abc", "应直接返回 upstreamApiKey");
         assert!(creds.is_upstream_credential());
+    }
+
+    /// 上游故障转移配置：热更新必须立即被 getter（= 请求路径的读取口）看到，
+    /// 且 `None` 字段保持不变（patch 语义）。
+    #[test]
+    fn upstream_failover_config_hot_update_and_patch_semantics() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+
+        // 初始 = config.json 默认值
+        let initial = manager.get_upstream_failover_config();
+        assert!(initial.enabled);
+        assert!(!initial.quota_patterns.is_empty());
+
+        // 只改 quota_patterns 与冷却：其余字段必须保持
+        manager
+            .set_upstream_failover_config(
+                None,
+                Some(vec!["my relay broke message".to_string()]),
+                None,
+                None,
+                Some(120),
+            )
+            .expect("合法更新应成功");
+        let updated = manager.get_upstream_failover_config();
+        assert_eq!(updated.quota_patterns, vec!["my relay broke message"]);
+        assert_eq!(updated.throttle_cooldown_secs, 120);
+        assert_eq!(updated.enabled, initial.enabled, "未提供的字段不得被改动");
+        assert_eq!(updated.suspended_patterns, initial.suspended_patterns);
+        assert!(updated.matches_quota("MY RELAY BROKE MESSAGE: balance"));
+
+        // 空数组 = 清空该类检测
+        manager
+            .set_upstream_failover_config(None, Some(vec![]), None, None, None)
+            .expect("清空列表应合法");
+        assert!(manager.get_upstream_failover_config().quota_patterns.is_empty());
+    }
+
+    /// 非法输入必须被拒绝且不改动现有配置：过短文案（误伤风险）与越界冷却时长。
+    #[test]
+    fn upstream_failover_config_rejects_invalid_input() {
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![], None, None, false).unwrap();
+        let before = manager.get_upstream_failover_config();
+
+        // 过短的检测文案（"ban" 会命中 "banner" 等无辜消息）
+        let err = manager
+            .set_upstream_failover_config(None, Some(vec!["ban".to_string()]), None, None, None)
+            .expect_err("过短文案应被拒绝");
+        assert!(err.to_string().contains("过短"), "错误应说明原因: {err}");
+
+        // 纯空白文案会被 trim 掉，不得混进列表
+        manager
+            .set_upstream_failover_config(
+                None,
+                Some(vec!["   ".to_string(), "valid pattern".to_string()]),
+                None,
+                None,
+                None,
+            )
+            .expect("空白项应被静默过滤");
+        assert_eq!(
+            manager.get_upstream_failover_config().quota_patterns,
+            vec!["valid pattern"]
+        );
+
+        // 冷却时长越界
+        assert!(
+            manager
+                .set_upstream_failover_config(None, None, None, None, Some(0))
+                .is_err()
+        );
+        assert!(
+            manager
+                .set_upstream_failover_config(None, None, None, None, Some(90_000))
+                .is_err()
+        );
+
+        // 被拒绝的调用不得部分生效
+        let after = manager.get_upstream_failover_config();
+        assert_eq!(after.throttle_cooldown_secs, before.throttle_cooldown_secs);
+        assert_eq!(after.suspended_patterns, before.suspended_patterns);
     }
 
     #[tokio::test]
@@ -6758,7 +7038,7 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+    fn test_usage_rest_urls_carry_profile_arn_and_fallback() {
         let credentials = KiroCredentials {
             profile_arn: Some(
                 "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
@@ -6766,15 +7046,61 @@ mod tests {
             ..Default::default()
         };
         let host = "q.us-east-1.amazonaws.com";
+        let arn = credentials.profile_arn.as_deref();
+        let encoded =
+            "arn%3Aaws%3Acodewhisperer%3Aus-east-1%3A123456789012%3Aprofile%2FREAL123";
 
         assert_eq!(
-            usage_limits_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+            usage_limits_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true&profileArn={encoded}"
+            )
         );
         assert_eq!(
-            available_models_url(host, &credentials),
-            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
+            available_models_url(host, arn),
+            format!(
+                "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR&profileArn={encoded}"
+            )
         );
+        assert_eq!(
+            usage_api_attempts(&credentials, &["us-east-1", "eu-central-1"]),
+            vec![
+                ("us-east-1", arn),
+                ("us-east-1", None),
+                ("eu-central-1", arn),
+                ("eu-central-1", None),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_try_builder_id_placeholder_then_omit() {
+        use crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN;
+
+        let credentials = KiroCredentials {
+            profile_arn: Some(BUILDER_ID_PROFILE_ARN.to_string()),
+            ..Default::default()
+        };
+        let attempts = usage_api_attempts(&credentials, &["us-east-1"]);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].1, Some(BUILDER_ID_PROFILE_ARN));
+        assert_eq!(attempts[1].1, None);
+
+        assert!(should_retry_usage_api_without_profile_arn(
+            403,
+            "User is not authorized to make this call.",
+            Some(BUILDER_ID_PROFILE_ARN),
+        ));
+        assert!(should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Invalid profileArn.\"}",
+            Some(BUILDER_ID_PROFILE_ARN),
+        ));
+        assert!(!should_retry_usage_api_without_profile_arn(
+            400,
+            "{\"message\":\"Invalid profileArn.\"}",
+            None,
+        ));
     }
 
     #[test]

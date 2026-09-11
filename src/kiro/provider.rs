@@ -749,6 +749,62 @@ impl KiroProvider {
                     .then(|| UpstreamRateLimitError::from_headers(response.headers()));
 
                 let body_text = response.text().await.unwrap_or_default();
+                // 从 token_manager 取运行时副本而非启动时 config 快照：
+                // Admin API 热更新检测规则后必须立即生效，无需重启。
+                let failover_cfg = self.token_manager.get_upstream_failover_config();
+
+                // 封禁文案检测：立即禁用（Suspended，不参与自愈）并切号。
+                // 必须先于欠费与通用 401/403 —— 封禁文案里常同时出现额度字样，
+                // 后判会把「封号」降级成「欠费」，禁用原因和面板提示都会错。
+                if matches!(status.as_u16(), 401 | 403)
+                    && failover_cfg.matches_suspended(&body_text)
+                {
+                    tracing::error!(
+                        "上游 API 请求失败（命中封禁文案，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
+                        ctx.id, attempt + 1, max_retries, status, body_text
+                    );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
+                        outcome::ACCOUNT_SUSPENDED, Some(&body_text), attempt_start,
+                    );
+                    let has_available = self.token_manager.report_suspended_for_request(
+                        ctx.id, model.as_deref(), group,
+                    );
+                    if !has_available {
+                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "上游 API 请求失败（账号封禁）: {} {}", status, body_text
+                    ));
+                    continue;
+                }
+
+                // 欠费/额度用尽文案检测：立即禁用（QuotaExceeded）并切号。
+                // 覆盖 400/401/402/403 —— 中转站表达"没钱了"的状态码五花八门：
+                // Anthropic 官方走 400，OpenAI 风格网关多用 403，也有网关用 402。
+                // 未命中的 400 仍走下方"请求问题直接终止"，不影响原语义。
+                if matches!(status.as_u16(), 400 | 401 | 402 | 403)
+                    && failover_cfg.matches_quota(&body_text)
+                {
+                    tracing::warn!(
+                        "上游 API 请求失败（命中欠费文案，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
+                        ctx.id, attempt + 1, max_retries, status, body_text
+                    );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
+                        outcome::QUOTA_EXHAUSTED, Some(&body_text), attempt_start,
+                    );
+                    let has_available = self.token_manager.report_quota_exhausted_for_request(
+                        ctx.id, model.as_deref(), group,
+                    );
+                    if !has_available {
+                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
+                    }
+                    last_error = Some(anyhow::anyhow!(
+                        "上游 API 请求失败（额度用尽）: {} {}", status, body_text
+                    ));
+                    continue;
+                }
 
                 if matches!(status.as_u16(), 401 | 403) {
                     Self::emit_attempt(
@@ -768,6 +824,36 @@ impl KiroProvider {
                 if status.as_u16() == 429 {
                     let rate_limit_error = rate_limit_429
                         .unwrap_or_else(|| UpstreamRateLimitError::new(None));
+
+                    // 冷却切号：把当前凭据按 Retry-After（缺省用配置值）冷却，
+                    // 立即换下一个可用凭据，而不是在被限流的 key 上原地退避。
+                    if failover_cfg.throttle_failover_enabled() {
+                        let cooldown_secs = retry_after_secs(&rate_limit_error)
+                            .unwrap_or(failover_cfg.throttle_cooldown_secs)
+                            .max(1);
+                        tracing::warn!(
+                            "上游 API 请求失败（429 限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                            ctx.id, cooldown_secs, attempt + 1, max_retries, body_text
+                        );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, "upstream", Some(429),
+                            outcome::ACCOUNT_THROTTLED, Some(&body_text), attempt_start,
+                        );
+                        let remaining = self.token_manager.report_account_throttled_for_request(
+                            ctx.id,
+                            std::time::Duration::from_secs(cooldown_secs),
+                            model.as_deref(),
+                            group,
+                        );
+                        // 没有其它可用凭据：把限流错误（含 Retry-After）交给客户端遵守。
+                        if remaining == 0 {
+                            return Err(rate_limit_error.into());
+                        }
+                        last_error = Some(rate_limit_error.into());
+                        continue;
+                    }
+
+                    // 旧行为（throttle_failover 关闭时）：原地退避重试。
                     Self::emit_attempt(
                         sink, attempt, ctx.id, "upstream", Some(429),
                         outcome::TRANSIENT, Some(&body_text), attempt_start,
@@ -1269,6 +1355,23 @@ fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyho
     }
 }
 
+/// 把 `Retry-After`（delta 秒或 HTTP 日期，`UpstreamRateLimitError` 已归一化为
+/// 两者之一）换算成秒数，作为上游 429 冷却切号的冷却时长。
+///
+/// HTTP 日期在过去（时钟偏差 / 上游给了陈旧时间）时返回 `None`，交由调用方
+/// 回退配置的默认冷却 —— 冷却 0 秒等于没冷却，下一轮还会选中同一个 key。
+fn retry_after_secs(rate_limit: &UpstreamRateLimitError) -> Option<u64> {
+    let value = rate_limit.retry_after()?;
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    let when = httpdate::parse_http_date(value).ok()?;
+    when.duration_since(std::time::SystemTime::now())
+        .ok()
+        .map(|d| d.as_secs())
+        .filter(|s| *s > 0)
+}
+
 /// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
 fn account_rate_limit_with_fallback(
     rate_limit: Option<UpstreamRateLimitError>,
@@ -1311,6 +1414,22 @@ mod rate_limit_tests {
         let mut last_error = Some(anyhow::anyhow!("所有凭据均已禁用"));
         assert!(take_rate_limit_error(&mut last_error).is_none());
         assert!(last_error.is_some());
+    }
+
+    #[test]
+    fn retry_after_secs_parses_delta_seconds() {
+        let err = UpstreamRateLimitError::new(Some("42".to_string()));
+        assert_eq!(retry_after_secs(&err), Some(42));
+    }
+
+    #[test]
+    fn retry_after_secs_none_when_missing_or_stale() {
+        assert_eq!(retry_after_secs(&UpstreamRateLimitError::new(None)), None);
+        // 过去的 HTTP 日期：冷却 0 秒等于没冷却，必须回退配置默认值。
+        let stale = UpstreamRateLimitError::new(Some(
+            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
+        ));
+        assert_eq!(retry_after_secs(&stale), None);
     }
 
     #[test]
@@ -1510,6 +1629,233 @@ mod upstream_passthrough_tests {
             head_lower.contains("anthropic-beta: test-beta-flag"),
             "anthropic-beta 应透传，实际: {head}"
         );
+    }
+
+    /// 起一个只服务一次请求的 mock 上游，返回指定状态码/额外头/响应体。
+    /// 用于模拟中转站的错误响应（欠费 400、封禁 403、限流 429 等）。
+    async fn spawn_mock_upstream_error(
+        status_line: &'static str,
+        extra_headers: &'static str,
+        body: &'static str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+
+            // 与 spawn_mock_upstream 相同：必须按 content-length 读完整个请求体
+            // 再响应。若带着未读数据直接关 socket，会触发 RST 把已写的响应一并
+            // 冲掉（客户端 / 代理侧表现为 502），而不是干净的 FIN。
+            let body_start = loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break None;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break Some(p + 4);
+                }
+            };
+            if let Some(body_start) = body_start {
+                let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
+                let content_len = head
+                    .lines()
+                    .find_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        k.trim().eq_ignore_ascii_case("content-length")
+                            .then(|| v.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                while buf.len() < body_start + content_len {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+            }
+
+            let resp = format!(
+                "HTTP/1.1 {}\r\ncontent-type: application/json\r\n{}content-length: {}\r\n\r\n{}",
+                status_line,
+                extra_headers,
+                body.len(),
+                body
+            );
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+
+        format!("http://{}", addr)
+    }
+
+    /// 两个上游凭据（priority 0 / 1），返回 (provider, manager)。
+    fn provider_with_two_upstreams(
+        first_url: String,
+        second_url: String,
+    ) -> (KiroProvider, Arc<MultiTokenManager>) {
+        let mut cred1 = KiroCredentials::default();
+        cred1.upstream_base_url = Some(first_url);
+        cred1.upstream_api_key = Some("sk-up-1".to_string());
+        cred1.priority = 0;
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.upstream_base_url = Some(second_url);
+        cred2.upstream_api_key = Some("sk-up-2".to_string());
+        cred2.priority = 1;
+
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false)
+                .unwrap(),
+        );
+
+        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
+        let ide = IdeEndpoint::new();
+        endpoints.insert(ide.name().to_string(), Arc::new(ide));
+        let cli = CliEndpoint::new();
+        endpoints.insert(cli.name().to_string(), Arc::new(cli));
+
+        let provider = KiroProvider::with_proxy(
+            manager.clone(),
+            None,
+            endpoints,
+            Config::default().default_endpoint,
+        );
+        (provider, manager)
+    }
+
+    /// 按 base_url 在快照里找到对应凭据条目。
+    fn snapshot_entry_by_url(
+        manager: &MultiTokenManager,
+        url: &str,
+    ) -> crate::kiro::token_manager::CredentialEntrySnapshot {
+        manager
+            .snapshot()
+            .entries
+            .into_iter()
+            .find(|e| e.upstream_base_url.as_deref() == Some(url))
+            .expect("快照中应有该上游凭据")
+    }
+
+    const CLIENT_BODY: &str = r#"{"model":"claude-sonnet-4.6","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
+
+    /// 上游返回欠费文案（Anthropic 官方 400 形状）：凭据应被立即禁用
+    /// （QuotaExceeded）并切到下一个凭据成功。旧行为是 400 直接 bail，
+    /// 欠费 key 永远留在池子里打死后续请求。
+    #[tokio::test]
+    async fn upstream_quota_body_disables_credential_and_fails_over() {
+        let err_url = spawn_mock_upstream_error(
+            "400 Bad Request",
+            "",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
+        )
+        .await;
+        let (ok_url, _rx) = spawn_mock_upstream().await;
+        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
+
+        let result = provider
+            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
+            .await
+            .expect("应切到第二个凭据成功");
+        assert!(result.is_upstream);
+
+        let entry = snapshot_entry_by_url(&manager, &err_url);
+        assert!(entry.disabled, "欠费凭据应被禁用");
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("QuotaExceeded"),
+            "禁用原因应为额度用尽"
+        );
+    }
+
+    /// 上游返回封禁文案（403）：凭据应被立即禁用（Suspended，不参与自愈）
+    /// 并切号，而不是按普通 401/403 攒 3 次失败计数。
+    #[tokio::test]
+    async fn upstream_suspended_body_disables_credential_immediately() {
+        let err_url = spawn_mock_upstream_error(
+            "403 Forbidden",
+            "",
+            r#"{"error":{"message":"Your account has been disabled due to a violation of our terms."}}"#,
+        )
+        .await;
+        let (ok_url, _rx) = spawn_mock_upstream().await;
+        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
+
+        let result = provider
+            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
+            .await
+            .expect("应切到第二个凭据成功");
+        assert!(result.is_upstream);
+
+        let entry = snapshot_entry_by_url(&manager, &err_url);
+        assert!(entry.disabled, "封禁凭据应被立即禁用");
+        assert_eq!(
+            entry.disabled_reason.as_deref(),
+            Some("Suspended"),
+            "禁用原因应为封禁（不参与自愈）"
+        );
+    }
+
+    /// 上游 429：当前凭据应进入冷却（取 Retry-After）并立即切号成功，
+    /// 而不是在被限流的 key 上原地退避到耗尽重试次数。
+    #[tokio::test]
+    async fn upstream_429_cools_down_and_fails_over() {
+        let err_url = spawn_mock_upstream_error(
+            "429 Too Many Requests",
+            "retry-after: 45\r\n",
+            r#"{"error":{"message":"rate limit exceeded"}}"#,
+        )
+        .await;
+        let (ok_url, _rx) = spawn_mock_upstream().await;
+        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
+
+        let result = provider
+            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
+            .await
+            .expect("应切到第二个凭据成功");
+        assert!(result.is_upstream);
+
+        let entry = snapshot_entry_by_url(&manager, &err_url);
+        assert!(!entry.disabled, "429 是临时限流，不应禁用凭据");
+        let remaining = entry
+            .throttled_remaining_secs
+            .expect("被限流的凭据应处于冷却中");
+        assert!(
+            remaining > 0 && remaining <= 45,
+            "冷却时长应来自 Retry-After（45s），实际 {remaining}s"
+        );
+    }
+
+    /// 未命中任何文案的普通 400：保持旧语义 —— 请求问题直接终止，
+    /// 不禁用凭据、不切号（切号重试一个坏请求毫无意义）。
+    #[tokio::test]
+    async fn upstream_plain_400_still_bails_without_failover() {
+        let err_url = spawn_mock_upstream_error(
+            "400 Bad Request",
+            "",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#,
+        )
+        .await;
+        let (ok_url, _rx) = spawn_mock_upstream().await;
+        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
+
+        let err = match provider
+            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
+            .await
+        {
+            Ok(_) => panic!("普通 400 应直接失败，不应切号成功"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("400"), "错误应携带原始状态码");
+
+        let entry = snapshot_entry_by_url(&manager, &err_url);
+        assert!(!entry.disabled, "普通 400 不应禁用凭据");
+        assert!(entry.disabled_reason.is_none());
     }
 
     /// 缺 `max_tokens` 时补上该字段（API 必填），且**只**补这一个。

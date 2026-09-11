@@ -11,7 +11,8 @@ use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
-        check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
+        check_proxy, check_rate_limit, check_update, check_upstream_health,
+        check_upstream_health_batch, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials,
@@ -33,6 +34,7 @@ use super::{
         get_self_heal_config,
         get_token_inflation_config,
         get_update_config,
+        get_upstream_failover_config,
         list_client_keys,
         list_groups,
         list_traces,
@@ -65,6 +67,7 @@ use super::{
         set_self_heal_config,
         set_token_inflation_config,
         set_update_config,
+        set_upstream_failover_config,
         start_idc_login,
         start_idc_relogin,
         start_social_login,
@@ -140,6 +143,8 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
+        .route("/credentials/{id}/health", post(check_upstream_health))
+        .route("/credentials/upstream-health", post(check_upstream_health_batch))
         .route("/models", get(get_current_models))
         .route("/models/test", post(test_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
@@ -160,6 +165,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
+        )
+        .route(
+            "/config/upstream-failover",
+            get(get_upstream_failover_config).put(set_upstream_failover_config),
         )
         .route(
             "/config/token-inflation",

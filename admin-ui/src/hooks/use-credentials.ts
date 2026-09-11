@@ -18,6 +18,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getUpstreamFailoverConfig,
+  setUpstreamFailoverConfig,
   getTokenInflationConfig,
   setTokenInflationConfig,
   getAccountRpmLimitConfig,
@@ -239,6 +241,26 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+/** 上游直通凭据故障转移配置。仅在弹窗打开时拉取，避免常驻请求。 */
+export function useUpstreamFailoverConfig(enabled = true) {
+  return useQuery({
+    queryKey: ['upstreamFailoverConfig'],
+    queryFn: getUpstreamFailoverConfig,
+    enabled,
+  })
+}
+
+// 更新上游直通凭据故障转移配置（热生效 + 落盘）
+export function useSetUpstreamFailoverConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setUpstreamFailoverConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['upstreamFailoverConfig'] })
     },
   })
 }

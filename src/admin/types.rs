@@ -446,6 +446,47 @@ pub struct ModelTestResponse {
     pub credit_unit: Option<String>,
 }
 
+/// 上游 Anthropic API 凭据健康检查请求。
+///
+/// `credentialIds` 省略或为空时检查所有上游凭据；传入后只检查指定 ID。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamHealthCheckRequest {
+    #[serde(default)]
+    pub credential_ids: Option<Vec<u64>>,
+}
+
+/// 单个上游凭据健康检查结果。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamHealthCheckResponse {
+    pub credential_id: u64,
+    /// `/v1/models` 是否返回 2xx。
+    pub success: bool,
+    /// 上游 HTTP 状态码；网络错误或超时导致未收到响应时为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// 从发起请求到收到上游响应头的耗时（毫秒）。
+    pub latency_ms: u64,
+    /// 失败原因。不会包含 API key。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// 检查完成时间（RFC3339）。
+    pub checked_at: String,
+}
+
+/// 批量上游凭据健康检查响应。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamHealthCheckBatchResponse {
+    pub results: Vec<UpstreamHealthCheckResponse>,
+    pub total: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    /// 本次批量检查完成时间（RFC3339）。单条结果仍保留各自完成时间。
+    pub checked_at: String,
+}
+
 // ============ 一键超额 ============
 
 /// 一键超额禁用结果
@@ -518,6 +559,31 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 更新上游直通凭据故障转移检测配置。
+///
+/// 所有字段缺省表示不修改；文案列表传空数组 `[]` 表示清空（= 关闭该类检测）。
+/// 响应直接复用 [`crate::model::config::UpstreamFailoverConfig`]（本身即
+/// camelCase Serialize），避免多一份需要手工同步的镜像结构。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetUpstreamFailoverConfigRequest {
+    /// 总开关；缺省表示不修改
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 欠费/额度用尽检测文案（子串，大小写不敏感）；缺省表示不修改
+    #[serde(default)]
+    pub quota_patterns: Option<Vec<String>>,
+    /// 封禁/停用检测文案；缺省表示不修改
+    #[serde(default)]
+    pub suspended_patterns: Option<Vec<String>>,
+    /// 429 是否冷却切号；缺省表示不修改
+    #[serde(default)]
+    pub throttle_failover: Option<bool>,
+    /// 429 无 Retry-After 时的冷却秒数；缺省表示不修改，1..=86400
+    #[serde(default)]
+    pub throttle_cooldown_secs: Option<u64>,
 }
 
 /// 单账号 RPM 限流配置响应

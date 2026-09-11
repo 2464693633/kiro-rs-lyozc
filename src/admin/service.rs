@@ -5,11 +5,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
+use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::http_client::ProxyConfig;
+use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
@@ -69,6 +70,7 @@ use super::types::{
     SelfHealConfigResponse,
     SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest,
+    SetUpstreamFailoverConfigRequest,
     KeyFeedConfigResponse,
     KeyFeedItemResult,
     KeyFeedPullResult,
@@ -87,6 +89,8 @@ use super::types::{
     UpdateConfigResponse,
     UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
+    UpstreamHealthCheckBatchResponse,
+    UpstreamHealthCheckResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -219,6 +223,19 @@ fn normalize_upstream_base_url(value: &str) -> Result<String, AdminServiceError>
         ));
     }
     Ok(raw.trim_end_matches('/').to_string())
+}
+
+/// 截断上游错误正文，防止异常网关返回超大内容或把敏感上下文原样暴露给 Admin UI。
+fn truncate_health_error(value: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 512;
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let truncated: String = chars.by_ref().take(MAX_ERROR_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}...", truncated)
+    } else {
+        truncated
+    }
 }
 
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
@@ -1171,6 +1188,165 @@ impl AdminService {
             credit_usage: (credit_usage > 0.0).then_some(credit_usage),
             credit_unit,
         })
+    }
+
+    /// 对单个上游 Anthropic 凭据执行轻量健康检查。
+    ///
+    /// 健康检查直接请求该凭据自己的 `/v1/models`，不会经过凭据池调度，也不会
+    /// 调用 `report_failure`/`report_success` 改变账号状态。这样面板可以区分
+    /// 「这个 key 当前不可用」和「另一个 key 被故障转移选中」两种情况。
+    pub async fn check_upstream_health(
+        &self,
+        credential_id: u64,
+    ) -> Result<UpstreamHealthCheckResponse, AdminServiceError> {
+        let credentials = self
+            .token_manager
+            .clone_credential(credential_id)
+            .ok_or(AdminServiceError::NotFound { id: credential_id })?;
+
+        if !credentials.is_upstream_credential() {
+            return Err(AdminServiceError::InvalidCredential(format!(
+                "凭据 #{} 不是上游 Anthropic API 凭据",
+                credential_id
+            )));
+        }
+
+        let base_url = credentials
+            .upstream_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(format!(
+                    "凭据 #{} 缺少 upstreamBaseUrl",
+                    credential_id
+                ))
+            })?;
+        let api_key = credentials
+            .upstream_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                AdminServiceError::InvalidCredential(format!(
+                    "凭据 #{} 缺少 upstreamApiKey",
+                    credential_id
+                ))
+            })?;
+
+        let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+        let global_proxy = self.token_manager.proxy();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        // 健康检查不能沿用普通请求的 12 分钟超时；单次探测最多等待 20 秒，
+        // 否则一个挂死的上游会把批量检查整批拖住。
+        let client = build_client(
+            effective_proxy.as_ref(),
+            20,
+            self.token_manager.config().tls_backend,
+        )
+        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        let started = std::time::Instant::now();
+        let response = match client
+            .get(&url)
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("accept", "application/json")
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                if status.is_success() {
+                    UpstreamHealthCheckResponse {
+                        credential_id,
+                        success: true,
+                        status: Some(status.as_u16()),
+                        latency_ms,
+                        error: None,
+                        checked_at: Utc::now().to_rfc3339(),
+                    }
+                } else {
+                    // 只读取并截断错误正文，避免把异常网关返回的大 body 写入 Admin
+                    // 响应；同时不回显请求头中的 API key。
+                    let body = response.text().await.unwrap_or_default();
+                    let detail = truncate_health_error(&body).replace(api_key, "[redacted]");
+                    let error = if detail.is_empty() {
+                        format!("上游返回 HTTP {}", status.as_u16())
+                    } else {
+                        format!("上游返回 HTTP {}: {}", status.as_u16(), detail)
+                    };
+                    UpstreamHealthCheckResponse {
+                        credential_id,
+                        success: false,
+                        status: Some(status.as_u16()),
+                        latency_ms,
+                        error: Some(error),
+                        checked_at: Utc::now().to_rfc3339(),
+                    }
+                }
+            }
+            Err(error) => UpstreamHealthCheckResponse {
+                credential_id,
+                success: false,
+                status: None,
+                latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                error: Some(truncate_health_error(&error.to_string())),
+                checked_at: Utc::now().to_rfc3339(),
+            },
+        };
+
+        Ok(response)
+    }
+
+    /// 并发检查多个上游 Anthropic 凭据。
+    ///
+    /// ID 列表省略或为空时检查当前配置中的全部上游凭据。并发度固定为 8，
+    /// 避免面板点击「全部检查」时瞬间打满单机连接池或上游限流窗口。
+    pub async fn check_upstream_health_batch(
+        &self,
+        credential_ids: Option<Vec<u64>>,
+    ) -> UpstreamHealthCheckBatchResponse {
+        let ids = match credential_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => self
+                .token_manager
+                .clone_all_credentials()
+                .into_iter()
+                .filter(|credential| credential.is_upstream_credential())
+                .filter_map(|credential| credential.id)
+                .collect(),
+        };
+
+        let mut results = futures::stream::iter(ids)
+            .map(|credential_id| async move {
+                match self.check_upstream_health(credential_id).await {
+                    Ok(result) => result,
+                    Err(error) => UpstreamHealthCheckResponse {
+                        credential_id,
+                        success: false,
+                        status: None,
+                        latency_ms: 0,
+                        error: Some(error.to_string()),
+                        checked_at: Utc::now().to_rfc3339(),
+                    },
+                }
+            })
+            .buffer_unordered(8)
+            .collect::<Vec<_>>()
+            .await;
+        // 稳定输出顺序便于前端按凭据列表渲染，也避免并发完成顺序导致 diff 抖动。
+        results.sort_by_key(|result| result.credential_id);
+        let total = results.len();
+        let success_count = results.iter().filter(|result| result.success).count();
+        UpstreamHealthCheckBatchResponse {
+            results,
+            total,
+            success_count,
+            failure_count: total.saturating_sub(success_count),
+            checked_at: Utc::now().to_rfc3339(),
+        }
     }
 
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）
@@ -2653,6 +2829,40 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 获取上游直通凭据的故障转移检测配置
+    pub fn get_upstream_failover_config(&self) -> crate::model::config::UpstreamFailoverConfig {
+        self.token_manager.get_upstream_failover_config()
+    }
+
+    /// 更新上游直通凭据的故障转移检测配置（热生效 + 持久化到 config.json）
+    pub fn set_upstream_failover_config(
+        &self,
+        req: SetUpstreamFailoverConfigRequest,
+    ) -> Result<crate::model::config::UpstreamFailoverConfig, AdminServiceError> {
+        if req.enabled.is_none()
+            && req.quota_patterns.is_none()
+            && req.suspended_patterns.is_none()
+            && req.throttle_failover.is_none()
+            && req.throttle_cooldown_secs.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_upstream_failover_config(
+                req.enabled,
+                req.quota_patterns,
+                req.suspended_patterns,
+                req.throttle_failover,
+                req.throttle_cooldown_secs,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_upstream_failover_config())
     }
 
     /// 获取 Token 膨胀倍率配置
@@ -4277,5 +4487,65 @@ mod tests {
             "Enterprise"
         );
         assert_eq!(subscription_type_from_title(None), "Free");
+    }
+
+    #[test]
+    fn health_error_is_compacted_and_bounded() {
+        let error = truncate_health_error("  invalid   api key\nplease retry  ");
+        assert_eq!(error, "invalid api key please retry");
+
+        let error = truncate_health_error(&"x".repeat(513));
+        assert_eq!(error.chars().count(), 515);
+        assert!(error.ends_with("..."));
+    }
+
+    #[tokio::test]
+    async fn upstream_health_check_reports_http_status_without_mutating_credential() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+            }
+            assert!(String::from_utf8_lossy(&request)
+                .to_ascii_lowercase()
+                .contains("x-api-key: sk-health-test"));
+            socket
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 13\r\n\r\ninvalid token",
+                )
+                .await
+                .unwrap();
+        });
+
+        let mut credentials = KiroCredentials::default();
+        credentials.id = Some(41);
+        credentials.upstream_base_url = Some(format!("http://{}", address));
+        credentials.upstream_api_key = Some("sk-health-test".to_string());
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![credentials], None, None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager.clone(), Vec::new());
+
+        let result = service.check_upstream_health(41).await.unwrap();
+        server.await.unwrap();
+
+        assert!(!result.success);
+        assert_eq!(result.status, Some(401));
+        assert!(result.error.as_deref().unwrap().contains("invalid token"));
+        assert!(!result.checked_at.is_empty());
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.entries[0].total_failure_count, 0);
+        assert!(!snapshot.entries[0].disabled);
     }
 }

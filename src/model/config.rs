@@ -308,6 +308,10 @@ pub struct Config {
     #[serde(default)]
     pub key_feed: KeyFeedConfig,
 
+    /// 上游直通凭据的故障转移检测配置（欠费/封禁文案、429 冷却切号）。
+    #[serde(default)]
+    pub upstream_failover: UpstreamFailoverConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -456,6 +460,146 @@ impl KeyFeedConfig {
             urlencoding::encode(token)
         ))
     }
+}
+
+/// 上游直通凭据的故障转移检测配置。
+///
+/// 上游多为各家中转站，欠费 / 封禁的返回文案格式互不相同且随时会变，故检测
+/// 规则做成**可配置的子串列表**（大小写不敏感、按字面匹配、不是正则）。
+/// 所有规则只作用于上游凭据分支；Kiro 凭据路径有自己的一套检测，互不影响。
+///
+/// 三类动作与 Kiro 路径的机制一一对应，复用同一套凭据池管理：
+/// - 封禁命中 → `report_suspended_for_request`：立即禁用、不参与自愈、切号；
+/// - 欠费命中 → `report_quota_exhausted_for_request`：立即禁用并切号；
+/// - 429 → `report_account_throttled_for_request`：冷却当前凭据并立即切号
+///   （旧行为是在同一凭据上原地退避重试，池里有其它 key 时纯属浪费）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpstreamFailoverConfig {
+    /// 总开关（默认 true）。关闭后上游分支完全回退旧行为：
+    /// 401/403 攒失败计数、429 原地退避、400 直接终止。
+    #[serde(default = "default_upstream_failover_enabled")]
+    pub enabled: bool,
+
+    /// 欠费 / 额度用尽文案（子串，大小写不敏感）。
+    ///
+    /// 匹配范围：400 / 401 / 402 / 403 的响应体 —— 中转站表达"没钱了"的状态码
+    /// 五花八门，Anthropic 官方是 400（"credit balance is too low"），不少
+    /// OpenAI 风格网关用 403（"insufficient_quota"）。命中后立即禁用该凭据
+    /// （`QuotaExceeded`）并切号。429 刻意不在此列：429 语义是限流，多为临时
+    /// 状态，走下面的冷却切号；把它禁死会误杀还能恢复的 key。
+    #[serde(default = "default_upstream_quota_patterns")]
+    pub quota_patterns: Vec<String>,
+
+    /// 封禁 / 停用文案（子串，大小写不敏感）。
+    ///
+    /// 匹配范围：401 / 403 的响应体。命中后立即禁用（`Suspended`，不参与自愈，
+    /// 需人工在面板重置）并切号，不必等 401/403 攒满 3 次失败计数。
+    #[serde(default = "default_upstream_suspended_patterns")]
+    pub suspended_patterns: Vec<String>,
+
+    /// 429 时是否冷却当前凭据并切号（默认 true）。
+    ///
+    /// 冷却时长优先取上游 `Retry-After` 头；没有时用
+    /// [`Self::throttle_cooldown_secs`]。关闭后 429 回退旧行为（原地退避重试）。
+    #[serde(default = "default_upstream_failover_enabled")]
+    pub throttle_failover: bool,
+
+    /// 429 无 `Retry-After` 时的冷却时长（秒，默认 60）。
+    ///
+    /// 比 Kiro 账号级风控的 30 分钟短得多：中转站的 429 多为短时限流而非风控，
+    /// 长冷却会让池子无谓萎缩。
+    #[serde(default = "default_upstream_throttle_cooldown_secs")]
+    pub throttle_cooldown_secs: u64,
+}
+
+impl Default for UpstreamFailoverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_upstream_failover_enabled(),
+            quota_patterns: default_upstream_quota_patterns(),
+            suspended_patterns: default_upstream_suspended_patterns(),
+            throttle_failover: default_upstream_failover_enabled(),
+            throttle_cooldown_secs: default_upstream_throttle_cooldown_secs(),
+        }
+    }
+}
+
+impl UpstreamFailoverConfig {
+    /// 响应体是否命中欠费文案。`enabled` 关闭时恒 false。
+    pub fn matches_quota(&self, body: &str) -> bool {
+        self.enabled && matches_any_pattern(&self.quota_patterns, body)
+    }
+
+    /// 响应体是否命中封禁文案。`enabled` 关闭时恒 false。
+    pub fn matches_suspended(&self, body: &str) -> bool {
+        self.enabled && matches_any_pattern(&self.suspended_patterns, body)
+    }
+
+    /// 429 是否走冷却切号。
+    pub fn throttle_failover_enabled(&self) -> bool {
+        self.enabled && self.throttle_failover
+    }
+}
+
+/// 大小写不敏感的子串匹配。空 pattern（含纯空白）跳过，防止空串 `contains` 恒真
+/// 把所有错误都误判成命中。
+fn matches_any_pattern(patterns: &[String], body: &str) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    let body_lower = body.to_lowercase();
+    patterns.iter().any(|p| {
+        let p = p.trim();
+        !p.is_empty() && body_lower.contains(&p.to_lowercase())
+    })
+}
+
+fn default_upstream_failover_enabled() -> bool {
+    true
+}
+
+fn default_upstream_throttle_cooldown_secs() -> u64 {
+    60
+}
+
+/// 默认欠费文案：覆盖 Anthropic 官方、OpenAI 风格网关和常见中文中转站。
+/// 全部取高特异性短语，避免误伤普通错误消息。
+fn default_upstream_quota_patterns() -> Vec<String> {
+    [
+        // Anthropic 官方 / 兼容网关
+        "credit balance is too low",
+        // OpenAI 风格网关（one-api / new-api 系）
+        "insufficient_quota",
+        "insufficient quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "余额不足",
+        "额度已用尽",
+        "额度不足",
+        "欠费",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+/// 默认封禁文案。刻意不收录裸 "banned" / "disabled" 单词 —— 太宽，普通错误
+/// 消息（如 "streaming is disabled"）会误命中。
+fn default_upstream_suspended_patterns() -> Vec<String> {
+    [
+        "account has been disabled",
+        "account has been suspended",
+        "account is suspended",
+        "user has been banned",
+        "账号已被封禁",
+        "账户已被禁用",
+        "账号已被禁用",
+        "已被封禁",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 
 /// rust 缓存模拟引擎（`anthropic::cache_metering`）参数。
@@ -1003,6 +1147,7 @@ impl Default for Config {
             billing: BillingConfig::default(),
             custom_models: Vec::new(),
             key_feed: KeyFeedConfig::default(),
+            upstream_failover: UpstreamFailoverConfig::default(),
             config_path: None,
         }
     }
@@ -1314,6 +1459,78 @@ mod cache_engine_config_tests {
         assert_eq!(s.input_token_multiplier, 1.5);
         assert_eq!(s.cache_read_multiplier, 2.0);
         assert_eq!(s.cache_creation_multiplier, 0.5);
+    }
+}
+
+#[cfg(test)]
+mod upstream_failover_config_tests {
+    use super::{Config, UpstreamFailoverConfig};
+
+    /// 老 config.json（无该段）反序列化后必须整段取默认值，且默认启用。
+    #[test]
+    fn defaults_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.upstream_failover.enabled);
+        assert!(config.upstream_failover.throttle_failover);
+        assert_eq!(config.upstream_failover.throttle_cooldown_secs, 60);
+        assert!(!config.upstream_failover.quota_patterns.is_empty());
+        assert!(!config.upstream_failover.suspended_patterns.is_empty());
+    }
+
+    /// 匹配是大小写不敏感的子串匹配，中英文都要能命中。
+    #[test]
+    fn pattern_matching_is_case_insensitive_substring() {
+        let cfg = UpstreamFailoverConfig::default();
+        assert!(cfg.matches_quota(
+            r#"{"error":{"message":"Your Credit Balance Is Too Low to access the API."}}"#
+        ));
+        assert!(cfg.matches_quota(r#"{"message":"当前分组余额不足，请联系管理员"}"#));
+        assert!(cfg.matches_suspended(
+            r#"{"error":{"message":"Your account has been disabled."}}"#
+        ));
+        // 普通错误不得误命中
+        assert!(!cfg.matches_quota(r#"{"message":"model not found"}"#));
+        assert!(!cfg.matches_suspended(r#"{"message":"streaming is disabled for this model"}"#));
+    }
+
+    /// 空 pattern（含纯空白）必须被跳过：空串 `contains` 恒真，会把一切错误
+    /// 都判成命中，等于把所有 4xx 的凭据全部禁用。
+    #[test]
+    fn blank_patterns_never_match() {
+        let cfg = UpstreamFailoverConfig {
+            quota_patterns: vec!["".to_string(), "   ".to_string()],
+            ..UpstreamFailoverConfig::default()
+        };
+        assert!(!cfg.matches_quota(r#"{"message":"anything"}"#));
+    }
+
+    /// 总开关关闭后所有检测恒 false（完全回退旧行为）。
+    #[test]
+    fn disabled_flag_turns_everything_off() {
+        let cfg = UpstreamFailoverConfig {
+            enabled: false,
+            ..UpstreamFailoverConfig::default()
+        };
+        assert!(!cfg.matches_quota("credit balance is too low"));
+        assert!(!cfg.matches_suspended("account has been disabled"));
+        assert!(!cfg.throttle_failover_enabled());
+    }
+
+    /// 用户自定义规则覆盖默认列表后按自定义生效。
+    #[test]
+    fn custom_patterns_replace_defaults() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamFailover":{"quotaPatterns":["my custom broke message"],"throttleCooldownSecs":120}}"#,
+        )
+        .unwrap();
+        let cfg = &config.upstream_failover;
+        assert!(cfg.matches_quota("MY CUSTOM BROKE MESSAGE with details"));
+        // 默认规则已被替换，不再命中
+        assert!(!cfg.matches_quota("credit balance is too low"));
+        assert_eq!(cfg.throttle_cooldown_secs, 120);
+        // 未提供的字段仍取默认
+        assert!(cfg.enabled);
+        assert!(!cfg.suspended_patterns.is_empty());
     }
 }
 

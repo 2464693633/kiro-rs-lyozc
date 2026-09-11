@@ -9,6 +9,59 @@
 
 ---
 
+## 2026-08-13 — 上游凭据补齐自动切号（欠费/封禁文案检测 + 429 冷却）
+
+**问题**：Kiro 凭据有完整的故障分类（402 额度禁用、403 封禁文案立即禁用、429 风控冷却切号），
+上游直通凭据只有 401/403 攒失败计数这一条。两个实际后果：
+
+1. **欠费 key 打死请求且永不出局**。中转站欠费多以 400 返回（Anthropic 官方是
+   `credit balance is too low`），而上游分支对 400 直接 `bail!` —— 不切号、不计失败、
+   不禁用。没余额的 key 会让路由到它的每个请求都失败，还一直留在池子里。
+2. **429 不切号**。上游 429 只在原凭据上退避重试（priority 模式下 `current_id` 不变，
+   下一轮还是它），直到耗尽 `MAX_TOTAL_RETRIES` 把 429 抛给客户端 —— 池里明明还有
+   别的 key。
+
+**方案**：`config.json` 新增 `upstreamFailover` 段（`model/config.rs::UpstreamFailoverConfig`）。
+上游多为各家中转站、文案随时会变，故检测规则做成**可配置子串列表**（大小写不敏感，
+非正则），三类动作全部复用凭据池现成机制：
+
+- 封禁文案（401/403 命中 `suspendedPatterns`）→ `report_suspended_for_request`：
+  立即禁用、不参与自愈。**判定先于欠费** —— 封禁文案里常同时出现额度字样，后判会把
+  封号降级成欠费，禁用原因就错了。
+- 欠费文案（400/401/402/403 命中 `quotaPatterns`）→ `report_quota_exhausted_for_request`。
+  429 刻意不在匹配范围：其语义是限流、多为临时态，禁死会误杀能恢复的 key。
+- 429 → `report_account_throttled_for_request` 冷却当前凭据并立即换号；冷却时长优先取
+  `Retry-After`（delta 秒与 HTTP 日期都支持，过期日期回退配置值），缺省 60s ——
+  比 Kiro 风控的 30 分钟短得多，中转站 429 多为短时限流，长冷却会让池子无谓萎缩。
+  无其它可用凭据时把带 Retry-After 的 429 交还客户端遵守。
+
+未命中文案的普通 401/403（攒 3 次禁用）与普通 400（直接终止）语义不变；
+`enabled: false` 整段关闭回退旧行为；字段缺省走 `#[serde(default)]`，老配置零迁移。
+
+**Admin API 热更新**：`GET/PUT /api/admin/config/upstream-failover`（与
+`/config/account-throttle` 同模式）。运行时配置放 `MultiTokenManager` 的
+`Mutex<UpstreamFailoverConfig>`（含 `Vec<String>` 文案列表，拆不成原子量；读取只在
+上游请求**失败**的错误路径发生，锁竞争可忽略），provider 每次错误处理时取运行时
+副本而非启动 config 快照。PUT 是 patch 语义：未提供字段不动，列表传 `[]` = 清空
+该类检测；写入前校验（冷却 1..=86400 秒；文案 trim 后过滤空白项、拒绝 <4 字节的
+过短子串 —— "ban" 会命中 "banner" 这类无辜消息）；持久化失败回滚内存值。
+
+**Admin UI 编辑界面**：设置齿轮菜单「调度与限流」下新增「上游凭据故障转移」入口
+（`admin-ui/src/components/upstream-failover-dialog.tsx`）。总开关 + 两个按行编辑的
+文案列表（欠费 / 封禁）+ 429 冷却切号开关与冷却秒数；前端预校验与后端同规则
+（文案 ≥4 UTF-8 字节、冷却 1..=86400 秒），保存整份提交、热生效。配置仅在弹窗
+打开时拉取，不产生常驻轮询。
+
+测试：`config.rs` 5 条（默认值 / 大小写与中英文命中 / 空 pattern 防恒真 / 总开关 /
+自定义规则覆盖默认），`provider.rs` 4 条 mock 上游集成（欠费 400 禁用切号、封禁 403
+立即禁用、429 冷却切号取 Retry-After、普通 400 不切号）+ 2 条 `retry_after_secs` 单测，
+`token_manager.rs` 2 条（热更新 patch 语义 / 非法输入拒绝且不部分生效）。
+mock 踩了一个坑：错误 mock 若不按 content-length 读完请求体就关 socket，会触发 RST
+把已写的响应冲掉（走系统代理时表现为 502），故与成功 mock 一样先读完再响应。
+`cargo test` **793 passed / 0 failed**。
+
+---
+
 ## 2026-08-09 — 合并上游：opus-5 纳入 1M 上下文窗口
 
 上游 [PR #61](https://github.com/ZyphrZero/kiro.rs/pull/61)（`eb309f7`），改一个文件、

@@ -170,12 +170,23 @@ pub fn default_is_account_throttled(body: &str) -> bool {
 /// `Your User ID (...) temporarily is suspended. We've locked your account as a
 /// security precaution. To restore access, please contact our support team ...`
 ///
-/// 与普通 403（权限不足 / WAF / 区域抖动）的关键差异：同时出现 "suspended" 与
-/// "locked your account" 两个高特异短语。大小写不敏感匹配，兼容文案微调。
-/// 两个短语都命中才判定，避免把偶发 403 误判为封禁。
+/// 优先识别结构化 `reason=TEMPORARILY_SUSPENDED`；旧响应没有 reason 时，要求
+/// `suspended` 与明确的账号锁定文案同时出现，避免把普通权限错误误判为封禁。
 pub fn default_is_account_suspended(body: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let reason = value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if reason.eq_ignore_ascii_case("TEMPORARILY_SUSPENDED") {
+            return true;
+        }
+    }
+
     let lower = body.to_ascii_lowercase();
-    lower.contains("suspended") && lower.contains("locked your account")
+    lower.contains("suspended")
+        && (lower.contains("locked your account")
+            || lower.contains("locked it as a security precaution"))
 }
 
 /// 默认的上游网关超时判断逻辑。
@@ -290,6 +301,14 @@ mod tests {
         // 大小写不敏感
         assert!(default_is_account_suspended(
             "Account SUSPENDED. We've LOCKED YOUR ACCOUNT."
+        ));
+
+        // 新版数据面响应改用结构化 reason，且文案为 "locked it"。
+        assert!(default_is_account_suspended(
+            r#"{"message":"Your User ID is temporarily suspended. We detected unusual user activity and locked it as a security precaution.","reason":"TEMPORARILY_SUSPENDED"}"#
+        ));
+        assert!(default_is_account_suspended(
+            "Account suspended after unusual activity; we locked it as a security precaution."
         ));
 
         // 普通 403 权限错误不应命中

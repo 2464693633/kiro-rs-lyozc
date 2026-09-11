@@ -451,6 +451,38 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+// ==== 上游直通凭据故障转移（检测规则可配置，热生效 + 落盘）====
+
+export interface UpstreamFailoverConfig {
+  /** 总开关。关闭后上游分支回退旧行为（401/403 攒计数、429 原地退避） */
+  enabled: boolean
+  /** 欠费/额度用尽检测文案（子串，大小写不敏感），命中即禁用并切号 */
+  quotaPatterns: string[]
+  /** 封禁/停用检测文案，命中即禁用（不参与自愈）并切号 */
+  suspendedPatterns: string[]
+  /** 429 时是否冷却当前凭据并立即切号 */
+  throttleFailover: boolean
+  /** 429 无 Retry-After 时的冷却秒数（1-86400） */
+  throttleCooldownSecs: number
+}
+
+/** 更新上游故障转移配置。未传字段保持原值；文案列表传 [] 表示清空（关闭该类检测）。 */
+export type UpstreamFailoverConfigPatch = Partial<UpstreamFailoverConfig>
+
+// 获取上游直通凭据故障转移配置
+export async function getUpstreamFailoverConfig(): Promise<UpstreamFailoverConfig> {
+  const { data } = await api.get<UpstreamFailoverConfig>('/config/upstream-failover')
+  return data
+}
+
+// 更新上游直通凭据故障转移配置（热生效 + 持久化）
+export async function setUpstreamFailoverConfig(
+  patch: UpstreamFailoverConfigPatch,
+): Promise<UpstreamFailoverConfig> {
+  const { data } = await api.put<UpstreamFailoverConfig>('/config/upstream-failover', patch)
+  return data
+}
+
 export interface TokenInflationConfig {
   inputMultiplier: number
   outputMultiplier: number

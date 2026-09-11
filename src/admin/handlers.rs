@@ -26,11 +26,12 @@ use super::{
         CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
         ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
         SetDisabledRequest, SetGlobalProxyRequest, SetKeyFeedConfigRequest,
+        SetUpstreamFailoverConfigRequest,
         SetLoadBalancingModeRequest,
         SetLogGovernanceConfigRequest, SetPriorityRequest, SetSelfHealConfigRequest,
         SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
         StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest,
+        UpdateCredentialRequest, UpdateRefreshTokenRequest, UpstreamHealthCheckRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -204,6 +205,32 @@ pub async fn test_model(
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_http_response(),
     }
+}
+
+/// POST /api/admin/credentials/:id/health
+/// 独立检查单个上游 Anthropic 凭据，不改变凭据池故障计数。
+pub async fn check_upstream_health(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.check_upstream_health(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_http_response(),
+    }
+}
+
+/// POST /api/admin/credentials/upstream-health
+/// 并发检查多个上游 Anthropic 凭据；请求体可传 credentialIds，省略则检查全部。
+pub async fn check_upstream_health_batch(
+    State(state): State<AdminState>,
+    Json(request): Json<UpstreamHealthCheckRequest>,
+) -> impl IntoResponse {
+    Json(
+        state
+            .service
+            .check_upstream_health_batch(request.credential_ids)
+            .await,
+    )
 }
 
 /// POST /api/admin/credentials/disable-quota-exceeded
@@ -588,6 +615,24 @@ pub async fn set_account_throttle_config(
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/upstream-failover
+/// 获取上游直通凭据的故障转移检测配置
+pub async fn get_upstream_failover_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_upstream_failover_config())
+}
+
+/// PUT /api/admin/config/upstream-failover
+/// 更新上游直通凭据的故障转移检测配置（热生效 + 持久化）
+pub async fn set_upstream_failover_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetUpstreamFailoverConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_upstream_failover_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

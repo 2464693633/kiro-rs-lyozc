@@ -563,11 +563,11 @@ impl KiroCredentials {
         }
     }
 
-    /// 返回「可发送给上游」的真实 profileArn（跳过 BuilderID 占位符）。
+    /// 返回需要真实身份的请求可发送的 profileArn（跳过 BuilderID 占位符）。
     ///
     /// - 真实 ARN（含 Social 共享 ARN）→ 原样返回；
-    /// - [`BUILDER_ID_PROFILE_ARN`] 占位符 → 返回 `None`（非流式/头部类调用不应发送
-    ///   BuilderID 占位符；流式请求请使用 [`Self::streaming_profile_arn`]）。
+    /// - [`BUILDER_ID_PROFILE_ARN`] 占位符 → 返回 `None`（头部与流式之外的身份请求不应
+    ///   把占位符当作真实 ARN；用量 REST 请求另有自适应的占位符/无 ARN回退）。
     pub fn effective_profile_arn(&self) -> Option<&str> {
         match self.profile_arn.as_deref() {
             Some(arn) if !is_placeholder_profile_arn(arn) => Some(arn),

@@ -46,7 +46,7 @@
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
-- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
+- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用会按上游租户先尝试已有 ARN，再自动回退到无 ARN。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
@@ -314,6 +314,8 @@ codex
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
+| `/api/admin/credentials/{id}/health` | 直接探测单个上游 Anthropic 凭据的 `/v1/models`、HTTP 状态与延迟 |
+| `/api/admin/credentials/upstream-health` | 并发探测全部或指定上游 Anthropic 凭据 |
 | `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
 | `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
@@ -323,6 +325,9 @@ codex
 | `/api/admin/config/*` | 运行时配置 |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
+
+上游健康检查直接使用每条 Anthropic 凭据的 Base URL、凭据级代理和 API Key 请求
+`GET /v1/models`，默认单次超时 20 秒；结果只反映本次探测，不会修改凭据池失败计数、禁用状态或故障转移选择。
 
 Admin API 鉴权同样支持：
 
@@ -367,6 +372,7 @@ Admin API 鉴权同样支持：
 | `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
 | `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
+| `upstreamFailover` | 见下 | 上游直通凭据的故障转移检测（欠费/封禁文案、429 冷却切号），详见 [上游凭据故障转移](#upstream-failover) |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
@@ -753,6 +759,7 @@ data/
 
 - 概览：整体请求量、token、模型分布、凭据贡献。
 - 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定。
+- 上游健康：逐个或批量探测 Anthropic API 凭据，显示可用性、HTTP 状态、响应头延迟和错误摘要。
 - 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
 
@@ -823,6 +830,43 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 429 + suspicious activity 可触发账号级冷却并切换凭据。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
+
+<a id="upstream-failover"></a>
+### 上游凭据故障转移
+
+上游直通凭据（各家中转站）同样参与自动切号。由于中转站的欠费 / 封禁返回文案互不相同，检测规则做成**可配置的子串列表**（大小写不敏感、按字面匹配、不是正则），配置在 `config.json` 的 `upstreamFailover` 段：
+
+```json
+{
+  "upstreamFailover": {
+    "enabled": true,
+    "quotaPatterns": ["credit balance is too low", "insufficient_quota", "余额不足", "额度已用尽"],
+    "suspendedPatterns": ["account has been disabled", "账号已被封禁"],
+    "throttleFailover": true,
+    "throttleCooldownSecs": 60
+  }
+}
+```
+
+- `quotaPatterns`：400/401/402/403 响应体命中欠费文案时，立即禁用该凭据（`QuotaExceeded`）并切号。默认列表覆盖 Anthropic 官方、OpenAI 风格网关（one-api / new-api 系）与常见中文文案。
+- `suspendedPatterns`：401/403 响应体命中封禁文案时，立即禁用（`Suspended`，不参与自愈，需在面板手动重置）并切号，无需等 401/403 攒满 3 次失败计数。
+- `throttleFailover`：上游 429 时把当前凭据冷却（优先取 `Retry-After` 头，否则用 `throttleCooldownSecs`）并立即切到下一个可用凭据，而不是在被限流的 key 上原地重试。
+- 未命中任何文案的普通 401/403 仍按失败计数处理（3 次禁用）；普通 400 仍直接返回，不切号。
+- `enabled` 设为 `false` 时整段关闭，完全回退旧行为。字段缺省时使用内置默认规则，老配置文件无需迁移。
+
+也可以在 Admin UI 中编辑：顶栏设置齿轮菜单 →「调度与限流」→「上游凭据故障转移」，文案列表按行编辑，保存即热生效。
+
+支持通过 Admin API 热更新（立即生效并持久化到 `config.json`，无需重启）：
+
+```bash
+# 查看当前配置
+curl -H "Authorization: Bearer $ADMIN_KEY" http://localhost:8990/api/admin/config/upstream-failover
+
+# 更新检测规则（未提供的字段保持不变；列表传 [] 表示清空该类检测）
+curl -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
+  http://localhost:8990/api/admin/config/upstream-failover \
+  -d '{"quotaPatterns": ["余额不足", "insufficient_quota"], "throttleCooldownSecs": 120}'
+```
 
 <a id="updates-release"></a>
 ## 在线更新和发布

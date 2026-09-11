@@ -7,6 +7,7 @@ import {
   Rss,
   ShieldAlert,
   ShieldCheck,
+  Shuffle,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -34,6 +35,7 @@ import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 import { CacheEngineDialog } from '@/components/cache-engine-dialog'
 import { KeyFeedDialog } from '@/components/key-feed-dialog'
+import { UpstreamFailoverDialog } from '@/components/upstream-failover-dialog'
 import { AvailableModelsDialog } from '@/components/available-models-dialog'
 
 /**
@@ -63,6 +65,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
   const [cacheEngineDialogOpen, setCacheEngineDialogOpen] = useState(false)
   const [keyFeedDialogOpen, setKeyFeedDialogOpen] = useState(false)
+  const [upstreamFailoverDialogOpen, setUpstreamFailoverDialogOpen] = useState(false)
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -135,6 +138,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     openKeyDialog,
     openCacheEngineDialog: () => setCacheEngineDialogOpen(true),
     openKeyFeedDialog: () => setKeyFeedDialogOpen(true),
+    openUpstreamFailoverDialog: () => setUpstreamFailoverDialogOpen(true),
     throttleConfig,
     inflationConfig,
     updateCheck,
@@ -161,6 +165,11 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
       />
 
       <KeyFeedDialog open={keyFeedDialogOpen} onOpenChange={setKeyFeedDialogOpen} />
+
+      <UpstreamFailoverDialog
+        open={upstreamFailoverDialogOpen}
+        onOpenChange={setUpstreamFailoverDialogOpen}
+      />
 
       <Dialog
         open={keyDialogOpen}
@@ -269,6 +278,7 @@ interface ToolControls {
   openKeyDialog: () => void
   openCacheEngineDialog: () => void
   openKeyFeedDialog: () => void
+  openUpstreamFailoverDialog: () => void
   openModels: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   /** 只读：编辑入口在缓存引擎弹窗，这里仅用于状态点与菜单后缀 */
@@ -349,6 +359,12 @@ function SettingsMenuItems({ controls }: { controls: ToolControls }) {
         onToggleFailover={controls.handleToggleFailover}
         onChangeCooldown={controls.updateCooldown}
       />
+      {/* 上游直通凭据（中转站）的欠费/封禁/429 检测规则，与上面的账号级
+          风控（Kiro 凭据）是两套独立机制，编辑项多（两个文案列表），收进弹窗 */}
+      <DropdownMenuItem onSelect={controls.openUpstreamFailoverDialog}>
+        <Shuffle />
+        上游凭据故障转移
+      </DropdownMenuItem>
       <SelfHealCompactItems />
       <AccountRpmLimitCompactItems />
 

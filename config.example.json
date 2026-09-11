@@ -11,5 +11,31 @@
   "modelCacheTtlSecs": 3600,
   "traceEnabled": true,
   "traceRetentionDays": 7,
-  "usageLogRetentionDays": 31
+  "usageLogRetentionDays": 31,
+  "upstreamFailover": {
+    "enabled": true,
+    "quotaPatterns": [
+      "credit balance is too low",
+      "insufficient_quota",
+      "insufficient quota",
+      "quota exceeded",
+      "exceeded your current quota",
+      "余额不足",
+      "额度已用尽",
+      "额度不足",
+      "欠费"
+    ],
+    "suspendedPatterns": [
+      "account has been disabled",
+      "account has been suspended",
+      "account is suspended",
+      "user has been banned",
+      "账号已被封禁",
+      "账户已被禁用",
+      "账号已被禁用",
+      "已被封禁"
+    ],
+    "throttleFailover": true,
+    "throttleCooldownSecs": 60
+  }
 }

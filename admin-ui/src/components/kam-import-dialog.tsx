@@ -31,6 +31,8 @@ interface KamAccount {
   userId?: string | null
   nickname?: string
   idp?: string
+  // 部分 KAM 版本把 profileArn 放在账号顶层，而不是 credentials 内。
+  profileArn?: string
   credentials: {
     refreshToken: string
     accessToken?: string
@@ -390,7 +392,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           req: {
             refreshToken: token,
             accessToken: cred.accessToken?.trim() || undefined,
-            profileArn: cred.profileArn?.trim() || undefined,
+            // 兼容 KAM 两种导出布局：优先 credentials.profileArn，
+            // 缺失时回退账号顶层 profileArn。
+            profileArn: cred.profileArn?.trim() || account.profileArn?.trim() || undefined,
             expiresAt: normalizeExpiresAt(cred.expiresAt),
             authMethod,
             provider,
