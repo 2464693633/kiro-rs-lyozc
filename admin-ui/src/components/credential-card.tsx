@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, memo } from "react";
 import { toast } from "sonner";
 import {
   RefreshCw,
@@ -15,7 +15,14 @@ import {
   ScrollText,
   Boxes,
   Wallet,
-  CalendarDays,
+  ChevronRight,
+  Activity,
+  Key,
+  Globe,
+  Server,
+  Layers,
+  Sparkles,
+  Flag,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -40,8 +47,13 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { CredentialStatusItem, BalanceResponse } from "@/types/api";
-import { maskProxyUrl, extractErrorMessage, overageFailureMessage, formatCredits } from "@/lib/utils";
+import type {
+  CredentialMetadataSchema,
+  CredentialStatusItem,
+  BalanceResponse,
+  ProxyPoolEntry,
+} from "@/types/api";
+import { maskProxyUrl, extractErrorMessage, overageFailureMessage, cn } from "@/lib/utils";
 import {
   useSetDisabled,
   useSetPriority,
@@ -51,8 +63,8 @@ import {
   useResetSuccessCount,
   useClearThrottle,
 } from "@/hooks/use-credentials";
-import { setCredentialOverage } from "@/api/credentials";
-import { useQueryClient } from "@tanstack/react-query";
+import { setCredentialOverage, getProxyPool } from "@/api/credentials";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { EditCredentialDialog } from "@/components/edit-credential-dialog";
@@ -60,22 +72,31 @@ import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
 import { AvailableModelsDialog } from "@/components/available-models-dialog";
-import { useBillingComparison, useBillingConfig } from "@/hooks/use-billing";
-import type { StatsRange, StatsTimeFilter } from "@/types/api";
+import { BalanceDialog } from "@/components/balance-dialog";
+import { getDisposition } from "@/components/console/credential-state";
+import {
+  railBorderClass,
+  railChipClass,
+} from "@/components/console/rail";
+import { PriorityPreview } from "@/components/console/priority-preview";
+import { CredentialLabel } from "@/components/console/credential-label";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
   selected: boolean;
-  onToggleSelect: () => void;
+  onToggleSelect: (id: number) => void;
   balance: BalanceResponse | null;
   loadingBalance: boolean;
-  onRefreshBalance: () => void;
+  onRefreshBalance: (id: number) => void | Promise<void>;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
   /** 字段排序开启时禁用拖拽调优先级（隐藏拖拽手柄） */
   dragDisabled?: boolean;
+  /** 开发预览卡：仅展示，不发起任何凭据操作。 */
+  preview?: boolean;
+  metadataSchema?: CredentialMetadataSchema;
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -92,21 +113,23 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${Math.floor(h / 24)} 天前`;
 }
 
-/** 添加时间用绝对日期展示（凭据的创建时刻是固定事实，相对时间意义不大） */
+/** 添加时间用绝对时刻展示 */
 function formatCreatedAt(createdAt: string | null | undefined): string {
   if (!createdAt) return "未知";
   const date = new Date(createdAt);
   if (Number.isNaN(date.getTime())) return "未知";
-  return date.toLocaleDateString("zh-CN", {
+  return date.toLocaleString("zh-CN", {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
   });
 }
 
-/** 完整时间戳，用于 hover 提示 */
 function formatCreatedAtFull(createdAt: string | null | undefined): string {
-  if (!createdAt) return "添加时间未知（该凭据在此功能上线前导入）";
+  if (!createdAt) return "添加时间未知";
   const date = new Date(createdAt);
   if (Number.isNaN(date.getTime())) return "添加时间未知";
   return `添加于 ${date.toLocaleString("zh-CN")}`;
@@ -119,217 +142,14 @@ function formatNumber(n: number): string {
   });
 }
 
-/** 紧凑数字格式：≥1M 显示 xM，≥1K 显示 xK，否则原值 */
-function fmtNum(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
-}
-
-function formatMoney(value: number): string {
-  if (value > 0 && value < 0.0001) return "<$0.0001";
-  return `$${value.toFixed(4)}`;
-}
-
-function dateInputValue(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
-}
-
-function presetStartDate(range: StatsRange, endDate: string): string {
-  const days = range === "24h" ? 0 : range === "7d" ? 6 : 29;
-  const date = new Date(`${endDate}T00:00:00`);
-  date.setDate(date.getDate() - days);
-  return dateInputValue(date);
-}
-
-function UpstreamBillingPanel({ credentialId }: { credentialId: number }) {
-  const today = dateInputValue(new Date());
-  const [range, setRange] = useState<StatsRange | undefined>("7d");
-  const [customOpen, setCustomOpen] = useState(false);
-  const [startDate, setStartDate] = useState(() => presetStartDate("7d", today));
-  const [endDate, setEndDate] = useState(today);
-  const [timeFilter, setTimeFilter] = useState<StatsTimeFilter>({
-    range: "7d",
-    granularity: "day",
-  });
-  const { data, isLoading, isFetching, isError } = useBillingComparison(
-    timeFilter,
-    { credentialId },
-  );
-  const { data: config } = useBillingConfig();
-  const selectPreset = (nextRange: StatsRange) => {
-    const currentEnd = dateInputValue(new Date());
-    setRange(nextRange);
-    setStartDate(presetStartDate(nextRange, currentEnd));
-    setEndDate(currentEnd);
-    setCustomOpen(false);
-    setTimeFilter({
-      range: nextRange,
-      granularity: nextRange === "24h" ? "hour" : "day",
-    });
-  };
-  const applyCustomRange = () => {
-    if (!startDate || !endDate || endDate < startDate) return;
-    setRange(undefined);
-    setTimeFilter({ startDate, endDate, granularity: "day" });
-  };
-
-  const ENGINE_LABELS: Record<string, string> = {
-    rust: 'Rust 缓存',
-    go: 'Go 缓存',
-    real: '真实上游',
-    nocache: '无缓存',
-  };
-
-  const ENGINE_COLORS: Record<string, string> = {
-    rust: 'bg-blue-500',
-    go: 'bg-emerald-500',
-    real: 'bg-red-500',
-    nocache: 'bg-gray-500',
-  };
-
-  const upstreamMultiplier = config?.upstreamMultipliers[String(credentialId)] ?? 1;
-
-  const rows = [
-    {
-      label: "上游真实",
-      tokens: data?.engines?.reduce((sum, e) => sum + e.upstreamTokens, 0) ?? 0,
-      cost: data?.upstreamCost ?? 0,
-      multiplier: upstreamMultiplier,
-      color: "bg-red-500",
-    },
-    ...(data?.engines?.map(e => ({
-      label: ENGINE_LABELS[e.engine] || e.engine,
-      tokens: e.clientTokens,
-      cost: e.clientCost,
-      multiplier: config?.[`${e.engine}Multiplier` as keyof typeof config] as number ?? 1,
-      color: ENGINE_COLORS[e.engine] || 'bg-gray-500',
-    })) ?? []),
-  ];
-  const timeText = timeFilter.range
-    ? timeFilter.range === "24h"
-      ? "近 1 天"
-      : timeFilter.range === "7d"
-        ? "近 7 天"
-        : "近 30 天"
-    : `${timeFilter.startDate} 至 ${timeFilter.endDate}`;
-
-  return (
-    <div className="rounded-lg border border-border/60 bg-secondary/30 p-3">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div className="text-sm font-medium">费用对比</div>
-          <div className="text-[11px] text-muted-foreground">
-            {data?.calls ?? 0} 次调用 · {timeText}
-          </div>
-        </div>
-        <div className="inline-flex rounded-md border bg-background p-0.5" aria-label="统计时间段">
-          {([
-            ["24h", "1天"],
-            ["7d", "7天"],
-            ["30d", "30天"],
-          ] as const).map(([value, label]) => (
-            <Button
-              key={value}
-              type="button"
-              size="sm"
-              variant={range === value ? "secondary" : "ghost"}
-              className="h-6 px-2 text-[11px]"
-              onClick={() => selectPreset(value)}
-            >
-              {label}
-            </Button>
-          ))}
-          <Button
-            type="button"
-            size="icon"
-            variant={range === undefined || customOpen ? "secondary" : "ghost"}
-            className="h-6 w-7"
-            title="自定义日期"
-            aria-label="自定义日期"
-            onClick={() => setCustomOpen((open) => !open)}
-          >
-            <CalendarDays className="h-3.5 w-3.5" />
-          </Button>
-        </div>
-      </div>
-      {customOpen && (
-        <div className="mb-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-2 max-[420px]:grid-cols-1">
-          <Input
-            type="date"
-            value={startDate}
-            max={endDate || today}
-            aria-label="统计开始日期"
-            className="h-8 min-w-0 text-xs"
-            onChange={(event) => setStartDate(event.target.value)}
-          />
-          <span className="text-center text-xs text-muted-foreground max-[420px]:hidden">至</span>
-          <Input
-            type="date"
-            value={endDate}
-            min={startDate}
-            max={today}
-            aria-label="统计结束日期"
-            className="h-8 min-w-0 text-xs"
-            onChange={(event) => setEndDate(event.target.value)}
-          />
-          <Button
-            type="button"
-            size="sm"
-            className="col-span-3 h-8 text-xs max-[420px]:col-span-1"
-            disabled={!startDate || !endDate || endDate < startDate}
-            onClick={applyCustomRange}
-          >
-            查询
-          </Button>
-        </div>
-      )}
-      <div className="grid grid-cols-[minmax(0,1fr)_auto_auto] gap-x-3 border-b border-border/50 pb-1 text-[10px] text-muted-foreground">
-        <span>计费来源</span>
-        <span className="text-right">Token</span>
-        <span className="text-right">金额 (USD)</span>
-      </div>
-      {isLoading ? (
-        <div className="flex h-[88px] items-center justify-center gap-2 text-xs text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          加载计费数据…
-        </div>
-      ) : isError ? (
-        <div className="flex h-[88px] items-center justify-center text-xs text-destructive">
-          计费数据加载失败
-        </div>
-      ) : (
-        <div className={isFetching ? "opacity-60" : ""}>
-          {rows.map((row) => (
-            <div
-              key={row.label}
-              className="grid min-h-9 grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-x-3 border-b border-border/40 text-xs last:border-0"
-            >
-              <div className="flex min-w-0 items-center gap-1.5">
-                <span className={`h-2 w-2 shrink-0 rounded-full ${row.color}`} />
-                <span className="truncate">{row.label}</span>
-                <span className="text-[10px] tabular-nums text-muted-foreground">
-                  ×{row.multiplier.toFixed(2)}
-                </span>
-              </div>
-              <span className="text-right font-medium tabular-nums">{fmtNum(row.tokens)}</span>
-              <span className="min-w-16 text-right font-semibold tabular-nums">
-                {formatMoney(row.cost)}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
-  return new Date(ts * 1000).toLocaleString("zh-CN");
+  return new Date(ts * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
@@ -342,25 +162,141 @@ function formatThrottleCountdown(secs: number): string {
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
-/**
- * 紧凑超额状态胶囊 — 与订阅徽章并列展示，不占整行
- * 三态：已开（绿色实色）/ 未开（中性细描边）/ 不支持（灰色虚边小字）
- */
+function proxyDisplayLabel(proxyUrl: string): string {
+  try {
+    const { host } = new URL(proxyUrl);
+    return host || maskProxyUrl(proxyUrl);
+  } catch {
+    return maskProxyUrl(proxyUrl);
+  }
+}
+
+function endpointDisplayLabel(endpoint: string): string {
+  if (endpoint === "ide") return "IDE 端点";
+  if (endpoint === "cli") return "CLI 端点";
+  return endpoint;
+}
+
+/** Profile ARN 的短标识：`arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK` → `EHGA3GRVQMUK` */
+export function profileShortId(arn: string): string {
+  const idx = arn.lastIndexOf("/");
+  return idx >= 0 ? arn.slice(idx + 1) : arn;
+}
+
+function metadataValueLabel(value: unknown): string {
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (typeof value === "string" || typeof value === "number") {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function metadataEntries(
+  credential: CredentialStatusItem,
+) {
+  const metadata = credential.metadata ?? {};
+  return Object.entries(metadata).flatMap(([key, detail]) => {
+    const rawValue = detail.value;
+    if (rawValue == null || rawValue === "") return [];
+    return [
+      {
+        key,
+        label: detail.title?.trim() || key,
+        description: detail.description,
+        value:
+          key === "salePrice" && typeof rawValue === "number"
+            ? `¥${(rawValue as number).toLocaleString("zh-CN", {
+                minimumFractionDigits: 2,
+                maximumFractionDigits: 2,
+              })}`
+            : detail.valueLabel ?? metadataValueLabel(rawValue),
+        emphasized: key === "type" && rawValue === "boom",
+      },
+    ];
+  });
+}
+
+
+
+/** 账目行 —— 标签 + 描述在左，值贴右边缘 */
+function LedgerRow({
+  label,
+  hint,
+  title,
+  description,
+  icon: Icon,
+  danger,
+  children,
+}: {
+  label: string;
+  hint?: string;
+  title?: string;
+  description?: string;
+  icon?: React.ElementType;
+  danger?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={cn(
+      "grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-baseline gap-x-2.5 gap-y-0.5 py-0.5 -mx-2 px-2 rounded",
+      danger && "bg-destructive/10 border border-destructive/30",
+    )}>
+      <dt className="flex shrink-0 flex-col" title={title}>
+        <span className="flex items-center gap-1.5">
+          {Icon && <Icon className="h-3.5 w-3.5 text-muted-foreground/70" />}
+          <span className="text-[12px] font-normal tracking-normal text-muted-foreground">
+            {label}
+          </span>
+          {hint && (
+            <span className="text-[10px] text-muted-foreground/50">{hint}</span>
+          )}
+        </span>
+        {description && (
+          <span className="text-[10px] leading-tight text-muted-foreground/50 mt-0.5">
+            {description}
+          </span>
+        )}
+      </dt>
+      <dd className="min-w-0 break-all text-right text-[12px] leading-4 text-foreground/90 font-medium">
+        {children}
+      </dd>
+    </div>
+  );
+}
+
+function CardSectionTitle({
+  children,
+  icon: Icon,
+}: {
+  children: React.ReactNode;
+  icon?: React.ElementType;
+}) {
+  return (
+    <h3 className="flex items-center gap-1.5 text-[11px] font-semibold leading-4 uppercase tracking-wider text-muted-foreground/80">
+      {Icon && <Icon className="h-3.5 w-3.5 opacity-70" />}
+      {children}
+    </h3>
+  );
+}
+
 function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
   const cap = balance.overageCapable;
   const on = balance.overageEnabled === true;
 
-  // 不支持的订阅：极弱化
   if (cap === false) return null;
 
   if (on) {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 h-6 text-[11px] font-medium text-emerald-700 dark:text-emerald-400"
+        className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-400 border border-emerald-500/30"
         title="此账号已开启超额"
       >
-        <Zap className="h-3 w-3" />
-        超额
+        <Zap className="h-2.5 w-2.5 fill-current" />
+        超额开启
       </span>
     );
   }
@@ -368,35 +304,26 @@ function OverageStatusPill({ balance }: { balance: BalanceResponse }) {
   if (cap === true) {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-transparent px-2 h-6 text-[11px] font-medium text-amber-600 dark:text-amber-400"
+        className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400"
         title="此账号支持超额但当前未开启"
       >
-        <ZapOff className="h-3 w-3" />
-        未开
+        <ZapOff className="h-2.5 w-2.5" />
+        超额未开
       </span>
     );
   }
 
-  // 未知：低调灰色，hover 看原始值
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-full border border-dashed border-border/60 bg-transparent px-2 h-6 text-[11px] text-muted-foreground"
-      title={
-        balance.overageCapabilityRaw
-          ? `overageCapability = ${balance.overageCapabilityRaw}`
-          : "上游未返回 overageCapability"
-      }
+      className="inline-flex items-center gap-1 rounded-full border border-dashed border-border/60 bg-transparent px-2 py-0.5 text-[10px] text-muted-foreground"
+      title="上游未返回超额能力状态"
     >
-      <ZapOff className="h-3 w-3" />
+      <ZapOff className="h-2.5 w-2.5 opacity-60" />
       未知
     </span>
   );
 }
 
-/**
- * 把后端返回的 disabledReason 字符串映射为更直观的中文徽标
- * （颜色/文案/排序权重，越靠前越显眼）
- */
 function getDisabledReasonStyle(reason?: string | null): {
   label: string;
   variant: "destructive" | "warning" | "outline" | "secondary";
@@ -422,7 +349,39 @@ function getDisabledReasonStyle(reason?: string | null): {
   }
 }
 
-export function CredentialCard({
+function MetadataSummary({
+  credential,
+}: {
+  credential: CredentialStatusItem;
+}) {
+  const entries = metadataEntries(credential);
+  if (entries.length === 0) return null;
+
+  return (
+    <div
+      className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden"
+      aria-label="凭据 Metadata"
+    >
+      {entries.map((entry) => (
+        <span
+          key={entry.key}
+          className={`inline-flex min-w-0 max-w-full shrink-0 items-center overflow-hidden rounded-md border px-1.5 py-0.5 text-[11px] ${
+            entry.emphasized
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+              : "border-border/60 bg-muted/45 text-foreground"
+          }`}
+          title={entry.description || `${entry.label}: ${entry.value}`}
+        >
+          <span className="shrink-0 text-muted-foreground">{entry.label}</span>
+          <span className="mx-1 text-border">·</span>
+          <span className="max-w-40 truncate font-medium">{entry.value}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function CredentialCardImpl({
   credential,
   selected,
   onToggleSelect,
@@ -432,6 +391,8 @@ export function CredentialCard({
   failureStats,
   view = "card",
   dragDisabled = false,
+  preview = false,
+  metadataSchema,
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -443,6 +404,8 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
+  const [showBalanceDialog, setShowBalanceDialog] = useState(false);
+  const [connectionExpanded, setConnectionExpanded] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -453,7 +416,22 @@ export function CredentialCard({
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
 
-  // 拖拽排序：手柄触发，整卡随拖动位移
+  // 代理池健康数据，用于标记凭据专属代理是否异常（仅在凭据配置了代理时按需查询）
+  const { data: proxyPool } = useQuery({
+    queryKey: ['proxy-pool'],
+    queryFn: getProxyPool,
+    staleTime: 30_000,
+    enabled: Boolean(credential.hasProxy && credential.proxyUrl),
+  });
+
+  /** 凭据专属代理在代理池中的健康信息（仅当 proxyUrl 匹配到池内条目时有效） */
+  const proxyEntry: ProxyPoolEntry | undefined = (() => {
+    if (!credential.proxyUrl || !proxyPool?.proxies) return undefined;
+    return proxyPool.proxies.find((p) => p.url === credential.proxyUrl);
+  })();
+
+  const proxyUnhealthy = proxyEntry && (proxyEntry.health === 'unhealthy' || proxyEntry.autoDisabled);
+
   const {
     attributes,
     listeners,
@@ -465,13 +443,10 @@ export function CredentialCard({
   } = useSortable({ id: credential.id, disabled: dragDisabled });
   const dragStyle: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
-    // 拖拽中关掉过渡，避免 Card 基类的 transition-all 把每帧 transform 动画化导致"不跟手"；
-    // 非拖拽态保留 dnd-kit 的归位过渡。
     transition: isDragging ? "none" : transition,
     zIndex: isDragging ? 20 : undefined,
   };
 
-  // 后端冷却剩余秒数会在 30s 拉取间隔之间过时，本地用 setInterval 自然递减以让倒计时连续。
   const [throttleRemaining, setThrottleRemaining] = useState<number>(
     credential.throttledRemainingSecs ?? 0,
   );
@@ -485,6 +460,7 @@ export function CredentialCard({
     }, 1000);
     return () => window.clearInterval(t);
   }, [throttleRemaining]);
+
   const handleClearThrottle = useCallback(() => {
     clearThrottle.mutate(credential.id, {
       onSuccess: (res) => {
@@ -494,6 +470,7 @@ export function CredentialCard({
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
     });
   }, [clearThrottle, credential.id]);
+
   const [overageBusy, setOverageBusy] = useState(false);
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
@@ -512,15 +489,22 @@ export function CredentialCard({
     }
   };
 
+  const handleToggleSelect = useCallback(() => {
+    onToggleSelect(credential.id);
+  }, [onToggleSelect, credential.id]);
+
+  const handleRefreshBalanceClick = useCallback(() => {
+    onRefreshBalance(credential.id);
+  }, [onRefreshBalance, credential.id]);
+
   const handleToggleDisabled = () => {
-    // 当前为禁用态 → 这次操作是“启用”，启用成功后顺带刷新一次余额
     const willEnable = credential.disabled;
     setDisabled.mutate(
       { id: credential.id, disabled: !credential.disabled },
       {
         onSuccess: (res) => {
           toast.success(res.message);
-          if (willEnable && !credential.isUpstream) onRefreshBalance();
+          if (willEnable) onRefreshBalance(credential.id);
         },
         onError: (err) => toast.error("操作失败: " + (err as Error).message),
       },
@@ -530,7 +514,7 @@ export function CredentialCard({
   const handlePriorityChange = () => {
     const np = parseInt(priorityValue, 10);
     if (isNaN(np) || np < 0) {
-      toast.error("优先级必须是非负整数");
+      toast.error("优先级要填 0 或更大的整数，0 最先被使用");
       return;
     }
     setPriority.mutate(
@@ -594,20 +578,62 @@ export function CredentialCard({
     return credential.authMethod;
   })();
 
-  const isQuotaExceeded = !credential.isUpstream && balance
+  const isQuotaExceeded = balance
     ? balance.remaining <= 0 || balance.usagePercentage >= 100
     : false;
 
   const disabledByQuota =
-    !credential.isUpstream &&
-    credential.disabled &&
-    credential.disabledReason === "QuotaExceeded";
+    credential.disabled && credential.disabledReason === "QuotaExceeded";
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
-  // 卡片与列表行共用的状态描边 / 灰化（当前优先 · 超额 · 冷却 · 禁用）
+  const disposition = getDisposition(credential, balance, throttleRemaining);
+
+  const runDisposition = () => {
+    switch (disposition.action) {
+      case "clearThrottle":
+        handleClearThrottle();
+        break;
+      case "viewBalance":
+        setShowBalanceDialog(true);
+        break;
+      case "relogin":
+        setShowReloginDialog(true);
+        break;
+      case "enable":
+        handleToggleDisabled();
+        break;
+      case "refreshToken":
+        handleForceRefresh();
+        break;
+      case "viewFailures":
+        setShowFailuresDialog(true);
+        break;
+      case "none":
+        break;
+    }
+  };
+
+  const dispositionButton = disposition.actionLabel ? (
+    <Button
+      size="sm"
+      variant="outline"
+      onClick={runDisposition}
+      disabled={
+        (disposition.action === "clearThrottle" && clearThrottle.isPending) ||
+        (disposition.action === "enable" && setDisabled.isPending) ||
+        (disposition.action === "refreshToken" && forceRefresh.isPending)
+      }
+      title={`${disposition.stateLabel} → ${disposition.actionLabel}`}
+      className="h-7 whitespace-nowrap px-3 text-xs font-medium border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300 hover:bg-amber-500/20"
+    >
+      <Sparkles className="mr-1 h-3 w-3" />
+      {disposition.actionLabel}
+    </Button>
+  ) : null;
+
   const stateClasses = [
-    credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
+    credential.isCurrent ? "ring-1 ring-primary shadow-xs" : "",
     !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
     disabledByQuota
       ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
@@ -615,84 +641,91 @@ export function CredentialCard({
     isThrottled
       ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
       : "",
-    credential.disabled && !disabledByQuota ? "opacity-70" : "",
+    credential.disabled && !disabledByQuota ? "opacity-75" : "",
   ]
     .filter(Boolean)
     .join(" ");
 
-  // 订阅 / 状态 / 鉴权 / 分组等徽章 —— 卡片头部与列表行共用
-  const badges = (
+  // 仅在有异常状态时呈现精简的状态标签，避免常规状态下出现杂乱胶囊
+  const statusBadges = (
     <>
-      {!credential.isUpstream && balance?.subscriptionTitle && (
-        <SubscriptionBadge
-          title={balance.subscriptionTitle}
-          className="max-w-full"
-        />
-      )}
-      {credential.isCurrent && <Badge variant="success">当前优先</Badge>}
-      {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
       {credential.disabled && reasonStyle && (
-        <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
+        <Badge variant={reasonStyle.variant} className="text-[11px]">
+          已禁用 · {reasonStyle.label}
+        </Badge>
       )}
       {credential.disabled && !reasonStyle && (
-        <Badge variant="destructive">已禁用</Badge>
+        <Badge variant="destructive" className="text-[11px]">已禁用</Badge>
       )}
-      {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
       {!credential.disabled && isQuotaExceeded && (
-        <Badge variant="warning">已超额</Badge>
+        <Badge variant="warning" className="text-[11px]">已超额</Badge>
       )}
       {isThrottled && (
         <Badge
           variant="warning"
-          className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30"
-          title="账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度"
+          className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30 text-[11px]"
+          title="账号级限流冷却中"
         >
-          <Clock className="mr-1 h-3 w-3" />
+          <Clock className="mr-1 h-3 w-3 inline" />
           冷却 {formatThrottleCountdown(throttleRemaining)}
-        </Badge>
-      )}
-      {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
-      {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
-      {(credential.endpoint || credential.hasProfileArn) && (
-        <Badge
-          variant="outline"
-          className="max-w-full truncate"
-          title={
-            credential.hasProfileArn ? "endpoint / 已配置 Profile ARN" : "endpoint"
-          }
-        >
-          {[credential.endpoint, credential.hasProfileArn ? "ARN" : null]
-            .filter(Boolean)
-            .join(" · ")}
-        </Badge>
-      )}
-      {/* 账号所属分组 */}
-      {(credential.groups ?? []).map((g) => (
-        <Badge key={g} variant="outline" title="账号分组">
-          {g}
-        </Badge>
-      ))}
-      {/* 账号来源渠道 */}
-      {credential.sourceChannel && (
-        <Badge variant="outline" title="账号来源渠道">
-          来源: {credential.sourceChannel}
         </Badge>
       )}
     </>
   );
 
-  // “更多操作”下拉 —— 卡片与列表行共用
+  const hasStatusBadges =
+    credential.disabled || isQuotaExceeded || isThrottled;
+
+  const subscriptionTitle = balance?.subscriptionTitle ?? credential.subscriptionTitle;
+  const subscriptionBadge = subscriptionTitle ? (
+    <SubscriptionBadge title={subscriptionTitle} />
+  ) : null;
+
+  const metadataItems = metadataEntries(credential);
+  const renderMetadataRows = (items: typeof metadataItems) =>
+    items.map((entry) => (
+      <LedgerRow
+        key={entry.key}
+        label={entry.label}
+        description={entry.description}
+        title={entry.description || (entry.key === entry.label ? undefined : `key: ${entry.key}`)}
+      >
+        <span
+          className={`font-medium ${
+            entry.emphasized ? "text-amber-600 dark:text-amber-400" : ""
+          }`}
+        >
+          {entry.value}
+        </span>
+      </LedgerRow>
+    ));
+  const metadataRows = renderMetadataRows(metadataItems);
+
+  const groups = credential.groups ?? [];
+  const groupingBlock =
+    groups.length > 0 ? (
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+        <span className="mr-0.5 text-[11px] text-muted-foreground/80">分组</span>
+        {groups.map((g) => (
+          <span
+            key={g}
+            title="账号分组"
+            className="inline-flex max-w-full items-center break-all rounded-md bg-secondary/80 px-2 py-0.5 text-[11px] font-medium text-secondary-foreground"
+          >
+            {g}
+          </span>
+        ))}
+      </div>
+    ) : null;
+
   const moreMenu = (
-    // modal={false}：菜单非模态，避免 Radix 在 <html> 上施加 overflow:hidden 滚动锁。
-    // 该锁在移动端（尤其 iOS Safari）会与背景层 backdrop-blur / 固定定位叠加，
-    // 导致整页渲染错乱或横向位移——这正是移动端点击"更多操作"后页面异常的根因。
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
-        <Button size="icon" variant="ghost" title="更多操作">
+        <Button size="icon" variant="ghost" className="h-8 w-8 hover:bg-accent" title="更多操作">
           <MoreHorizontal className="h-4 w-4" />
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
+      <DropdownMenuContent align="end" className="w-48">
         <DropdownMenuItem
           onSelect={(e) => {
             e.preventDefault();
@@ -704,7 +737,7 @@ export function CredentialCard({
               credential.refreshFailureCount === 0)
           }
         >
-          <RotateCcw />
+          <RotateCcw className="mr-2 h-4 w-4" />
           重置失败计数
         </DropdownMenuItem>
         <DropdownMenuItem
@@ -712,7 +745,7 @@ export function CredentialCard({
           disabled={credential.disabled}
           title={credential.disabled ? "已禁用凭据无法查询" : undefined}
         >
-          <Boxes />
+          <Boxes className="mr-2 h-4 w-4" />
           查看可用模型
         </DropdownMenuItem>
         {throttleRemaining > 0 && (
@@ -723,12 +756,11 @@ export function CredentialCard({
             }}
             disabled={clearThrottle.isPending}
           >
-            <Clock />
-            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+            <Clock className="mr-2 h-4 w-4" />
+            解除限流冷却（{formatThrottleCountdown(throttleRemaining)}）
           </DropdownMenuItem>
         )}
-        {!credential.isUpstream &&
-          balance?.overageCapable === true &&
+        {balance?.overageCapable === true &&
           (balance.overageEnabled ? (
             <DropdownMenuItem
               onSelect={(e) => {
@@ -737,7 +769,7 @@ export function CredentialCard({
               }}
               disabled={overageBusy}
             >
-              <ZapOff />
+              <ZapOff className="mr-2 h-4 w-4 text-amber-500" />
               关闭超额
             </DropdownMenuItem>
           ) : (
@@ -748,20 +780,20 @@ export function CredentialCard({
               }}
               disabled={overageBusy}
             >
-              <Zap className="text-emerald-500" />
+              <Zap className="mr-2 h-4 w-4 text-emerald-500" />
               开启超额
             </DropdownMenuItem>
           ))}
         {credential.authMethod !== "api_key" && <DropdownMenuSeparator />}
         {credential.authMethod !== "api_key" && (
           <DropdownMenuItem onSelect={() => setShowReloginDialog(true)}>
-            <LogIn />
+            <LogIn className="mr-2 h-4 w-4" />
             重新登录
           </DropdownMenuItem>
         )}
         {credential.authMethod !== "api_key" && (
           <DropdownMenuItem onSelect={() => setShowUpdateTokenDialog(true)}>
-            <RefreshCw />
+            <RefreshCw className="mr-2 h-4 w-4" />
             重新导入 Token
           </DropdownMenuItem>
         )}
@@ -773,23 +805,25 @@ export function CredentialCard({
             setShowDeleteDialog(true);
           }}
         >
-          <Trash2 />
+          <Trash2 className="mr-2 h-4 w-4" />
           删除凭据
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
 
-  // 紧凑列表行：继承卡片的全部操作（启用/禁用 · 优先级 · 失败/成功 · 刷新 · 编辑 · 更多 · 拖拽 · 选择）
+  // 紧凑列表行 View
   const listView = (
     <div
       ref={setNodeRef}
       style={dragStyle}
       data-credential-id={credential.id}
-      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card px-2 py-2 transition-all sm:gap-3 sm:px-3 ${
+      className={`group flex min-w-0 items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 transition-colors sm:gap-3 sm:px-3.5 [transform:translateZ(0)] ${railBorderClass(
+        disposition.tone,
+      )} ${
         isDragging
-          ? "shadow-apple-lg opacity-80"
-          : "hover:bg-accent/40 hover:shadow-apple-sm"
+          ? "shadow-md opacity-80"
+          : "hover:bg-accent/40 hover:border-border"
       } ${stateClasses}`}
     >
       {/* 拖拽手柄（字段排序开启时隐藏，此时拖拽无意义） */}
@@ -799,165 +833,187 @@ export function CredentialCard({
           size="icon"
           variant="ghost"
           data-no-rect-select
-          className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
-          title="拖拽调整优先级"
+          className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing hover:bg-accent/60"
+          title="拖拽排序 · 越靠上越先被使用"
           {...attributes}
           {...listeners}
         >
-          <GripVertical className="h-4 w-4 text-muted-foreground" />
+          <GripVertical className="h-4 w-4 text-muted-foreground/70" />
         </Button>
       )}
 
-      {/* 选择框 */}
       <label
         data-no-rect-select
         className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
         onClick={(e) => e.stopPropagation()}
       >
         <Checkbox
-          className="h-5 w-5 [&_svg]:h-4 [&_svg]:w-4"
+          className="h-4 w-4 [&_svg]:h-3 [&_svg]:w-3"
           checked={selected}
-          onCheckedChange={onToggleSelect}
+          onCheckedChange={handleToggleSelect}
         />
       </label>
 
-      {/* 身份 + 徽章 */}
       <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-medium leading-5">
-          {credential.email || `凭据 #${credential.id}`}
+        <div className="flex items-center gap-2 text-sm font-medium leading-5">
+          <CredentialLabel id={credential.id} email={credential.email} />
         </div>
-        <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden [&>*]:shrink-0">
-          {badges}
+        <div className="mt-1 flex min-w-0 items-center gap-1.5 overflow-hidden [&>*]:shrink-0">
+          {statusBadges}
+          {groups.map((g) => (
+            <span
+              key={g}
+              title="账号分组"
+              className="inline-flex items-center rounded-md bg-secondary/80 px-1.5 py-0.5 text-[11px] font-medium text-secondary-foreground"
+            >
+              {g}
+            </span>
+          ))}
+          {credential.sourceChannel && (
+            <span
+              title="账号来源渠道"
+              className="text-[11px] text-muted-foreground/80"
+            >
+              {credential.sourceChannel}
+            </span>
+          )}
         </div>
+        <MetadataSummary credential={credential} />
       </div>
 
-      {/* 关键指标（中大屏） */}
-      <div className="hidden shrink-0 items-center gap-5 lg:flex">
-        <div className="relative w-14 shrink-0 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-            优先级
+      <div className="hidden shrink-0 items-center gap-6 lg:flex">
+        <div className="relative w-16 shrink-0 text-center">
+          <div
+            className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80"
+            title="优先级：数字越小越先被使用，0 最先"
+          >
+            优先级 ↑
           </div>
-          {/* 固定高度占位，避免编辑态切换时整行高度抖动 */}
           <div className="mt-0.5 flex h-[26px] items-center justify-center">
             {editingPriority ? (
-              // 编辑栏（≈112px）比列宽（56px）更宽：绝对定位脱离流式布局浮起，
-              // 配合背景与 z-index，避免被相邻"失败"列在绘制顺序上覆盖
-              <div className="absolute left-1/2 top-1/2 z-30 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-0.5 rounded-md border border-border/60 bg-card p-1 shadow-apple-sm">
-                <Input
-                  type="number"
-                  value={priorityValue}
-                  onChange={(e) => setPriorityValue(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") handlePriorityChange();
-                    if (e.key === "Escape") {
+              <div className="absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-md border border-border bg-popover p-1.5 shadow-md">
+                <div className="inline-flex items-center gap-1">
+                  <Input
+                    type="number"
+                    value={priorityValue}
+                    onChange={(e) => setPriorityValue(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handlePriorityChange();
+                      if (e.key === "Escape") {
+                        setEditingPriority(false);
+                        setPriorityValue(String(credential.priority));
+                      }
+                    }}
+                    className="h-7 w-16 rounded-md text-sm font-mono"
+                    min="0"
+                    autoFocus
+                  />
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 text-emerald-600"
+                    onClick={handlePriorityChange}
+                    disabled={setPriority.isPending}
+                    title="确认"
+                  >
+                    ✓
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7 text-muted-foreground"
+                    onClick={() => {
                       setEditingPriority(false);
                       setPriorityValue(String(credential.priority));
-                    }
-                  }}
-                  className="h-7 w-16 rounded-md text-sm"
-                  min="0"
-                  autoFocus
-                />
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={handlePriorityChange}
-                  disabled={setPriority.isPending}
-                  title="确认"
-                >
-                  ✓
-                </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => {
-                    setEditingPriority(false);
-                    setPriorityValue(String(credential.priority));
-                  }}
-                  title="取消"
-                >
-                  ✕
-                </Button>
+                    }}
+                    title="取消"
+                  >
+                    ✕
+                  </Button>
+                </div>
+                <div className="mt-1 whitespace-nowrap px-1 text-center">
+                  <PriorityPreview
+                    credentialId={credential.id}
+                    draft={priorityValue}
+                    disabled={credential.disabled}
+                  />
+                </div>
               </div>
             ) : (
               <button
                 type="button"
-                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                className="inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-semibold tabular-nums transition-colors hover:bg-accent hover:text-primary"
                 onClick={() => setEditingPriority(true)}
-                title="点击编辑优先级"
+                title={credential.isCurrent ? "当前调度优先凭据 · 点击编辑" : "点击编辑优先级"}
               >
-                {credential.priority}
-                <Pencil className="h-3 w-3 opacity-70" />
+                {credential.isCurrent && (
+                  <Flag className="h-3 w-3 fill-emerald-500 text-emerald-500 shrink-0" />
+                )}
+                #{credential.priority}
+                <Pencil className="h-3 w-3 opacity-60" />
               </button>
             )}
           </div>
         </div>
 
         <div className="w-20 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
             失败
           </div>
           <button
             type="button"
             onClick={() => setShowFailuresDialog(true)}
-            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent"
-            title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-semibold tabular-nums transition-colors hover:bg-accent"
+            title="鉴权失败 / 风控 / 其他。点击查看日志"
           >
             {failureStats ? (
-              <span className="tabular-nums">
-                <span className="text-destructive">{failureStats.auth}</span>
-                <span className="text-muted-foreground/50">/</span>
-                <span className="text-amber-600 dark:text-amber-400">
-                  {failureStats.throttle}
-                </span>
-                <span className="text-muted-foreground/50">/</span>
-                <span className="text-muted-foreground">
-                  {failureStats.other}
-                </span>
+              <span className="tabular-nums font-mono">
+                <span className="text-destructive font-semibold">{failureStats.auth}</span>
+                <span className="text-muted-foreground/40">/</span>
+                <span className="text-amber-600 dark:text-amber-400">{failureStats.throttle}</span>
+                <span className="text-muted-foreground/40">/</span>
+                <span className="text-muted-foreground">{failureStats.other}</span>
               </span>
             ) : (
               <span
                 className={
                   credential.totalFailureCount > 0
-                    ? "text-destructive"
-                    : "text-muted-foreground"
+                    ? "font-mono font-semibold text-destructive"
+                    : "font-mono text-muted-foreground"
                 }
               >
                 {credential.totalFailureCount}
               </span>
             )}
-            <ScrollText className="h-3.5 w-3.5 opacity-70" />
+            <ScrollText className="h-3 w-3 opacity-60" />
           </button>
         </div>
 
         <div className="w-16 text-center">
-          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/80">
             成功
           </div>
           <button
             type="button"
             onClick={handleResetSuccess}
-            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-xs font-semibold tabular-nums transition-colors hover:bg-accent hover:text-primary"
             title="点击重置成功次数"
           >
             {credential.successCount}
-            <RotateCcw className="h-3 w-3 opacity-70" />
+            <RotateCcw className="h-3 w-3 opacity-50" />
           </button>
         </div>
       </div>
 
-      {/* 余额（大屏） */}
-      {!credential.isUpstream && <div className="hidden w-44 shrink-0 xl:block">
+      <div className="hidden w-44 shrink-0 xl:block">
         {loadingBalance ? (
           <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            查询中…
+            查询余额…
           </div>
         ) : balance ? (
           <div>
-            <div className="flex items-baseline justify-between gap-2 text-xs tabular-nums">
+            <div className="flex items-baseline justify-between gap-2 text-xs tabular-nums font-mono">
               <span
                 className={`font-semibold ${
                   balance.remaining < 0
@@ -971,38 +1027,37 @@ export function CredentialCard({
                   ? `-$${formatNumber(Math.abs(balance.remaining))}`
                   : `$${formatNumber(balance.remaining)}`}
               </span>
-              <span className="text-muted-foreground">
+              <span className="text-muted-foreground text-[11px]">
                 {balance.usagePercentage.toFixed(0)}%
               </span>
             </div>
             <Progress value={balance.usagePercentage} className="mt-1 h-1.5" />
           </div>
         ) : (
-          <div className="text-center text-[11px] text-muted-foreground">
+          <div className="text-center text-[11px] text-muted-foreground/70">
             余额未查询
           </div>
         )}
-      </div>}
+      </div>
 
-      {/* 最后调用 + 添加时间（中大屏） */}
-      <div className="hidden w-24 shrink-0 truncate text-right text-xs md:block">
-        <div className="truncate text-muted-foreground">
+      <div className="hidden w-28 shrink-0 truncate text-right text-xs md:block">
+        <div className="truncate font-medium text-foreground/90">
           {formatLastUsed(credential.lastUsedAt)}
         </div>
         <div
-          className="truncate text-[11px] tabular-nums text-muted-foreground/60"
+          className="truncate text-[10px] tabular-nums font-mono text-muted-foreground/60"
           title={formatCreatedAtFull(credential.createdAt)}
         >
-          添加 {formatCreatedAt(credential.createdAt)}
+          {formatCreatedAt(credential.createdAt)}
         </div>
       </div>
 
-      {/* 操作区 */}
-      <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
-        {!credential.isUpstream && <Button
+      <div className="flex shrink-0 items-center gap-1">
+        {dispositionButton}
+        <Button
           size="icon"
           variant="ghost"
-          className="hidden h-9 w-9 sm:inline-flex"
+          className={`h-8 w-8 ${dispositionButton ? "hidden" : "hidden sm:inline-flex"}`}
           onClick={handleForceRefresh}
           disabled={
             forceRefresh.isPending ||
@@ -1018,158 +1073,189 @@ export function CredentialCard({
           }
         >
           <RefreshCw
-            className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
+            className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
           />
-        </Button>}
-        {!credential.isUpstream && <Button
+        </Button>
+        <Button
           size="icon"
           variant="ghost"
-          className="hidden h-9 w-9 sm:inline-flex"
-          onClick={onRefreshBalance}
+          className={`h-8 w-8 ${dispositionButton ? "hidden" : "hidden sm:inline-flex"}`}
+          onClick={handleRefreshBalanceClick}
           disabled={loadingBalance || credential.disabled}
           title={credential.disabled ? "已禁用" : "刷新余额"}
         >
           {loadingBalance ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : (
-            <Wallet className="h-4 w-4" />
+            <Wallet className="h-3.5 w-3.5" />
           )}
-        </Button>}
+        </Button>
         <Switch
           checked={!credential.disabled}
           onCheckedChange={handleToggleDisabled}
           disabled={setDisabled.isPending}
           title={credential.disabled ? "启用" : "禁用"}
+          className="scale-90"
         />
         <Button
           size="icon"
           variant="ghost"
-          className="h-9 w-9"
+          className="h-8 w-8"
           onClick={() => setShowEditDialog(true)}
           title="编辑"
         >
-          <Pencil className="h-4 w-4" />
+          <Pencil className="h-3.5 w-3.5" />
         </Button>
         {moreMenu}
       </div>
     </div>
   );
 
+  // 标准卡片 View (Default)
   return (
     <>
       {view === "list" ? (
         listView
       ) : (
-      <Card
-        ref={setNodeRef}
-        style={dragStyle}
-        data-credential-id={credential.id}
-        className={`group flex h-full min-w-0 flex-col ${
-          isDragging
-            ? "shadow-apple-lg opacity-80"
-            : "hover:-translate-y-0.5 hover:shadow-apple-lg"
-        } ${stateClasses}`}
-      >
-        <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-3">
-          <div className="flex min-w-0 items-start gap-2.5 sm:gap-3">
-            <label
-              data-no-rect-select
-              className="mt-0.5 flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent sm:h-7 sm:w-7"
-              onClick={(e) => {
-                // label + Checkbox 双击事件去重，避免触发两次 onCheckedChange
-                e.stopPropagation();
-              }}
-            >
-              <Checkbox
-                className="h-5 w-5 [&_svg]:h-4 [&_svg]:w-4"
-                checked={selected}
-                onCheckedChange={onToggleSelect}
-              />
-            </label>
-            <div className="min-w-0 flex-1">
-              <CardTitle className="truncate text-[15px] leading-5">
-                {credential.email || `凭据 #${credential.id}`}
-              </CardTitle>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
-                {badges}
+        <Card
+          ref={setNodeRef}
+          style={dragStyle}
+          data-credential-id={credential.id}
+          className={`group flex h-full min-w-0 flex-col overflow-hidden rounded-lg border border-border bg-card shadow-xs transition-colors duration-100 [transform:translateZ(0)] ${
+            isDragging ? "shadow-md opacity-80" : "hover:border-primary/40"
+          } ${stateClasses}`}
+        >
+          {/* Card Header: 选择框 + Title + 呼吸指示 + 禁用开关 */}
+          <CardHeader className="p-4 pb-3 sm:p-4 sm:pb-3 border-b border-border/40 bg-muted/20">
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                <label
+                  data-no-rect-select
+                  className="flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+                  title={selected ? "取消选择" : "选择凭据"}
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <Checkbox
+                    className="h-4 w-4 [&_svg]:h-3 [&_svg]:w-3"
+                    checked={selected}
+                    onCheckedChange={handleToggleSelect}
+                    disabled={preview}
+                  />
+                </label>
+                <CardTitle className="min-w-0 flex-1 text-sm font-semibold leading-snug">
+                  <CredentialLabel
+                    id={credential.id}
+                    email={credential.email}
+                    showId={false}
+                    className="flex w-full min-w-0 items-baseline gap-1.5 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate font-mono"
+                  />
+                </CardTitle>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-2">
+                <Switch
+                  checked={!credential.disabled}
+                  onCheckedChange={handleToggleDisabled}
+                  disabled={preview || setDisabled.isPending}
+                  title={credential.disabled ? "点击启用" : "点击禁用"}
+                  className="scale-90"
+                />
               </div>
             </div>
-            <Switch
-              className="mt-0.5"
-              checked={!credential.disabled}
-              onCheckedChange={handleToggleDisabled}
-              disabled={setDisabled.isPending}
-              title={credential.disabled ? "启用" : "禁用"}
-            />
-          </div>
-        </CardHeader>
 
-        <CardContent className="flex flex-1 flex-col space-y-3 px-4 pb-4 sm:space-y-4 sm:px-5 sm:pb-5">
-          {/* 信息行 */}
-          <dl className="grid grid-cols-1 gap-2 text-[13px] min-[420px]:grid-cols-2 min-[420px]:gap-x-4">
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">优先级</dt>
-              <dd className="min-w-0">
+        {hasStatusBadges && (
+          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-1.5">
+            {statusBadges}
+          </div>
+        )}
+      </CardHeader>
+
+          <CardContent className="flex flex-1 flex-col p-4 space-y-3.5">
+            {/* 核心指标 (Metrics Grid) */}
+            <div className="grid grid-cols-3 divide-x divide-border/30 text-center py-1">
+              {/* Priority */}
+              <div className="flex flex-col items-center justify-center px-1">
+                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+                  优先级
+                </span>
                 {editingPriority ? (
-                  <div className="inline-flex max-w-full items-center gap-1">
+                  <div className="mt-1 flex items-center justify-center gap-0.5">
                     <Input
                       type="number"
                       value={priorityValue}
                       onChange={(e) => setPriorityValue(e.target.value)}
-                      className="w-16 h-7 rounded-md text-base sm:text-sm"
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handlePriorityChange();
+                        if (e.key === "Escape") {
+                          setEditingPriority(false);
+                          setPriorityValue(String(credential.priority));
+                        }
+                      }}
+                      className="h-6 w-12 text-center text-xs font-mono p-0"
                       min="0"
+                      autoFocus
                     />
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
+                    <button
+                      type="button"
                       onClick={handlePriorityChange}
-                      disabled={setPriority.isPending}
+                      className="text-xs text-emerald-600 font-bold px-1"
                     >
                       ✓
-                    </Button>
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-7 w-7"
-                      onClick={() => {
-                        setEditingPriority(false);
-                        setPriorityValue(String(credential.priority));
-                      }}
-                    >
-                      ✕
-                    </Button>
+                    </button>
                   </div>
                 ) : (
                   <button
                     type="button"
-                    className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-                    onClick={() => setEditingPriority(true)}
-                    title="点击编辑优先级"
+                    onClick={() => {
+                      if (!preview) setEditingPriority(true);
+                    }}
+                    className={`mt-0.5 inline-flex items-center gap-1 rounded-md px-2 py-0.5 font-mono text-xs font-semibold border transition-colors hover:brightness-105 ${railChipClass(disposition.tone)}`}
+                    title={credential.isCurrent ? "当前调度优先凭据 · 点击编辑优先级" : "点击编辑优先级（数字越小越先被使用）"}
                   >
-                    {credential.priority}
-                    <Pencil className="h-3 w-3 opacity-70" />
+                    {credential.isCurrent && (
+                      <Flag className="h-3 w-3 fill-emerald-500 text-emerald-500 shrink-0" />
+                    )}
+                    #{credential.priority}
+                    <Pencil className="h-2.5 w-2.5 opacity-60" />
                   </button>
                 )}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">失败次数</dt>
-              <dd className="min-w-0">
+              </div>
+
+              {/* Success */}
+              <div className="flex flex-col items-center justify-center px-1">
+                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+                  成功数
+                </span>
                 <button
                   type="button"
-                  onClick={() => setShowFailuresDialog(true)}
-                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent"
-                  title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+                  onClick={preview ? undefined : handleResetSuccess}
+                  disabled={preview}
+                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold text-emerald-600 dark:text-emerald-400 hover:text-emerald-500 transition-colors"
+                  title="点击重置成功次数"
+                >
+                  {credential.successCount}
+                  <RotateCcw className="h-2.5 w-2.5 opacity-50" />
+                </button>
+              </div>
+
+              {/* Failures */}
+              <div className="flex flex-col items-center justify-center px-1">
+                <span className="text-[10px] font-semibold text-muted-foreground/80 uppercase tracking-wider">
+                  失败数
+                </span>
+                <button
+                  type="button"
+                  onClick={preview ? undefined : () => setShowFailuresDialog(true)}
+                  disabled={preview}
+                  className="mt-0.5 inline-flex items-center gap-1 font-mono text-xs font-semibold hover:text-primary transition-colors"
+                  title="查看失败日志"
                 >
                   {failureStats ? (
-                    <span className="tabular-nums">
+                    <span className="text-[11px]">
                       <span className="text-destructive">{failureStats.auth}</span>
-                      <span className="text-muted-foreground/50">/</span>
-                      <span className="text-amber-600 dark:text-amber-400">
-                        {failureStats.throttle}
-                      </span>
-                      <span className="text-muted-foreground/50">/</span>
+                      <span className="text-muted-foreground/40">/</span>
+                      <span className="text-amber-600 dark:text-amber-400">{failureStats.throttle}</span>
+                      <span className="text-muted-foreground/40">/</span>
                       <span className="text-muted-foreground">{failureStats.other}</span>
                     </span>
                   ) : (
@@ -1183,301 +1269,343 @@ export function CredentialCard({
                       {credential.totalFailureCount}
                     </span>
                   )}
-                  <ScrollText className="h-3.5 w-3.5 opacity-70" />
+                  <ScrollText className="h-2.5 w-2.5 opacity-50" />
                 </button>
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">刷新失败</dt>
-              <dd
-                className={`tabular-nums font-medium ${credential.refreshFailureCount > 0 ? "text-destructive" : ""}`}
-              >
-                {credential.refreshFailureCount}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">成功次数</dt>
-              <dd className="min-w-0">
-                <button
-                  type="button"
-                  onClick={handleResetSuccess}
-                  className="inline-flex cursor-pointer items-center gap-1 rounded px-1.5 py-0.5 font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
-                  title="点击重置成功次数"
-                >
-                  {credential.successCount}
-                  <RotateCcw className="h-3 w-3 opacity-70" />
-                </button>
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
-              <dt className="shrink-0 text-muted-foreground">最后调用</dt>
-              <dd className="min-w-0 truncate text-right font-medium">
-                {formatLastUsed(credential.lastUsedAt)}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
-              <dt className="shrink-0 text-muted-foreground">添加时间</dt>
-              <dd
-                className="min-w-0 truncate text-right font-medium tabular-nums"
-                title={formatCreatedAtFull(credential.createdAt)}
-              >
-                {formatCreatedAt(credential.createdAt)}
-              </dd>
-            </div>
-            {credential.maskedApiKey && (
-              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
-                <dt className="shrink-0 text-muted-foreground">API Key</dt>
-                <dd className="min-w-0 truncate text-right font-mono text-xs">
-                  {credential.maskedApiKey}
-                </dd>
               </div>
-            )}
-            {credential.hasProxy && (
-              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
-                <dt className="shrink-0 text-muted-foreground">代理</dt>
-                <dd className="min-w-0 truncate text-right font-mono text-xs">
-                  {maskProxyUrl(credential.proxyUrl ?? "")}
-                </dd>
-              </div>
-            )}
-            {!credential.isUpstream && credential.tokenUsage7d && credential.tokenUsage7d.calls > 0 && (
-              <div className="min-[420px]:col-span-2 border-t border-border/50 pt-2">
-                <div className="mb-1 text-xs text-muted-foreground">用量（近 7 天）</div>
-                <div className="grid grid-cols-3 gap-x-4 gap-y-0.5 text-xs min-[420px]:grid-cols-6">
-                  {/* 积分放第一列：账号余额是多人共用的总数，这一列才是本实例自己消耗的部分 */}
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">积分</span>
-                    <span className="font-medium tabular-nums">{formatCredits(credential.tokenUsage7d.credits)}</span>
-                  </div>
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">调用</span>
-                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.calls)}</span>
-                  </div>
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">输入</span>
-                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.inputTokens)}</span>
-                  </div>
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">输出</span>
-                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.outputTokens)}</span>
-                  </div>
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">缓存写</span>
-                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.cacheCreationTokens)}</span>
-                  </div>
-                  <div className="flex justify-between gap-1">
-                    <span className="text-muted-foreground">缓存读</span>
-                    <span className="font-medium tabular-nums">{fmtNum(credential.tokenUsage7d.cacheReadTokens)}</span>
-                  </div>
-                </div>
-              </div>
-            )}
-          </dl>
+            </div>
 
-          {credential.isUpstream ? (
-            <UpstreamBillingPanel credentialId={credential.id} />
-          ) : (
-          <div
-            className={`flex min-h-[138px] flex-col rounded-xl border p-3 transition-colors sm:min-h-[150px] sm:p-4 ${
-              isQuotaExceeded || disabledByQuota
-                ? "border-amber-500/40 bg-amber-50/60 dark:bg-amber-500/[0.06]"
-                : "border-border/60 bg-secondary/40"
-            }`}
-          >
-            {loadingBalance ? (
-              <div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                正在查询余额…
+            {/* Status & Ledger Section */}
+            <div className="space-y-1 border-t border-border/40 pt-3 px-3 text-[12px]">
+              <CardSectionTitle icon={Activity}>运行与账号信息</CardSectionTitle>
+              {groupingBlock && <div className="py-1">{groupingBlock}</div>}
+              <LedgerRow label="凭据类型">
+                <span className="font-semibold">{authLabel}</span>
+              </LedgerRow>
+              <LedgerRow label="最近调用">
+                <span className="font-mono text-muted-foreground">
+                  {formatLastUsed(credential.lastUsedAt)}
+                </span>
+              </LedgerRow>
+              <LedgerRow label="添加时间">
+                <span
+                  className="font-mono text-muted-foreground/80"
+                  title={formatCreatedAtFull(credential.createdAt)}
+                >
+                  {formatCreatedAt(credential.createdAt)}
+                </span>
+              </LedgerRow>
+              {metadataRows}
+            </div>
+
+            {/* Usage & Quota Card (余额与额度) */}
+            <div
+              className={`rounded-xl border p-3 transition-colors duration-200 space-y-2 ${
+                isQuotaExceeded || disabledByQuota
+                  ? "border-amber-500/50 bg-amber-500/[0.04]"
+                  : "border-border/60 bg-secondary/20"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <CardSectionTitle icon={Wallet}>额度与用量</CardSectionTitle>
+                <div className="flex items-center gap-1.5">
+                  {subscriptionBadge}
+                  {balance && <OverageStatusPill balance={balance} />}
+                </div>
               </div>
-            ) : balance ? (
-              <div className="space-y-3">
-                <div className="flex min-w-0 items-end justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      {balance.remaining < 0 ? "超额" : "余额"}
+
+              {loadingBalance ? (
+                <div className="flex items-center justify-center gap-2 py-3 text-xs text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  正在查询最新余额…
+                </div>
+              ) : balance ? (
+                <div className="space-y-2">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <div>
+                      <div className="text-[10px] font-semibold text-muted-foreground uppercase">
+                        剩余可用
+                      </div>
+                      <div
+                        className={`console-num font-mono text-xl font-semibold tracking-tight ${
+                          balance.remaining < 0
+                            ? "text-red-600 dark:text-red-400"
+                            : balance.remaining === 0
+                              ? "text-amber-600 dark:text-amber-400"
+                              : "text-emerald-600 dark:text-emerald-400"
+                        }`}
+                      >
+                        {balance.remaining < 0
+                          ? `-$${formatNumber(Math.abs(balance.remaining))}`
+                          : `$${formatNumber(balance.remaining)}`}
+                      </div>
                     </div>
-                    <div
-                      className={`mt-0.5 text-xl font-semibold tabular-nums ${
-                        balance.remaining < 0
-                          ? "text-red-600 dark:text-red-400"
-                          : balance.remaining === 0
-                            ? "text-amber-600 dark:text-amber-400"
-                            : "text-emerald-600 dark:text-emerald-400"
-                      }`}
-                    >
-                      {balance.remaining < 0
-                        ? `-$${formatNumber(Math.abs(balance.remaining))}`
-                        : `$${formatNumber(balance.remaining)}`}
+                    <div className="text-right font-mono">
+                      <div className="text-[10px] font-semibold text-muted-foreground uppercase">
+                        已用比例
+                      </div>
+                      <div className="text-sm font-semibold text-foreground">
+                        {balance.usagePercentage.toFixed(1)}%
+                      </div>
                     </div>
                   </div>
-                  <div className="min-w-0 shrink-0 text-right">
-                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
-                      超额
-                    </div>
-                    <div className="mt-1 flex items-center justify-end">
-                      <OverageStatusPill balance={balance} />
-                    </div>
+
+                  <Progress value={balance.usagePercentage} className="h-1.5 bg-muted" />
+
+                  <div className="grid grid-cols-2 gap-1 text-[11px] font-mono text-muted-foreground pt-1 border-t border-border/30">
+                    <div>已用: ${formatNumber(balance.currentUsage)}</div>
+                    <div className="text-right">上限: ${formatNumber(balance.usageLimit)}</div>
                   </div>
+
+                  {balance.nextResetAt && (
+                    <div className="flex items-center justify-between text-[11px] font-mono text-muted-foreground/80 pt-0.5">
+                      <span>下次重置</span>
+                      <span>{formatResetDate(balance.nextResetAt)}</span>
+                    </div>
+                  )}
                 </div>
-                <div className="space-y-1.5">
-                  <Progress value={balance.usagePercentage} />
-                  <div className="grid grid-cols-3 gap-1 text-[11px] tabular-nums text-muted-foreground">
-                    <span className="min-w-0 truncate">
-                      已用 ${formatNumber(balance.currentUsage)}
-                    </span>
-                    <span className="text-center">
-                      {balance.usagePercentage.toFixed(1)}%
-                    </span>
-                    <span className="min-w-0 truncate text-right">
-                      额度 ${formatNumber(balance.usageLimit)}
-                    </span>
-                  </div>
+              ) : (
+                <div className="flex items-center justify-between py-1 text-xs">
+                  <span className="text-muted-foreground">尚未获取余额数据</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2.5 text-xs font-medium"
+                    onClick={handleRefreshBalanceClick}
+                  >
+                    <Wallet className="mr-1.5 h-3.5 w-3.5" />
+                    查询余额
+                  </Button>
                 </div>
-                <div className="break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                  下次重置：
-                  <span className="font-medium text-foreground">
-                    {formatResetDate(balance.nextResetAt)}
-                  </span>
+              )}
+            </div>
+
+            {/* Connection Details 手风琴展开面板 */}
+            <div className="rounded-xl border border-border/40 bg-card/40 overflow-hidden">
+              <button
+                type="button"
+                className="flex w-full items-center justify-between px-3 py-2 text-left hover:bg-accent/40 transition-colors"
+                onClick={() => setConnectionExpanded((expanded) => !expanded)}
+                aria-expanded={connectionExpanded}
+              >
+                <CardSectionTitle icon={Server}>连接与代理详情</CardSectionTitle>
+                <ChevronRight
+                  className={`h-4 w-4 text-muted-foreground transition-transform duration-200 ${
+                    connectionExpanded ? "rotate-90" : ""
+                  }`}
+                />
+              </button>
+              {connectionExpanded && (
+                <div className="px-3 pb-2.5 pt-1 space-y-1 border-t border-border/30 text-[12px]">
+                  {credential.endpoint && (
+                    <LedgerRow label="端点" icon={Server}>
+                      <span>{endpointDisplayLabel(credential.endpoint)}</span>
+                    </LedgerRow>
+                  )}
+                  {credential.hasProfileArn && (
+                    <LedgerRow label="Profile" icon={Layers}>
+                      <span
+                        className="font-mono text-xs"
+                        title={
+                          credential.profileArn
+                            ? `${credential.profileArn}\n上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                            : "已配置"
+                        }
+                      >
+                        {credential.profileArn ? profileShortId(credential.profileArn) : "已配置"}
+                      </span>
+                    </LedgerRow>
+                  )}
+                  {credential.sourceChannel && (
+                    <LedgerRow label="来源" icon={Globe}>
+                      <span>{credential.sourceChannel}</span>
+                    </LedgerRow>
+                  )}
+                  {credential.maskedApiKey && (
+                    <LedgerRow label="API Key" icon={Key}>
+                      <span className="font-mono text-xs text-muted-foreground">{credential.maskedApiKey}</span>
+                    </LedgerRow>
+                  )}
+                  {credential.hasProxy && (
+                    <LedgerRow label="代理地址" icon={Globe} danger={proxyUnhealthy}>
+                      <span
+                        className="font-mono text-xs"
+                        title={maskProxyUrl(credential.proxyUrl ?? "")}
+                      >
+                        {proxyDisplayLabel(credential.proxyUrl ?? "")}
+                      </span>
+                      {proxyEntry && proxyUnhealthy && (
+                        <span className="ml-1.5 text-[11px] font-medium text-destructive">
+                          {proxyEntry.autoDisabled ? '已自动禁用' : `异常 ×${proxyEntry.consecutiveFailures}`}
+                        </span>
+                      )}
+                    </LedgerRow>
+                  )}
                 </div>
+              )}
+            </div>
+
+            {/* 底栏 ToolBar */}
+            {preview ? (
+              <div className="mt-auto flex items-center justify-end gap-2 pt-2.5 border-t border-border/40">
+                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
+                  <RefreshCw className="h-4 w-4" />
+                </Button>
+                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
+                  <Wallet className="h-4 w-4" />
+                </Button>
+                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
+                  <Pencil className="h-4 w-4" />
+                </Button>
+                <Button size="icon" variant="ghost" className="h-8 w-8" disabled title="预览">
+                  <MoreHorizontal className="h-4 w-4" />
+                </Button>
               </div>
             ) : (
-              <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">
-                余额未查询，点击顶部"刷新当前页余额"即可加载。
-              </div>
-            )}
-          </div>
-          )}
-
-          {/* 操作区 */}
-          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
-            <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
-              {/* 上游：字段排序期间隐藏拖拽手柄，避免视觉顺序与服务端优先级混淆 */}
-              {!dragDisabled && (
-                <>
+              <div className="mt-auto flex min-w-0 items-center gap-2 pt-2.5 border-t border-border/40">
+                {!dragDisabled && (
                   <Button
                     ref={setActivatorNodeRef}
                     size="icon"
                     variant="ghost"
                     data-no-rect-select
-                    className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
-                    title="拖拽调整优先级"
+                    className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing hover:bg-accent"
+                    title="拖拽排序"
                     {...attributes}
                     {...listeners}
                   >
-                    <GripVertical className="h-4 w-4 text-muted-foreground" />
+                    <GripVertical className="h-4 w-4 text-muted-foreground/70" />
                   </Button>
-                  <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
-                </>
-              )}
-              {/* 我方：上游 API 凭据没有 Kiro Token，刷新按钮无意义 */}
-              {!credential.isUpstream && <Button
-                size="sm"
-                variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
-                onClick={handleForceRefresh}
-                disabled={
-                  forceRefresh.isPending ||
-                  credential.disabled ||
-                  credential.authMethod === "api_key"
-                }
-                title={
-                  credential.authMethod === "api_key"
-                    ? "API Key 无需刷新"
-                    : credential.disabled
-                      ? "已禁用"
-                      : "强制刷新 Token"
-                }
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
-                />
-                <span className="hidden sm:inline">刷新 Token</span>
-              </Button>}
-              {!credential.isUpstream && <Button
-                size="sm"
-                variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
-                onClick={onRefreshBalance}
-                disabled={loadingBalance || credential.disabled}
-                title={credential.disabled ? "已禁用" : "刷新余额"}
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
-                />
-                <span className="hidden sm:inline">刷新余额</span>
-              </Button>}
-            </div>
-
-            <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:items-center">
-              <Button
-                size="sm"
-                variant="outline"
-                className="w-full min-[420px]:w-auto"
-                onClick={() => setShowEditDialog(true)}
-              >
-                <Pencil className="h-3.5 w-3.5" />
-                编辑
-              </Button>
-              {moreMenu}
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+                )}
+                {dispositionButton}
+                <span className="min-w-0 flex-1" />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  onClick={handleForceRefresh}
+                  disabled={
+                    forceRefresh.isPending ||
+                    credential.disabled ||
+                    credential.authMethod === "api_key"
+                  }
+                  title={
+                    credential.authMethod === "api_key"
+                      ? "API Key 无需刷新"
+                      : credential.disabled
+                        ? "已禁用"
+                        : "强制刷新 Token"
+                  }
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
+                  />
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  onClick={handleRefreshBalanceClick}
+                  disabled={loadingBalance || credential.disabled}
+                  title={credential.disabled ? "已禁用" : "刷新余额"}
+                >
+                  {loadingBalance ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Wallet className="h-4 w-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8 shrink-0 hover:bg-accent"
+                  onClick={() => setShowEditDialog(true)}
+                  title="编辑"
+                >
+                  <Pencil className="h-4 w-4" />
+                </Button>
+                {moreMenu}
+              </div>
+            )}
+          </CardContent>
+        </Card>
       )}
 
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>确认删除凭据</DialogTitle>
-            <DialogDescription>
-              您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setShowDeleteDialog(false)}
-              disabled={deleteCredential.isPending}
-            >
-              取消
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteCredential.isPending}
-            >
-              确认删除
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {/* 弹窗 Dialog 组件按需惰性挂载，避免关闭时无谓实例化 */}
+      {showDeleteDialog && (
+        <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle>确认删除凭据</DialogTitle>
+              <DialogDescription>
+                您确定要删除凭据 #{credential.id} 吗？此操作无法撤销。
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => setShowDeleteDialog(false)}
+                disabled={deleteCredential.isPending}
+              >
+                取消
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={handleDelete}
+                disabled={deleteCredential.isPending}
+              >
+                确认删除
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
 
-      <EditCredentialDialog
-        open={showEditDialog}
-        onOpenChange={setShowEditDialog}
-        credential={credential}
-      />
-      <UpdateTokenDialog
-        open={showUpdateTokenDialog}
-        onOpenChange={setShowUpdateTokenDialog}
-        credential={credential}
-      />
-      <ReloginDialog
-        open={showReloginDialog}
-        onOpenChange={setShowReloginDialog}
-        credential={credential}
-      />
-      <CredentialFailuresDialog
-        open={showFailuresDialog}
-        onOpenChange={setShowFailuresDialog}
-        credentialId={credential.id}
-        email={credential.email}
-      />
-      <AvailableModelsDialog
-        open={showModelsDialog}
-        onOpenChange={setShowModelsDialog}
-        credentialId={credential.id}
-      />
+      {showEditDialog && (
+        <EditCredentialDialog
+          open={showEditDialog}
+          onOpenChange={setShowEditDialog}
+          credential={credential}
+          metadataSchema={metadataSchema}
+        />
+      )}
+      {showUpdateTokenDialog && (
+        <UpdateTokenDialog
+          open={showUpdateTokenDialog}
+          onOpenChange={setShowUpdateTokenDialog}
+          credential={credential}
+        />
+      )}
+      {showReloginDialog && (
+        <ReloginDialog
+          open={showReloginDialog}
+          onOpenChange={setShowReloginDialog}
+          credential={credential}
+        />
+      )}
+      {showFailuresDialog && (
+        <CredentialFailuresDialog
+          open={showFailuresDialog}
+          onOpenChange={setShowFailuresDialog}
+          credentialId={credential.id}
+          email={credential.email}
+        />
+      )}
+      {showModelsDialog && (
+        <AvailableModelsDialog
+          open={showModelsDialog}
+          onOpenChange={setShowModelsDialog}
+          credentialId={credential.id}
+        />
+      )}
+      {showBalanceDialog && (
+        <BalanceDialog
+          open={showBalanceDialog}
+          onOpenChange={setShowBalanceDialog}
+          credentialId={showBalanceDialog ? credential.id : null}
+        />
+      )}
     </>
   );
 }
+
+export const CredentialCard = memo(CredentialCardImpl);

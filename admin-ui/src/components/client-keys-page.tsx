@@ -1,9 +1,8 @@
-import { useState } from 'react'
+import { useState, useMemo } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, Loader2,
 } from 'lucide-react'
-import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
@@ -16,31 +15,54 @@ import {
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
-  useRotateClientKey, useRevealClientKey,
+  useRotateClientKey, useSetClientKeyMaxCredits,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { GroupSingleSelect } from '@/components/group-select'
-import type {
-  CacheEngineKind, ClientKeyItem, ClientKeyPlaintextResponse, CreateClientKeyResponse,
-} from '@/types/api'
-import { extractErrorMessage } from '@/lib/utils'
+import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
+import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
-
-/**
- * 明文展示对话框的状态。
- *
- * `mode` 只影响文案与按钮：`created` / `rotated` 是**刚生成的新值**（后者意味着旧值已失效，
- * 下游必须换上），`revealed` 是**回看已有值**（随时可再看，不必强调"仅此一次"）。
- */
-type PlainKeyDialogState = {
-  mode: 'created' | 'rotated' | 'revealed'
-  data: CreateClientKeyResponse | ClientKeyPlaintextResponse
-}
+import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
+import { BulkBar } from '@/components/console/bulk-bar'
+import { PageHeader } from '@/components/console/page-header'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
   if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
   return n.toString()
+}
+
+/**
+ * 解析积分上限输入框：
+ * - 空字符串 → null（不限制）
+ * - 合法非负数 → number
+ * - 其它 → 'invalid'
+ */
+function parseMaxCreditsInput(raw: string): number | null | 'invalid' {
+  const t = raw.trim()
+  if (t === '') return null
+  const n = Number(t)
+  if (!Number.isFinite(n) || n < 0) return 'invalid'
+  return n
+}
+
+/** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
+function CreditsUsage({ used, max }: { used: number; max?: number }) {
+  if (max == null) {
+    return (
+      <span className="text-[12px] tabular-nums text-muted-foreground">
+        {formatCredits(used)} <span className="text-[11px]">/ 无限制</span>
+      </span>
+    )
+  }
+  const ratio = max > 0 ? used / max : 1
+  const over = used >= max
+  const color = over ? 'text-destructive' : ratio >= 0.8 ? 'text-amber-500' : 'text-foreground'
+  return (
+    <span className={`text-[12px] tabular-nums ${color}`} title={`已用 ${used} / 上限 ${max}`}>
+      {formatCredits(used)} <span className="text-[11px] text-muted-foreground">/ {formatCredits(max)}</span>
+    </span>
+  )
 }
 
 function formatRelative(ts?: string): string {
@@ -54,7 +76,7 @@ function formatRelative(ts?: string): string {
 }
 
 export function ClientKeysPage() {
-  const { data, isLoading } = useClientKeys()
+  const { data, isLoading, isFetching, refetch } = useClientKeys()
   // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
   const groupOptions = useGroupOptions()
   const createKey = useCreateClientKey()
@@ -63,22 +85,23 @@ export function ClientKeysPage() {
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
   const rotateKey = useRotateClientKey()
-  const revealKey = useRevealClientKey()
+  const setMaxCredits = useSetClientKeyMaxCredits()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
-  const [createEngine, setCreateEngine] = useState<CacheEngineKind>('rust')
-  const [plainKey, setPlainKey] = useState<PlainKeyDialogState | null>(null)
-  const [showPlain, setShowPlain] = useState(true)
+  const [createMaxCredits, setCreateMaxCredits] = useState('')
+  const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
+  const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  const [editMaxCredits, setEditMaxCredits] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -87,20 +110,25 @@ export function ClientKeysPage() {
       toast.error('请填写名称')
       return
     }
+    const maxCredits = parseMaxCreditsInput(createMaxCredits)
+    if (maxCredits === 'invalid') {
+      toast.error('积分上限必须是非负数')
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
-        cacheEngine: createEngine,
+        maxCredits: maxCredits ?? undefined,
       })
-      setPlainKey({ mode: 'created', data: res })
+      setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
       setCreateGroup('')
-      setCreateEngine('rust')
-      setShowPlain(true)
+      setCreateMaxCredits('')
+      setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
     }
@@ -157,7 +185,7 @@ export function ClientKeysPage() {
     if (
       !(await confirm({
         title: '重新生成 Key',
-        description: `重新生成 Key "${item.name}"？旧明文立即失效，使用旧明文的下游会马上收到 401，需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
+        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
         confirmText: '重新生成',
         destructive: true,
       }))
@@ -165,8 +193,8 @@ export function ClientKeysPage() {
       return
     try {
       const res = await rotateKey.mutateAsync(item.id)
-      setPlainKey({ mode: 'rotated', data: res })
-      setShowPlain(true)
+      setCreatedKey(res)
+      setShowCreatedPlain(true)
       // 系统密钥轮换后本地存储的 apiKey 已失效，提示用户用新明文重新登录
       if (item.isSystem) {
         toast.info('系统密钥已更新，若你正用该密钥登录管理面板，请用新明文重新登录')
@@ -176,33 +204,33 @@ export function ClientKeysPage() {
     }
   }
 
-  /** 回看旧 Key 明文：不改任何状态，只把明文取回来展示 */
-  const handleReveal = async (item: ClientKeyItem) => {
-    try {
-      const res = await revealKey.mutateAsync(item.id)
-      setPlainKey({ mode: 'revealed', data: res })
-      setShowPlain(true)
-    } catch (err) {
-      toast.error('获取明文失败：' + extractErrorMessage(err))
-    }
-  }
-
   const startEdit = (item: ClientKeyItem) => {
     setEditTarget(item)
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
+    const maxCredits = parseMaxCreditsInput(editMaxCredits)
+    if (maxCredits === 'invalid') {
+      toast.error('积分上限必须是非负数')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
         req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
       })
+      // 仅在上限发生变化时才调用额度接口，避免无谓写入
+      const prev = editTarget.maxCredits ?? null
+      if (maxCredits !== prev) {
+        await setMaxCredits.mutateAsync({ id: editTarget.id, maxCredits })
+      }
       toast.success('已更新')
       setEditOpen(false)
     } catch (err) {
@@ -219,405 +247,526 @@ export function ClientKeysPage() {
     }
   }
 
-  return (
-    <div>
-      <div className="mb-6 flex items-end justify-between gap-4">
-        <div>
-          <h1 className="text-[28px] font-semibold tracking-tight leading-tight">客户端 Key</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。
-          </p>
-        </div>
-        <Button onClick={() => setCreateOpen(true)} size="sm">
-          <Plus className="h-3.5 w-3.5" />新建 Key
-        </Button>
-      </div>
+  const [selectedIds, setSelectedIds] = useState<Set<number | string>>(new Set())
+  const [batchActionPending, setBatchActionPending] = useState(false)
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; action: 'delete' | 'toggle' } | null>(null)
 
-      {isLoading ? (
-        <Card>
-          <CardContent className="py-16 text-center text-sm text-muted-foreground">
-            加载中…
-          </CardContent>
-        </Card>
-      ) : !data || data.keys.length === 0 ? (
-        <Card>
-          <CardContent className="py-16 text-center">
-            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
-              <KeyRound className="h-5 w-5" />
+  const keys: ClientKeyItem[] = useMemo(() => data?.keys ?? [], [data?.keys])
+
+  const handleBatchDelete = async () => {
+    if (selectedIds.size === 0) return
+    const selectedItems = keys.filter((k) => selectedIds.has(k.id))
+    const deletableItems = selectedItems.filter((k) => !k.isSystem)
+    const systemCount = selectedItems.length - deletableItems.length
+
+    if (deletableItems.length === 0) {
+      toast.error('所选项均为系统密钥，不可删除')
+      return
+    }
+
+    const systemHint = systemCount > 0 ? `（已自动跳过 ${systemCount} 个系统密钥）` : ''
+    const ok = await confirm({
+      title: `批量删除 ${deletableItems.length} 把 Key？`,
+      description: `确定要删除选中的 ${deletableItems.length} 把客户端 Key 吗？${systemHint}此操作无法撤销。`,
+      confirmText: '确认删除',
+      destructive: true,
+    })
+    if (!ok) return
+
+    setBatchActionPending(true)
+    setBatchProgress({ current: 0, total: deletableItems.length, action: 'delete' })
+    let s = 0
+    let f = 0
+    try {
+      for (let i = 0; i < deletableItems.length; i++) {
+        const item = deletableItems[i]
+        try {
+          await deleteKey.mutateAsync(item.id)
+          s++
+        } catch {
+          f++
+        }
+        setBatchProgress({ current: i + 1, total: deletableItems.length, action: 'delete' })
+      }
+      if (f === 0) {
+        toast.success(`已批量删除 ${s} 把 Key`)
+      } else {
+        toast.warning(`批量删除完成：成功 ${s} 个，失败 ${f} 个`)
+      }
+      setSelectedIds(new Set())
+    } finally {
+      setBatchActionPending(false)
+      setBatchProgress(null)
+    }
+  }
+
+  const handleBatchSetDisabled = async (disabled: boolean) => {
+    if (selectedIds.size === 0) return
+    const ids = Array.from(selectedIds).map(Number)
+    setBatchActionPending(true)
+    setBatchProgress({ current: 0, total: ids.length, action: 'toggle' })
+    let s = 0
+    let f = 0
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        const id = ids[i]
+        try {
+          await setDisabled.mutateAsync({ id, disabled })
+          s++
+        } catch {
+          f++
+        }
+        setBatchProgress({ current: i + 1, total: ids.length, action: 'toggle' })
+      }
+      toast.success(`已批量${disabled ? '禁用' : '启用'} ${s} 把 Key${f > 0 ? `，失败 ${f} 个` : ''}`)
+      setSelectedIds(new Set())
+    } finally {
+      setBatchActionPending(false)
+      setBatchProgress(null)
+    }
+  }
+
+  const columns: ConsoleColumn<ClientKeyItem>[] = useMemo(
+    () => [
+      {
+        id: 'id',
+        header: 'ID',
+        cell: (k) => (
+          <span className="console-num text-[12px] text-muted-foreground">
+            #{k.id}
+          </span>
+        ),
+      },
+      {
+        id: 'name',
+        header: '名称',
+        cell: (k) => (
+          <div className="min-w-0 max-w-[240px]">
+            <div className="flex items-center gap-1.5">
+              <span className="truncate font-medium text-foreground">{k.name}</span>
+              {k.isSystem && (
+                <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
+                  系统
+                </Badge>
+              )}
             </div>
-            <p className="text-sm text-muted-foreground">还没有客户端 Key，点击右上角"新建 Key"开始</p>
-          </CardContent>
-        </Card>
-      ) : (
-        <Card>
-          <CardContent className="overflow-x-auto p-0">
-            <table className="w-full min-w-[920px] text-sm">
-              <thead className="text-[12px] text-muted-foreground border-b border-border/60">
-                <tr className="whitespace-nowrap">
-                  <th className="text-left font-medium px-4 py-3">ID</th>
-                  <th className="text-left font-medium px-4 py-3">名称</th>
-                  <th className="text-left font-medium px-4 py-3">Key</th>
-                  <th className="text-left font-medium px-4 py-3">分组</th>
-                  <th className="text-left font-medium px-4 py-3">状态</th>
-                  <th className="text-right font-medium px-4 py-3">总调用</th>
-                  <th className="text-right font-medium px-4 py-3">输入</th>
-                  <th className="text-right font-medium px-4 py-3">输出</th>
-                  <th className="text-left font-medium px-4 py-3">最后使用</th>
-                  <th className="sticky right-0 z-20 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3 text-right font-medium">
-                    操作
-                  </th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.keys.map((k) => (
-                  <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
-                    <td className="px-4 py-3 font-mono text-[12px] text-muted-foreground tabular-nums">
-                      #{k.id}
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1.5">
-                        <span className="max-w-[220px] truncate font-medium">{k.name}</span>
-                        {k.isSystem && (
-                          <Badge variant="secondary" title="由 config.json apiKey 同步，不可删除、可轮换">
-                            系统
-                          </Badge>
-                        )}
-                        {/* 标注引擎：rust 默认不标，其余三个标注 */}
-                        {k.cacheEngine === 'go' && (
-                          <Badge
-                            variant="outline"
-                            title="缓存引擎 B：Go（全局共享指纹表）"
-                          >
-                            Go
-                          </Badge>
-                        )}
-                        {k.cacheEngine === 'real' && (
-                          <Badge
-                            variant="outline"
-                            title="缓存引擎 C：Real（真实上游 prompt caching）"
-                          >
-                            Real
-                          </Badge>
-                        )}
-                        {k.cacheEngine === 'nocache' && (
-                          <Badge
-                            variant="outline"
-                            title="缓存引擎 D：NoCache（禁用 prompt caching）"
-                          >
-                            NoCache
-                          </Badge>
-                        )}
-                      </div>
-                      {k.description && (
-                        <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
-                          {k.description}
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      <DropdownMenu>
-                        <DropdownMenuTrigger asChild>
-                          <button
-                            type="button"
-                            className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            title="点击查看明文 / 重新生成"
-                          >
-                            {k.maskedKey}
-                          </button>
-                        </DropdownMenuTrigger>
-                        <DropdownMenuContent align="start">
-                          <DropdownMenuItem
-                            onSelect={() => handleReveal(k)}
-                            disabled={revealKey.isPending}
-                          >
-                            <Eye className="h-3.5 w-3.5" />
-                            查看 Key 明文
-                          </DropdownMenuItem>
-                          <DropdownMenuItem onSelect={() => handleRotate(k)}>
-                            <RefreshCw className="h-3.5 w-3.5" />
-                            重新生成 Key（旧 Key 立即失效）
-                          </DropdownMenuItem>
-                        </DropdownMenuContent>
-                      </DropdownMenu>
-                    </td>
-                    <td className="px-4 py-3">
-                      {k.group ? (
-                        <Badge variant="outline">{k.group}</Badge>
-                      ) : (
-                        <span className="text-[12px] text-muted-foreground">全部账号</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-3">
-                      {k.disabled ? (
-                        <Badge variant="destructive">已禁用</Badge>
-                      ) : (
-                        <Badge variant="success">启用</Badge>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-right tabular-nums">{k.totalCalls}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalInputTokens)}</td>
-                    <td className="px-4 py-3 text-right tabular-nums">{formatTokens(k.totalOutputTokens)}</td>
-                    <td className="px-4 py-3 text-[12px] text-muted-foreground">
-                      {formatRelative(k.lastUsedAt)}
-                    </td>
-                    <td className="sticky right-0 z-10 min-w-[9.75rem] border-l border-border/60 bg-card px-4 py-3">
-                      <div className="flex items-center justify-end gap-1">
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => startEdit(k)}
-                          title="改名"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleToggleDisabled(k)}
-                          title={k.disabled ? '启用' : '禁用'}
-                        >
-                          <Power className={`h-3.5 w-3.5 ${k.disabled ? 'text-emerald-500' : 'text-amber-500'}`} />
-                        </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleReset(k)}
-                          title="重置统计"
-                        >
-                          <RotateCcw className="h-3.5 w-3.5" />
-                        </Button>
-                        {!k.isSystem && (
-                          <Button
-                            size="icon"
-                            variant="ghost"
-                            className="h-7 w-7"
-                            onClick={() => handleDelete(k)}
-                            title="删除"
-                          >
-                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                          </Button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </CardContent>
-        </Card>
+            {k.description && (
+              <div className="truncate text-[11px] text-muted-foreground">
+                {k.description}
+              </div>
+            )}
+          </div>
+        ),
+      },
+      {
+        id: 'key',
+        header: 'Key',
+        cell: (k) => (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                title="点击展开 Key 操作"
+              >
+                {k.maskedKey}
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onSelect={() => handleRotate(k)}>
+                <RefreshCw className="h-3.5 w-3.5" />
+                重新生成 Key（旧 Key 立即失效）
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        ),
+      },
+      {
+        id: 'group',
+        header: '分组',
+        cell: (k) =>
+          k.group ? (
+            <Badge variant="outline">{k.group}</Badge>
+          ) : (
+            <span className="text-[12px] text-muted-foreground">全部账号</span>
+          ),
+      },
+      {
+        id: 'status',
+        header: '状态',
+        cell: (k) =>
+          k.disabled ? (
+            <Badge variant="destructive">已禁用</Badge>
+          ) : (
+            <Badge variant="success">启用</Badge>
+          ),
+      },
+      {
+        id: 'totalCalls',
+        header: '总调用',
+        align: 'right',
+        cell: (k) => <span className="console-num">{k.totalCalls}</span>,
+      },
+      {
+        id: 'inputTokens',
+        header: '输入',
+        align: 'right',
+        cell: (k) => <span className="console-num">{formatTokens(k.totalInputTokens)}</span>,
+      },
+      {
+        id: 'outputTokens',
+        header: '输出',
+        align: 'right',
+        cell: (k) => <span className="console-num">{formatTokens(k.totalOutputTokens)}</span>,
+      },
+      {
+        id: 'credits',
+        header: '积分 / 上限',
+        align: 'right',
+        cell: (k) => <CreditsUsage used={k.totalCredits} max={k.maxCredits} />,
+      },
+      {
+        id: 'lastUsed',
+        header: '最后使用',
+        cell: (k) => (
+          <span className="text-[12px] text-muted-foreground">
+            {formatRelative(k.lastUsedAt)}
+          </span>
+        ),
+      },
+    ],
+    [],
+  )
+
+  const rowActions = (k: ClientKeyItem) => (
+    <div className="flex items-center justify-end gap-1">
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation()
+          startEdit(k)
+        }}
+        title="编辑"
+      >
+        <Pencil className="h-3.5 w-3.5" />
+      </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation()
+          handleToggleDisabled(k)
+        }}
+        title={k.disabled ? '启用' : '禁用'}
+      >
+        <Power className={`h-3.5 w-3.5 ${k.disabled ? 'text-emerald-500' : 'text-amber-500'}`} />
+      </Button>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={(e) => {
+          e.stopPropagation()
+          handleReset(k)
+        }}
+        title="重置统计"
+      >
+        <RotateCcw className="h-3.5 w-3.5" />
+      </Button>
+      {!k.isSystem && (
+        <Button
+          size="icon"
+          variant="ghost"
+          className="text-destructive hover:text-destructive"
+          onClick={(e) => {
+            e.stopPropagation()
+            handleDelete(k)
+          }}
+          title="删除"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
       )}
+    </div>
+  )
+
+  return (
+    <div className="console-scope space-y-4">
+      <PageHeader
+        breadcrumbs={[{ label: '控制台' }, { label: '客户端 Key', active: true }]}
+        icon={<KeyRound className="h-4 w-4" />}
+        title="客户端 Key"
+        description="分发给下游用户/项目的访问密钥。每把 Key 独立计数与禁用，泄露后只需替换一把。"
+        actions={
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => refetch()}
+              disabled={isFetching}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${isFetching ? 'animate-spin' : ''}`} />
+              刷新
+            </Button>
+            <Button onClick={() => setCreateOpen(true)} size="sm">
+              <Plus className="h-3.5 w-3.5" />
+              新建 Key
+            </Button>
+          </>
+        }
+      />
+
+      <ConsoleTable
+        rows={keys}
+        columns={columns}
+        rowKey={(k) => k.id}
+        selectable
+        selected={selectedIds}
+        onSelectedChange={setSelectedIds}
+        rowActions={rowActions}
+        loading={isLoading}
+        empty="还没有客户端 Key，点击右上角「新建 Key」开始。"
+      />
+
+      {/* 吸底批量操作栏 */}
+      <BulkBar
+        count={selectedIds.size}
+        onClear={() => setSelectedIds(new Set())}
+        noun="把 Key"
+      >
+        <Button
+          onClick={() => handleBatchSetDisabled(false)}
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+          disabled={batchActionPending}
+        >
+          <Power className="h-3.5 w-3.5 text-emerald-500" />
+          批量启用
+        </Button>
+        <Button
+          onClick={() => handleBatchSetDisabled(true)}
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+          disabled={batchActionPending}
+        >
+          {batchActionPending && batchProgress?.action === 'toggle' ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-500" />
+              处理中 {batchProgress.current}/{batchProgress.total}
+            </>
+          ) : (
+            <>
+              <Power className="h-3.5 w-3.5 text-amber-500" />
+              批量禁用
+            </>
+          )}
+        </Button>
+        <Button
+          onClick={handleBatchDelete}
+          size="sm"
+          variant="destructive"
+          className="h-7 px-2.5 text-xs gap-1 rounded"
+          disabled={batchActionPending}
+        >
+          {batchActionPending && batchProgress?.action === 'delete' ? (
+            <>
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              删除中 {batchProgress.current}/{batchProgress.total}
+            </>
+          ) : (
+            <>
+              <Trash2 className="h-3.5 w-3.5" />
+              批量删除
+            </>
+          )}
+        </Button>
+      </BulkBar>
 
       {/* 新建对话框 */}
-      <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>新建客户端 Key</DialogTitle>
-            <DialogDescription>
-              创建后会展示明文 Key，请复制保存到安全位置（日后也可从列表回看）。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleCreate} className="space-y-3 py-2">
-            <div>
-              <label className="text-[12px] text-muted-foreground">名称 *</label>
-              <Input
-                placeholder="VS Code 本机 / 团队 A 等"
-                value={createName}
-                onChange={(e) => setCreateName(e.target.value)}
-                disabled={createKey.isPending}
-                autoFocus
-              />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">描述（可选）</label>
-              <Input
-                placeholder="可选备注，如绑定的项目、负责人等"
-                value={createDesc}
-                onChange={(e) => setCreateDesc(e.target.value)}
-                disabled={createKey.isPending}
-              />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
-              <GroupSingleSelect
-                value={createGroup}
-                options={groupOptions}
-                onChange={setCreateGroup}
-                disabled={createKey.isPending}
-                noneLabel="（不绑定，可用全部账号）"
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
-              </p>
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">缓存引擎</label>
-              <div className="mt-1 grid grid-cols-2 gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={createEngine === 'rust' ? 'default' : 'outline'}
-                  onClick={() => setCreateEngine('rust')}
+      {createOpen && (
+        <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>新建客户端 Key</DialogTitle>
+              <DialogDescription>
+                创建后明文 Key 仅显示一次，请立即复制保存到安全位置。
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleCreate} className="space-y-3 py-2">
+              <div>
+                <label className="text-[12px] text-muted-foreground">名称 *</label>
+                <Input
+                  placeholder="VS Code 本机 / 团队 A 等"
+                  value={createName}
+                  onChange={(e) => setCreateName(e.target.value)}
                   disabled={createKey.isPending}
-                >
-                  Rust (A)
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={createEngine === 'go' ? 'default' : 'outline'}
-                  onClick={() => setCreateEngine('go')}
-                  disabled={createKey.isPending}
-                >
-                  Go (B)
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={createEngine === 'real' ? 'default' : 'outline'}
-                  onClick={() => setCreateEngine('real')}
-                  disabled={createKey.isPending}
-                >
-                  Real (C)
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant={createEngine === 'nocache' ? 'default' : 'outline'}
-                  onClick={() => setCreateEngine('nocache')}
-                  disabled={createKey.isPending}
-                >
-                  NoCache (D)
-                </Button>
+                  autoFocus
+                />
               </div>
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                {createEngine === 'rust'
-                  ? 'Rust：按 session / Key 隔离缓存；适合长会话。'
-                  : createEngine === 'go'
-                  ? 'Go：全局共享指纹表，不同 Key 的相同前缀会互相命中。'
-                  : createEngine === 'real'
-                  ? 'Real：直接依赖上游 prompt caching，无本地缓存状态。'
-                  : 'NoCache：禁用 prompt caching，用于对比基线。'}
+              <div>
+                <label className="text-[12px] text-muted-foreground">描述（可选）</label>
+                <Input
+                  placeholder="可选备注，如绑定的项目、负责人等"
+                  value={createDesc}
+                  onChange={(e) => setCreateDesc(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
+                <GroupSingleSelect
+                  value={createGroup}
+                  options={groupOptions}
+                  onChange={setCreateGroup}
+                  disabled={createKey.isPending}
+                  noneLabel="（不绑定，可用全部账号）"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
+                </p>
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">积分上限（可选）</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  inputMode="decimal"
+                  placeholder="留空表示不限制"
+                  value={createMaxCredits}
+                  onChange={(e) => setCreateMaxCredits(e.target.value)}
+                  disabled={createKey.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
+                </p>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
+                  取消
+                </Button>
+                <Button type="submit" disabled={createKey.isPending || !createName.trim()}>
+                  {createKey.isPending ? '创建中…' : '创建'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {/* 创建后明文展示对话框 */}
+      {createdKey && (
+        <Dialog open={!!createdKey} onOpenChange={(o) => { if (!o) setCreatedKey(null) }}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <KeyRound className="h-4 w-4 text-emerald-500" />
+                Key 已生成
+              </DialogTitle>
+              <DialogDescription>
+                这是 Key "{createdKey?.name}" 的明文。<strong>关闭对话框后将无法再查看</strong>，请立即复制。
+              </DialogDescription>
+            </DialogHeader>
+            <div className="space-y-3">
+              <div className="relative">
+                <Input
+                  readOnly
+                  type={showCreatedPlain ? 'text' : 'password'}
+                  value={createdKey?.key ?? ''}
+                  className="pr-20 font-mono text-[13px]"
+                />
+                <div className="absolute inset-y-0 right-0 flex items-center pr-1">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => setShowCreatedPlain((v) => !v)}
+                    title={showCreatedPlain ? '隐藏' : '显示'}
+                  >
+                    {showCreatedPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="h-7 w-7"
+                    onClick={() => createdKey && copyText(createdKey.key)}
+                    title="复制"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
               </p>
             </div>
             <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
-                取消
-              </Button>
-              <Button type="submit" disabled={createKey.isPending || !createName.trim()}>
-                {createKey.isPending ? '创建中…' : '创建'}
-              </Button>
+              <Button onClick={() => setCreatedKey(null)}>我已保存好</Button>
             </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      {/* 明文展示对话框：新建 / 轮换后展示新值，或回看已有值 */}
-      <Dialog open={!!plainKey} onOpenChange={(o) => { if (!o) setPlainKey(null) }}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-emerald-500" />
-              {plainKey?.mode === 'created'
-                ? 'Key 已生成'
-                : plainKey?.mode === 'rotated'
-                ? 'Key 已重新生成'
-                : 'Key 明文'}
-            </DialogTitle>
-            <DialogDescription>
-              这是 Key "{plainKey?.data.name}" 的明文。
-              {plainKey?.mode === 'rotated' ? (
-                <> 旧明文已失效，使用旧明文的下游需要换上这一条才能继续调用。</>
-              ) : plainKey?.mode === 'created' ? (
-                <> 请复制保存；日后也可在列表里点 Key 重新查看。</>
-              ) : (
-                <> 可随时从列表里的 Key 列重新查看。</>
-              )}
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3">
-            <div className="relative">
-              <Input
-                readOnly
-                type={showPlain ? 'text' : 'password'}
-                value={plainKey?.data.key ?? ''}
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="absolute inset-y-0 right-0 flex items-center pr-1">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => setShowPlain((v) => !v)}
-                  title={showPlain ? '隐藏' : '显示'}
-                >
-                  {showPlain ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="h-7 w-7"
-                  onClick={() => plainKey && copyText(plainKey.data.key)}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-            <p className="text-[11px] text-muted-foreground">
-              客户端调用 <code>/v1/messages</code> 时，把它放在 <code>x-api-key</code> 或 <code>Authorization: Bearer</code> 头中。
-            </p>
-          </div>
-          <DialogFooter>
-            <Button onClick={() => setPlainKey(null)}>
-              {plainKey?.mode === 'revealed' ? '关闭' : '我已保存好'}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+          </DialogContent>
+        </Dialog>
+      )}
 
       {/* 编辑对话框 */}
-      <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>编辑 Key</DialogTitle>
-            <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleEditSave} className="space-y-3 py-2">
-            <div>
-              <label className="text-[12px] text-muted-foreground">名称</label>
-              <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">描述</label>
-              <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
-            </div>
-            <div>
-              <label className="text-[12px] text-muted-foreground">绑定分组</label>
-              <GroupSingleSelect
-                value={editGroup}
-                options={groupOptions}
-                onChange={setEditGroup}
-                disabled={updateKey.isPending}
-                noneLabel="（不绑定，可用全部账号）"
-              />
-              <p className="mt-1 text-[11px] text-muted-foreground">
-                绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
-              <Button type="submit" disabled={updateKey.isPending}>
-                {updateKey.isPending ? '保存中…' : '保存'}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {editOpen && (
+        <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
+          <DialogContent className="sm:max-w-md">
+            <DialogHeader>
+              <DialogTitle>编辑 Key</DialogTitle>
+              <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleEditSave} className="space-y-3 py-2">
+              <div>
+                <label className="text-[12px] text-muted-foreground">名称</label>
+                <Input value={editName} onChange={(e) => setEditName(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">描述</label>
+                <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">绑定分组</label>
+                <GroupSingleSelect
+                  value={editGroup}
+                  options={groupOptions}
+                  onChange={setEditGroup}
+                  disabled={updateKey.isPending}
+                  noneLabel="（不绑定，可用全部账号）"
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+                </p>
+              </div>
+              <div>
+                <label className="text-[12px] text-muted-foreground">积分上限</label>
+                <Input
+                  type="number"
+                  min="0"
+                  step="any"
+                  inputMode="decimal"
+                  placeholder="留空表示不限制"
+                  value={editMaxCredits}
+                  onChange={(e) => setEditMaxCredits(e.target.value)}
+                  disabled={updateKey.isPending || setMaxCredits.isPending}
+                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
+                </p>
+              </div>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
+                <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
+                  {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
     </div>
   )
 }

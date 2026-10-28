@@ -15,6 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::admin::trace_db::TraceSink;
+
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, MessagesRequest};
 
@@ -232,23 +234,15 @@ pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResul
 }
 
 /// 生成 WebSearch SSE 响应流
-#[allow(clippy::too_many_arguments)]
 pub fn create_websearch_sse_stream(
     model: String,
     query: String,
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
-    let events = generate_websearch_events(
-        &model,
-        &query,
-        &tool_use_id,
-        search_results,
-        input_tokens,
-        cache_usage,
-    );
+    let events =
+        generate_websearch_events(&model, &query, &tool_use_id, search_results, input_tokens);
 
     stream::iter(
         events
@@ -264,18 +258,12 @@ fn generate_websearch_events(
     tool_use_id: &str,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
 ) -> Vec<SseEvent> {
     let mut events = Vec::new();
     let message_id = format!(
         "msg_{}",
         Uuid::new_v4().to_string().replace('-', "")[..24].to_string()
     );
-
-    // 缓存模拟：与其它路径同口径，用 split_against_total 把估算分摊到
-    // input / cache_creation / cache_read，保证三者之和 == input_tokens。
-    // 此前这三项硬编码 input_tokens/0/0，WebSearch 的模拟缓存全部丢失。
-    let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(input_tokens);
 
     // 1. message_start
     events.push(SseEvent::new(
@@ -290,10 +278,10 @@ fn generate_websearch_events(
                 "content": [],
                 "stop_reason": null,
                 "usage": {
-                    "input_tokens": sim_input,
+                    "input_tokens": input_tokens,
                     "output_tokens": 0,
-                    "cache_creation_input_tokens": sim_cc,
-                    "cache_read_input_tokens": sim_cr
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
                 }
             }
         }),
@@ -360,7 +348,7 @@ fn generate_websearch_events(
     ));
 
     // 5. content_block_start (web_search_tool_result, index 2)
-    // 官方 API 的 web_search_tool_result 没有 tool_use_id 字段
+    // 官方 API 要求 tool_use_id 指向对应的 server_tool_use，AI SDK 等严格客户端缺了会解析失败
     let search_content = websearch_result_content(&search_results);
 
     events.push(SseEvent::new(
@@ -370,6 +358,7 @@ fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": search_content
             }
         }),
@@ -522,6 +511,7 @@ fn build_websearch_content(
         }),
         json!({
             "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
             "content": websearch_result_content(search_results)
         }),
         json!({"type": "text", "text": generate_search_summary(query, search_results)}),
@@ -540,7 +530,6 @@ fn finish_mcp_call(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn render_websearch_response(
     stream_response: bool,
     model: String,
@@ -548,21 +537,15 @@ fn render_websearch_response(
     tool_use_id: String,
     search_results: Option<WebSearchResults>,
     input_tokens: i32,
-    cache_usage: super::cache_metering::CacheUsage,
 ) -> Response {
     if stream_response {
-        let stream = create_websearch_sse_stream(
-            model,
-            query,
-            tool_use_id,
-            search_results,
-            input_tokens,
-            cache_usage,
-        );
+        let stream =
+            create_websearch_sse_stream(model, query, tool_use_id, search_results, input_tokens);
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
             .header(header::CACHE_CONTROL, "no-cache")
+            .header("x-accel-buffering", "no")
             .header(header::CONNECTION, "keep-alive")
             .body(Body::from_stream(stream))
             .unwrap()
@@ -570,203 +553,42 @@ fn render_websearch_response(
         let content = build_websearch_content(&query, &tool_use_id, &search_results);
         let summary = generate_search_summary(&query, &search_results);
         let output_tokens = (summary.len() as i32 + 3) / 4;
-        // 缓存模拟：与流式分支同口径分摊。不复用 websearch_loop::render_json，
-        // 因为它把 cache_* 硬编码为 0 且被 mixed-tools loop 共用，改签名会牵连
-        // 那条路径。本地 WebSearch 不走上游、收不到 meteringEvent，故无 credit_* 字段。
-        let (sim_input, sim_cc, sim_cr) = cache_usage.split_against_total(input_tokens);
-        let body = serde_json::json!({
-            "id": format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-            "type": "message",
-            "role": "assistant",
-            "content": content,
-            "model": model,
-            "stop_reason": "end_turn",
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": sim_input,
-                "output_tokens": output_tokens,
-                "cache_creation_input_tokens": sim_cc,
-                "cache_read_input_tokens": sim_cr
-            }
-        });
-        (StatusCode::OK, Json(body)).into_response()
+        // 本地 WebSearch 不走上游，不会收到 meteringEvent，因此也不带 credit_* 字段。
+        super::websearch_loop::render_json(
+            &model,
+            content,
+            "end_turn",
+            crate::kiro::model::events::TokenUsage {
+                uncached_input_tokens: input_tokens,
+                output_tokens,
+                cache_read_input_tokens: 0,
+                cache_write_input_tokens: 0,
+            },
+            "",
+            None,
+        )
     }
 }
 
-/// 上游 WebSearch 直通产生的用量，供调用方接到 `hook` 上，
-/// 使这条路径的计费口径与普通上游直通一致。
-///
-/// 不含 Response —— 它始终是 [`handle_websearch_request`] 的第一个返回值，
-/// 避免「响应到底该从哪个字段取」的歧义。
-pub enum UpstreamWebSearchUsage {
-    /// 流式：用量要等整条流跑完才知道，故用 `oneshot` 回传。
-    Stream {
-        credential_id: u64,
-        usage_rx: tokio::sync::oneshot::Receiver<super::upstream::UpstreamStreamUsage>,
-    },
-    /// 非流式：用量当场就有（膨胀前的客户端口径 + 上游真实值）。
-    NonStream {
-        credential_id: u64,
-        input_tokens: i32,
-        output_tokens: i32,
-        cache_creation: i32,
-        cache_read: i32,
-        raw_usage: crate::admin::usage_stats::TokenUsageBreakdown,
-    },
-}
-
 /// 处理 WebSearch 请求
-///
-/// 返回 `(Response, Option<UpstreamWebSearchUsage>)`：Response 始终是要下发给客户端的那个。
-/// - `None` 表示走的是 Kiro 的 MCP 搜索路径，调用方按原有方式记账；
-/// - `Some(..)` 表示上游凭据直通，调用方需按其中的用量记账。
 pub async fn handle_websearch_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     payload: &MessagesRequest,
     input_tokens: i32,
     group: Option<&str>,
-    cache_usage: super::cache_metering::CacheUsage,
-    multipliers: super::cache_engine::UsageMultipliers,
-    usage_mode: super::cache_engine::UsageMode,
-) -> (Response, Option<UpstreamWebSearchUsage>) {
-    // 上游凭据直通：Anthropic 原生支持 web_search_20250610 tool，直接透传请求。
-    // 提前 acquire 一次以判断凭据类型（后续 call_api_dual 内部会再 acquire，
-    // 但因为同一 group 且短时间内，走同一凭据的概率极高）。
-    match provider.token_manager().acquire_context(Some(&payload.model), group).await {
-        Ok(ctx) if ctx.credentials.is_upstream_credential() => {
-            tracing::info!(
-                credential_id = ctx.id,
-                "上游凭据的 WebSearch 请求直接透传至上游 Anthropic API"
-            );
-            let anthropic_body = match serde_json::to_string(payload) {
-                Ok(b) => b,
-                Err(e) => {
-                    return (
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(ErrorResponse::new(
-                                "internal_error",
-                                &format!("序列化请求失败: {}", e),
-                            )),
-                        )
-                            .into_response(),
-                        None,
-                    );
-                }
-            };
-            // 透传给上游，由 Anthropic 原生处理 web_search tool
-            // 使用 call_api_dual_for_credential(ctx.id, ...) 而非 call_api_dual，
-            // 避免内部再次 acquire_context：balanced 模式下第二次 acquire 可能路由
-            // 到 Kiro 凭据，导致 Anthropic body 发给 Kiro 端点产生 400 错误。
-            let call_result = match provider
-                .call_api_dual_for_credential(ctx.id, &anthropic_body, &anthropic_body)
-                .await
-            {
-                Ok(result) => result,
-                Err(e) => {
-                    tracing::warn!("上游 WebSearch 请求失败: {}", e);
-                    return (
-                        (
-                            StatusCode::BAD_GATEWAY,
-                            Json(ErrorResponse::new("upstream_error", &e.to_string())),
-                        )
-                            .into_response(),
-                        None,
-                    );
-                }
-            };
-
-            // 必须按 `stream` 分流，且复用普通上游直通那两个函数。
-            //
-            // 此前这里无论流式与否都 `bytes().await` 整体缓冲、再把 content-type 硬写成
-            // `application/json`：而 Claude Code 的 WebSearch 请求带 `stream: true`，
-            // 上游回的是 SSE。客户端按 SSE 解析一个标称 JSON 的响应，什么都取不到 ——
-            // 表面现象就是「WebSearch 不返回结果」。
-            //
-            // 顺带把计费接上：原先这条路径既不应用膨胀倍率、也不回报上游真实 usage。
-            let (input_mul, output_mul, cache_mul, cache_creation_mul) = multipliers.resolve();
-            let simulated_total_input = cache_usage.prompt_total_est.max(1);
-
-            if payload.stream {
-                let (response, usage_rx) =
-                    super::upstream::handle_upstream_stream_response_with_inflation(
-                        call_result.response,
-                        input_mul,
-                        output_mul,
-                        cache_mul,
-                        cache_creation_mul,
-                        simulated_total_input,
-                        cache_usage,
-                        usage_mode,
-                        input_tokens,
-                    );
-                return (
-                    response,
-                    Some(UpstreamWebSearchUsage::Stream {
-                        credential_id: call_result.credential_id,
-                        usage_rx,
-                    }),
-                );
-            }
-
-            let (response, in_tok, out_tok, cc, cr, raw_usage) =
-                super::upstream::handle_upstream_non_stream_response(
-                    call_result.response,
-                    input_mul,
-                    output_mul,
-                    cache_mul,
-                    cache_creation_mul,
-                    simulated_total_input,
-                    cache_usage,
-                    usage_mode,
-                    input_tokens,
-                )
-                .await;
-            return (
-                response,
-                Some(UpstreamWebSearchUsage::NonStream {
-                    credential_id: call_result.credential_id,
-                    input_tokens: in_tok,
-                    output_tokens: out_tok,
-                    cache_creation: cc,
-                    cache_read: cr,
-                    raw_usage,
-                }),
-            );
-        }
-        Ok(_) => {
-            // Kiro 凭据走 MCP 路径（现有逻辑）
-        }
-        Err(e) => {
-            tracing::warn!("WebSearch acquire_context 失败: {}", e);
-            return (
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ErrorResponse::new("no_available_credentials", &e.to_string())),
-                )
-                    .into_response(),
-                None,
-            );
-        }
-    }
-
-    // === 以下为 Kiro 凭据的 MCP WebSearch 路径（保持不变） ===
-
+) -> Response {
     // 1. 提取搜索查询
     let query = match extract_search_query(payload) {
         Some(q) => q,
         None => {
             return (
-                (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse::new(
-                        "invalid_request_error",
-                        "无法从消息中提取搜索查询",
-                    )),
-                )
-                    .into_response(),
-                None,
-            );
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new(
+                    "invalid_request_error",
+                    "无法从消息中提取搜索查询",
+                )),
+            )
+                .into_response();
         }
     };
 
@@ -776,23 +598,20 @@ pub async fn handle_websearch_request(
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
     // 3. 调用 Kiro MCP API
-    let search_results = match finish_mcp_call(call_mcp_api(&provider, &mcp_request, group).await) {
-        Ok(results) => results,
-        Err(response) => return (response, None),
-    };
+    let search_results =
+        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
+            Ok(results) => results,
+            Err(response) => return response,
+        };
 
     // 4. 按请求模式生成响应
-    (
-        render_websearch_response(
-            payload.stream,
-            payload.model.clone(),
-            query,
-            tool_use_id,
-            search_results,
-            input_tokens,
-            cache_usage,
-        ),
-        None,
+    render_websearch_response(
+        payload.stream,
+        payload.model.clone(),
+        query,
+        tool_use_id,
+        search_results,
+        input_tokens,
     )
 }
 
@@ -800,18 +619,34 @@ pub async fn handle_websearch_request(
 pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    sink: Option<&dyn TraceSink>,
     group: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body, group).await?;
+    if let Some(sink) = sink {
+        return provider
+            .call_mcp_with_trace(
+                &request_body,
+                sink,
+                group,
+                parse_mcp_response,
+                is_no_results_mcp_error,
+            )
+            .await;
+    }
 
+    let response = provider.call_mcp(&request_body, group).await?;
     let body = response.text().await?;
+    parse_mcp_response(&body)
+}
+
+fn parse_mcp_response(body: &str) -> anyhow::Result<McpResponse> {
     tracing::debug!("MCP response: {}", body);
 
-    let mcp_response: McpResponse = serde_json::from_str(&body)?;
+    let mcp_response: McpResponse = serde_json::from_str(body)?;
 
     if let Some(ref error) = mcp_response.error {
         anyhow::bail!(
@@ -822,6 +657,12 @@ pub(crate) async fn call_mcp_api(
     }
 
     Ok(mcp_response)
+}
+
+pub(crate) fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
+    error
+        .to_string()
+        .contains("MCP error: -32602 - Tool returned no results")
 }
 
 #[cfg(test)]
@@ -837,48 +678,30 @@ mod tests {
         assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "60");
     }
 
-    /// WebSearch 路径必须下发模拟缓存 token，且三项之和 == input_tokens。
-    ///
-    /// 回归防护：此前 WebSearch 分支在 `cache_engines.begin()` 之前就 return，
-    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0，
-    /// 且请求不进缓存表 —— 会话中间夹一次 WebSearch 会断掉后续的前缀链。
-    #[tokio::test]
-    async fn websearch_non_stream_carries_simulated_cache_tokens() {
-        // 造一个「有缓存命中」的场景：估算总量 100，被覆盖 80，其中 60 是读命中
-        // （余下 20 记为 creation），未覆盖的 20 记为 input。
-        let usage = super::super::cache_metering::CacheUsage {
-            cache_read: 60,
-            cache_covered_est: 80,
-            prompt_total_est: 100,
-        };
+    #[test]
+    fn parse_mcp_response_rejects_json_rpc_errors() {
+        let error = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":{"code":-32603,"message":"search failed"}}"#,
+        )
+        .unwrap_err();
 
-        let response = render_websearch_response(
-            false,
-            "claude-sonnet-4".to_string(),
-            "rust".to_string(),
-            "srvtoolu_test".to_string(),
-            None,
-            100,
-            usage,
-        );
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(error.to_string(), "MCP error: -32603 - search failed");
+    }
 
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        let u = &v["usage"];
+    #[test]
+    fn parse_mcp_response_rejects_malformed_bodies() {
+        assert!(parse_mcp_response("not-json").is_err());
+    }
 
-        let input = u["input_tokens"].as_i64().unwrap();
-        let cc = u["cache_creation_input_tokens"].as_i64().unwrap();
-        let cr = u["cache_read_input_tokens"].as_i64().unwrap();
+    #[test]
+    fn parse_mcp_response_accepts_successful_results() {
+        let response = parse_mcp_response(
+            r#"{"jsonrpc":"2.0","id":"1","error":null,"result":{"content":[],"isError":false}}"#,
+        )
+        .unwrap();
 
-        assert_eq!(cr, 60, "读缓存应下发模拟值而非 0");
-        assert_eq!(
-            input + cc + cr,
-            100,
-            "三项之和必须等于 input_tokens（互斥分摊）"
-        );
+        assert!(response.error.is_none());
+        assert!(response.result.is_some());
     }
 
     #[tokio::test]
@@ -890,7 +713,6 @@ mod tests {
             "srvtoolu_test".to_string(),
             None,
             12,
-            super::super::cache_metering::CacheUsage::default(),
         );
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -936,6 +758,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         assert!(has_web_search_tool(&req));
@@ -976,6 +799,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         // 多个工具时不应该被识别为纯 websearch 请求
@@ -1018,6 +842,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         // A regular client-defined tool can be named web_search, but only
@@ -1047,6 +872,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let query = extract_search_query(&req);
@@ -1072,6 +898,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let query = extract_search_query(&req);
@@ -1165,5 +992,22 @@ mod tests {
         assert!(summary.contains("Test Result"));
         assert!(summary.contains("https://example.com"));
         assert!(summary.contains("This is a test snippet"));
+    }
+
+    #[test]
+    fn web_search_tool_result_references_server_tool_use_id() {
+        let events = generate_websearch_events("claude-sonnet-4.5", "q", "srvtoolu_abc", None, 1);
+        let result_block = events
+            .iter()
+            .find(|e| e.data["content_block"]["type"] == "web_search_tool_result")
+            .expect("web_search_tool_result block");
+        assert_eq!(result_block.data["content_block"]["tool_use_id"], "srvtoolu_abc");
+
+        let content = build_websearch_content("q", "srvtoolu_abc", &None);
+        let block = content
+            .iter()
+            .find(|b| b["type"] == "web_search_tool_result")
+            .expect("web_search_tool_result block");
+        assert_eq!(block["tool_use_id"], "srvtoolu_abc");
     }
 }

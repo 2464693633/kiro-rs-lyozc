@@ -8,9 +8,8 @@
 //! 这样只会说 OpenAI 协议的客户端（如 Codex CLI，`wire_api = "chat"`）也能
 //! 直接走 Kiro 后端，无需额外的翻译代理进程。
 //!
-//! 说明：内部调用始终以非流式方式执行，`stream: true` 的请求在拿到完整结果后
-//! 合成为 OpenAI 的 `chat.completion.chunk` SSE 序列。对 Codex 这类"拿到结果再
-//! 展示"的客户端，语义与逐 token 流式一致；正确性（含工具调用）完全保留。
+//! Streaming requests translate Anthropic events as they arrive, including
+//! tool arguments, final usage, and abnormal termination.
 
 use std::collections::BTreeMap;
 
@@ -18,16 +17,19 @@ use axum::{
     Json,
     body::{Body, to_bytes},
     extract::{Extension, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::handlers::post_messages;
 use super::middleware::{AppState, KeyContext};
-use super::types::{Message, MessagesRequest, OutputConfig, SystemMessage, Tool};
+use super::stream::REFUSAL_STOP_REASON;
+use super::types::{Message, MessagesRequest, Metadata, OutputConfig, SystemMessage, Tool};
 
 /// 读取内部响应体时的上限（64MB，与请求体上限对齐）
 const MAX_INNER_BODY: usize = 64 * 1024 * 1024;
@@ -54,6 +56,35 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+}
+
+/// 从 OpenAI 请求体或会话亲和请求头中提取并规范化 Kiro 会话 UUID。
+pub(super) fn resolve_session_metadata(
+    prompt_cache_key: Option<&str>,
+    headers: &HeaderMap,
+) -> Option<Metadata> {
+    let candidates = [
+        prompt_cache_key,
+        headers
+            .get("x-session-affinity")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("session_id")
+            .and_then(|value| value.to_str().ok()),
+    ];
+
+    candidates.into_iter().flatten().find_map(|candidate| {
+        let raw_uuid = candidate.strip_prefix("session_").unwrap_or(candidate);
+        let uuid = Uuid::parse_str(raw_uuid).ok()?;
+        Some(Metadata {
+            user_id: Some(format!("session_{uuid}")),
+        })
+    })
 }
 
 // ============================ Handler ============================
@@ -62,10 +93,12 @@ pub struct ChatCompletionRequest {
 pub async fn post_chat_completions(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
+    headers: HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let want_stream = req.stream;
     let model = req.model.clone();
+    let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &headers);
 
     tracing::info!(
         model = %model,
@@ -75,27 +108,21 @@ pub async fn post_chat_completions(
     );
 
     // 1. OpenAI -> Anthropic 请求翻译
-    let anthropic_req = match openai_to_anthropic(req) {
+    let anthropic_req = match openai_to_anthropic(req, metadata) {
         Ok(r) => r,
         Err(msg) => {
             return openai_error(StatusCode::BAD_REQUEST, "invalid_request_error", &msg);
         }
     };
 
-    // 2. 复用 Anthropic 全链路（内部强制非流式）
-    //
-    // raw_body 传 None：客户端发的是 OpenAI 格式，不存在可直接转发给上游的
-    // Anthropic 原文，只能用翻译后的结构体重新序列化（= post_messages 的兜底）。
-    let inner = post_messages(
-        State(state),
-        Extension(key_ctx),
-        axum::http::HeaderMap::new(),
-        None,
-        Json(anthropic_req),
-    )
-    .await;
+    // 2. Reuse the Anthropic chain with the client's streaming preference.
+    let inner = post_messages(State(state), Extension(key_ctx), Json(anthropic_req)).await;
 
     let status = inner.status();
+    let retry_after = inner.headers().get(header::RETRY_AFTER).cloned();
+    if status.is_success() && want_stream {
+        return chat_streaming_response(inner.into_body(), model);
+    }
     let body_bytes = match to_bytes(inner.into_body(), MAX_INNER_BODY).await {
         Ok(b) => b,
         Err(e) => {
@@ -109,11 +136,15 @@ pub async fn post_chat_completions(
 
     // 上游非 2xx：原样透传（Anthropic 错误体已是 {"error":{type,message}} 形状）
     if !status.is_success() {
-        return Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(body_bytes))
             .unwrap();
+        if let Some(value) = retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
     }
 
     let anthropic: Value = match serde_json::from_slice(&body_bytes) {
@@ -130,23 +161,16 @@ pub async fn post_chat_completions(
     // 3. Anthropic -> OpenAI 响应翻译
     let parsed = parse_anthropic_message(&anthropic, &model);
 
-    if want_stream {
-        let sse = build_stream_sse(&parsed);
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(sse))
-            .unwrap()
-    } else {
-        let body = build_completion_json(&parsed);
-        (StatusCode::OK, Json(body)).into_response()
-    }
+    let body = build_completion_json(&parsed);
+    (StatusCode::OK, Json(body)).into_response()
 }
 
 // ============================ 请求翻译 ============================
 
-fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, String> {
+fn openai_to_anthropic(
+    req: ChatCompletionRequest,
+    metadata: Option<Metadata>,
+) -> Result<MessagesRequest, String> {
     let max_tokens = req
         .max_tokens
         .or(req.max_completion_tokens)
@@ -247,13 +271,18 @@ fn openai_to_anthropic(req: ChatCompletionRequest) -> Result<MessagesRequest, St
         model: req.model,
         max_tokens,
         messages,
-        stream: false, // 内部始终非流式
-        system: if system.is_empty() { None } else { Some(system) },
+        stream: req.stream,
+        system: if system.is_empty() {
+            None
+        } else {
+            Some(system)
+        },
         tools,
         tool_choice,
         thinking: None,
         output_config,
-        metadata: None,
+        metadata,
+        cache_control: None,
     })
 }
 
@@ -405,8 +434,12 @@ pub(super) struct ParsedResponse {
     pub(super) model: String,
     pub(super) text: String,
     pub(super) tool_calls: Vec<Value>, // OpenAI tool_calls
+    /// Anthropic/Kiro 的原始停止原因。`finish_reason` 是面向 OpenAI
+    /// completion 兼容层的归一化值，不能用于区分输出耗尽和上下文溢出。
+    pub(super) upstream_stop_reason: String,
     pub(super) finish_reason: String,
     pub(super) prompt_tokens: i64,
+    pub(super) cached_tokens: i64,
     pub(super) completion_tokens: i64,
     /// 思考文本（content 里的 thinking 块 + web_search loop 的顶层
     /// `kiro_thinking` 带外字段）。chat/completions 路径不消费，
@@ -501,14 +534,29 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
     let finish_reason = map_finish_reason(stop_reason, !tool_calls.is_empty()).to_string();
 
     let usage = anthropic.get("usage");
-    let prompt_tokens = usage
+    let uncached_input_tokens = usage
         .and_then(|u| u.get("input_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
+    let cache_creation_tokens = usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let cached_tokens = usage
+        .and_then(|u| u.get("cache_read_input_tokens"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(0);
+    let prompt_tokens = uncached_input_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cached_tokens);
     let completion_tokens = usage
         .and_then(|u| u.get("output_tokens"))
         .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(0);
 
     let credit_usage = usage
         .and_then(|u| u.get("credit_usage"))
@@ -526,8 +574,10 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
         model: model.to_string(),
         text,
         tool_calls,
+        upstream_stop_reason: stop_reason.to_string(),
         finish_reason,
         prompt_tokens,
+        cached_tokens,
         completion_tokens,
         thinking,
         web_searches,
@@ -539,6 +589,8 @@ pub(super) fn parse_anthropic_message(anthropic: &Value, model: &str) -> ParsedR
 
 fn map_finish_reason(stop_reason: &str, has_tool_calls: bool) -> &'static str {
     match stop_reason {
+        // 拒答优先于工具调用：被拦截的轮次不应让客户端去执行半截的 tool_calls。
+        REFUSAL_STOP_REASON => "content_filter",
         "tool_use" => "tool_calls",
         "max_tokens" | "model_context_window_exceeded" => "length",
         _ if has_tool_calls => "tool_calls",
@@ -580,7 +632,167 @@ fn build_completion_json(p: &ParsedResponse) -> Value {
     })
 }
 
-/// 把完整结果合成为 OpenAI chat.completion.chunk SSE 序列
+struct ChatStreamContext {
+    id: String,
+    created: i64,
+    model: String,
+    tools: BTreeMap<u64, usize>,
+    usage: serde_json::Map<String, Value>,
+    stop_reason: String,
+    terminal: bool,
+}
+
+impl ChatStreamContext {
+    fn chunk(&self, delta: Value, finish: Option<&str>, usage: Option<Value>) -> Bytes {
+        let mut value = json!({
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created,
+            "model": self.model, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        });
+        if let Some(usage) = usage {
+            value["usage"] = usage;
+        }
+        Bytes::from(format!("data: {value}\n\n"))
+    }
+
+    fn fail(&mut self, error: Value) -> Vec<Bytes> {
+        self.terminal = true;
+        vec![Bytes::from(format!(
+            "data: {}\n\n",
+            json!({"error": error})
+        ))]
+    }
+
+    fn handle(&mut self, event: &str, data: Value) -> Vec<Bytes> {
+        if self.terminal {
+            return Vec::new();
+        }
+        if let Some(usage) = data
+            .get("usage")
+            .or_else(|| data.pointer("/message/usage"))
+            .and_then(Value::as_object)
+        {
+            self.usage.extend(usage.clone());
+        }
+        let index = data.get("index").and_then(Value::as_u64).unwrap_or(0);
+        match event {
+            "ping" => vec![Bytes::from_static(b": ping\n\n")],
+            "message_start" => vec![self.chunk(json!({"role": "assistant"}), None, None)],
+            "content_block_start" => {
+                let block = &data["content_block"];
+                match block["type"].as_str() {
+                    Some("tool_use") => {
+                        let tool_index = self.tools.len();
+                        self.tools.insert(index, tool_index);
+                        let input = block
+                            .get("input")
+                            .filter(|v| v.as_object().is_some_and(|o| !o.is_empty()))
+                            .map(Value::to_string)
+                            .unwrap_or_default();
+                        vec![self.chunk(
+                            json!({"tool_calls": [{
+                                "index": tool_index, "id": block["id"], "type": "function",
+                                "function": {"name": block["name"], "arguments": input}
+                            }]}),
+                            None,
+                            None,
+                        )]
+                    }
+                    Some("text") if block["text"].as_str().is_some_and(|s| !s.is_empty()) => vec![self.chunk(json!({"content": block["text"]}), None, None)],
+                    _ => Vec::new(),
+                }
+            }
+            "content_block_delta" => match data["delta"]["type"].as_str() {
+                Some("text_delta") => vec![self.chunk(json!({"content": data["delta"]["text"]}), None, None)],
+                Some("input_json_delta") => match self.tools.get(&index) {
+                    Some(tool_index) => vec![self.chunk(json!({"tool_calls": [{"index": tool_index, "function": {"arguments": data["delta"]["partial_json"]}}]}), None, None)],
+                    None => self.fail(json!({"type": "api_error", "message": "Upstream tool delta has no matching tool"})),
+                },
+                _ => Vec::new(),
+            },
+            "message_delta" => {
+                if let Some(reason) = data.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.stop_reason = reason.to_owned();
+                }
+                Vec::new()
+            }
+            "message_stop" => {
+                let parsed = parse_anthropic_message(&json!({"usage": self.usage}), &self.model);
+                let finish = map_finish_reason(&self.stop_reason, !self.tools.is_empty());
+                let chunks = vec![
+                    self.chunk(json!({}), Some(finish), Some(build_usage_json(&parsed))),
+                    Bytes::from_static(b"data: [DONE]\n\n"),
+                ];
+                self.terminal = true;
+                chunks
+            }
+            "error" => self.fail(data.get("error").cloned().unwrap_or_else(|| json!({"type":"api_error", "message":"Upstream stream failed"}))),
+            _ => Vec::new(),
+        }
+    }
+}
+
+fn chat_streaming_response(body: Body, model: String) -> Response {
+    let context = ChatStreamContext {
+        id: new_id(),
+        created: now_ts(),
+        model,
+        tools: BTreeMap::new(),
+        usage: serde_json::Map::new(),
+        stop_reason: "end_turn".to_owned(),
+        terminal: false,
+    };
+    let output = stream::unfold(
+        (
+            body.into_data_stream(),
+            Vec::new(),
+            context,
+            std::collections::VecDeque::new(),
+        ),
+        |(mut body, mut buffer, mut context, mut pending)| async move {
+            loop {
+                if let Some(chunk) = pending.pop_front() {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(chunk),
+                        (body, buffer, context, pending),
+                    ));
+                }
+                if context.terminal {
+                    return None;
+                }
+                match body.next().await {
+                    Some(Ok(chunk)) => {
+                        buffer.extend_from_slice(&chunk);
+                        for frame in super::responses::take_sse_frames(&mut buffer) {
+                            if context.terminal {
+                                break;
+                            }
+                            match super::responses::parse_sse_frame(&frame) {
+                                Ok(Some((event, data))) => pending.extend(context.handle(&event, data)),
+                                Ok(None) => {},
+                                Err(_) => pending.extend(context.fail(json!({
+                                    "type": "api_error", "message": "Invalid upstream SSE frame"
+                                }))),
+                            }
+                        }
+                    }
+                    Some(Err(_)) | None => pending.extend(context.fail(json!({
+                        "type": "api_error", "message": "Upstream response stream was interrupted"
+                    }))),
+                }
+            }
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(output))
+        .unwrap()
+}
+
+/// Complete-result SSE fixtures for conversion tests.
+#[cfg(test)]
 fn build_stream_sse(p: &ParsedResponse) -> String {
     let id = new_id();
     let created = now_ts();
@@ -679,13 +891,132 @@ fn openai_error(status: StatusCode, err_type: &str, message: &str) -> Response {
 mod tests {
     use super::*;
 
+    const UUID_A: &str = "550e8400-e29b-41d4-a716-446655440000";
+    const UUID_B: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+    const UUID_C: &str = "123e4567-e89b-12d3-a456-426614174000";
+    const UUID_D: &str = "123e4567-e89b-12d3-a456-426614174001";
+
+    fn metadata_user_id(metadata: Option<Metadata>) -> Option<String> {
+        metadata.and_then(|value| value.user_id)
+    }
+
+    fn chat_request(prompt_cache_key: Option<&str>) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "gpt-5.6-sol",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "low",
+            "max_completion_tokens": 12
+        });
+        if let Some(key) = prompt_cache_key {
+            value["prompt_cache_key"] = json!(key);
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn session_metadata_accepts_and_normalizes_uuid_forms() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(
+                Some("550E8400-E29B-41D4-A716-446655440000"),
+                &headers,
+            ))
+            .as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(
+                Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8"),
+                &headers,
+            ))
+            .as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+    }
+
+    #[test]
+    fn session_metadata_uses_body_then_header_priority_with_invalid_fallback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            format!("session_{UUID_B}").parse().unwrap(),
+        );
+        headers.insert("x-client-request-id", UUID_C.parse().unwrap());
+        headers.insert("session_id", UUID_D.parse().unwrap());
+
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(Some(UUID_A), &headers)).as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(Some("invalid"), &headers)).as_deref(),
+            Some("session_67e55044-10b1-426f-9247-bb680e5fe0c8")
+        );
+
+        headers.insert("x-session-affinity", "invalid".parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174000")
+        );
+
+        headers.insert("x-client-request-id", "invalid".parse().unwrap());
+        assert_eq!(
+            metadata_user_id(resolve_session_metadata(None, &headers)).as_deref(),
+            Some("session_123e4567-e89b-12d3-a456-426614174001")
+        );
+    }
+
+    #[test]
+    fn session_metadata_skips_non_utf8_and_invalid_candidates() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-session-affinity",
+            axum::http::HeaderValue::from_bytes(&[0xff]).unwrap(),
+        );
+        headers.insert("x-client-request-id", "not-a-uuid".parse().unwrap());
+        headers.insert("session_id", "session_not-a-uuid".parse().unwrap());
+
+        assert!(resolve_session_metadata(Some("invalid"), &headers).is_none());
+        assert!(resolve_session_metadata(None, &HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn chat_conversion_forwards_resolved_metadata_without_other_regressions() {
+        let req = chat_request(Some(UUID_A));
+        let metadata = resolve_session_metadata(req.prompt_cache_key.as_deref(), &HeaderMap::new());
+        let anthropic = openai_to_anthropic(req, metadata).unwrap();
+
+        assert_eq!(
+            anthropic
+                .metadata
+                .and_then(|value| value.user_id)
+                .as_deref(),
+            Some("session_550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert_eq!(anthropic.model, "gpt-5.6-sol");
+        assert_eq!(anthropic.max_tokens, 12);
+        assert_eq!(anthropic.messages.len(), 1);
+        assert_eq!(
+            anthropic
+                .output_config
+                .as_ref()
+                .map(|config| config.effort.as_str()),
+            Some("low")
+        );
+
+        let anthropic = openai_to_anthropic(chat_request(None), None).unwrap();
+        assert!(anthropic.metadata.is_none());
+    }
+
     fn base_parsed() -> ParsedResponse {
         ParsedResponse {
             model: "gpt-5.6-sol".to_string(),
             text: "hi".to_string(),
             tool_calls: Vec::new(),
+            upstream_stop_reason: "end_turn".to_string(),
             finish_reason: "stop".to_string(),
             prompt_tokens: 7,
+            cached_tokens: 0,
             completion_tokens: 11,
             thinking: String::new(),
             web_searches: Vec::new(),
@@ -771,6 +1102,54 @@ mod tests {
         assert_eq!(p.credit_usage, Some(0.6));
         assert_eq!(p.credit_unit.as_deref(), Some("credit"));
         assert_eq!(p.credit_unit_plural.as_deref(), Some("credits"));
+    }
+
+    #[test]
+    fn parse_anthropic_message_combines_all_input_categories() {
+        let anthropic = json!({
+            "content": [],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 3,
+                "cache_creation_input_tokens": 4,
+                "cache_read_input_tokens": 7,
+                "output_tokens": 5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        assert_eq!(p.prompt_tokens, 14);
+        assert_eq!(p.cached_tokens, 7);
+        assert_eq!(p.completion_tokens, 5);
+    }
+
+    #[test]
+    fn parse_anthropic_message_preserves_upstream_stop_reason() {
+        for reason in ["max_tokens", "model_context_window_exceeded"] {
+            let anthropic = json!({
+                "content": [{"type": "text", "text": "partial"}],
+                "stop_reason": reason,
+                "usage": {"input_tokens": 3, "output_tokens": 5}
+            });
+            let parsed = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+            assert_eq!(parsed.upstream_stop_reason, reason);
+            assert_eq!(parsed.finish_reason, "length");
+        }
+    }
+
+    #[test]
+    fn parse_anthropic_message_sanitizes_negative_and_missing_usage() {
+        let anthropic = json!({
+            "content": [],
+            "usage": {
+                "input_tokens": -3,
+                "cache_read_input_tokens": -7,
+                "output_tokens": -5
+            }
+        });
+        let p = parse_anthropic_message(&anthropic, "gpt-5.6-sol");
+        assert_eq!(p.prompt_tokens, 0);
+        assert_eq!(p.cached_tokens, 0);
+        assert_eq!(p.completion_tokens, 0);
     }
 
     #[test]

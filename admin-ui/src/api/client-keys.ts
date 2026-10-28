@@ -1,7 +1,6 @@
 import axios from 'axios'
 import { storage } from '@/lib/storage'
 import type {
-  ClientKeyPlaintextResponse,
   ClientKeysResponse,
   CreateClientKeyRequest,
   CreateClientKeyResponse,
@@ -59,13 +58,16 @@ export async function resetClientKeyStats(id: number): Promise<SuccessResponse> 
   return data
 }
 
-export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
-  const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
+/** 设置或清除积分使用上限。maxCredits 传 null 表示取消限制 */
+export async function setClientKeyMaxCredits(
+  id: number,
+  maxCredits: number | null,
+): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/client-keys/${id}/max-credits`, { maxCredits })
   return data
 }
 
-/** 回看既有 Key 的明文（明文不进列表接口，按需单独取） */
-export async function revealClientKey(id: number): Promise<ClientKeyPlaintextResponse> {
-  const { data } = await api.get<ClientKeyPlaintextResponse>(`/client-keys/${id}/reveal`)
+export async function rotateClientKey(id: number): Promise<CreateClientKeyResponse> {
+  const { data } = await api.post<CreateClientKeyResponse>(`/client-keys/${id}/rotate`)
   return data
 }

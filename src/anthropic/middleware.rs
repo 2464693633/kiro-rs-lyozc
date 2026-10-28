@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 
-use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::client_keys::{KeyAuth, SharedClientKeyManager};
 use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
@@ -28,23 +28,9 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
-    /// 该 Key 选择的缓存模拟引擎。老 Key 缺该字段时为 `Rust`（保持原行为）。
-    pub cache_engine: super::cache_engine::CacheEngineKind,
+    /// 客户端 IP（转发头优先，回落到 TCP 对端），仅用于请求日志
+    pub client_ip: Option<String>,
 }
-
-/// 客户端请求体原文（未经「反序列化 → 重新序列化」往返）。
-///
-/// 上游凭据直通路径必须转发这份字节。用 `serde_json::to_string(&payload)` 会把
-/// serde 的默认值实体化进请求体，最典型的是 [`super::types::Thinking`]：
-/// `budget_tokens` 是带 `default = 20000` 的裸 `i32`，客户端发
-/// `{"type":"disabled"}` 时会被补成 `{"type":"disabled","budget_tokens":20000}`，
-/// 而 Anthropic 对 `disabled` 不接受该字段 —— 上游直接 400
-/// `thinking.budget_tokens is not supported when thinking.type is disabled`。
-///
-/// 同类注入还有：`max_tokens` 缺省被补成 32000（客户端本想用上游自己的默认值），
-/// `system` / `tools` / `tool_choice` / `output_config` 被写成显式 `null`。
-#[derive(Clone, Debug)]
-pub struct RawBody(pub bytes::Bytes);
 
 /// 应用共享状态
 #[derive(Clone)]
@@ -64,8 +50,6 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
-    /// 双缓存模拟引擎句柄。由客户端 Key 上的 `cacheEngine` 字段选择走哪一套。
-    pub cache_engines: super::cache_engine::CacheEngines,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -85,7 +69,6 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             cache_meter: None,
-            cache_engines: super::cache_engine::CacheEngines::default(),
             trace_store: None,
         }
     }
@@ -111,34 +94,7 @@ impl AppState {
 
     /// 注入缓存计量器
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
-        // 引擎 A 的句柄同时进 cache_engines，使接缝能路由到它。
-        self.cache_engines.rust = cache.clone();
         self.cache_meter = cache;
-        self
-    }
-
-    /// 注入引擎 B（go 缓存模拟引擎）。
-    pub fn with_go_cache_tracker(
-        mut self,
-        tracker: Option<std::sync::Arc<super::cache_metering_go::GoCacheTracker>>,
-    ) -> Self {
-        self.cache_engines.go = tracker;
-        self
-    }
-
-    /// 注入引擎 C / D 的倍率存储。
-    ///
-    /// **必须由外部传入同一个 `Arc`，不可依赖 `CacheEngines::default()`**：Admin
-    /// 侧热更新是对 `Arc` 内的原子量做 store，只有请求路径与 Admin 路径共享同一份
-    /// 分配，改配置才会立刻生效。若两边各自 `Default::default()`，Admin 改完看着
-    /// 成功、请求路径却永远读到 1.0 —— 静默失效，且没有任何报错提示。
-    ///
-    /// A / B 不需要这个方法，因为它们的句柄本身就是外部构造的 `Arc` tracker。
-    pub fn with_stateless_multipliers(
-        mut self,
-        multipliers: std::sync::Arc<super::cache_engine::StatelessMultipliers>,
-    ) -> Self {
-        self.cache_engines.stateless = multipliers;
         self
     }
 
@@ -167,49 +123,34 @@ pub async fn auth_middleware(
     };
 
     if let Some(mgr) = &state.client_keys {
-        if let Some(id) = mgr.verify_and_touch(&presented) {
-            let group = mgr.group_of(id);
-            let cache_engine = mgr.cache_engine_of(id);
-            request.extensions_mut().insert(KeyContext {
-                key_id: id,
-                group,
-                key_source: TraceKeySource::ClientKey,
-                cache_engine,
-            });
-            return next.run(request).await;
+        match mgr.verify_and_touch_ex(&presented) {
+            KeyAuth::Ok(id) => {
+                let group = mgr.group_of(id);
+                let client_ip = auth::extract_client_ip(&request);
+                request.extensions_mut().insert(KeyContext {
+                    key_id: id,
+                    group,
+                    key_source: TraceKeySource::ClientKey,
+                    client_ip,
+                });
+                return next.run(request).await;
+            }
+            KeyAuth::OverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            KeyAuth::NotFound => {}
         }
     }
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
-}
-
-/// 把请求体原文缓存进扩展，供上游凭据直通路径原样转发。见 [`RawBody`]。
-///
-/// 只挂在 `/v1/messages` 与 `/cc/v1/messages` 上 —— 其余端点不走上游直通，
-/// 没有转发原文的需求，不必为它们多留一份 body 副本。
-///
-/// **必须排在 [`auth_middleware`] 之内层**：未鉴权的请求应在缓冲 body 之前就被
-/// 拒掉，否则任意来源都能让服务为一个 50MB 的匿名请求分配内存。
-///
-/// body 在这里被完整读出，再原样塞回给下游的 `Json` 提取器。故内存里会同时存在
-/// 原文字节与反序列化后的结构体 —— 对 messages 端点可接受（本就要缓冲整个 body
-/// 才能解析 JSON），但这是有意的取舍而非疏漏。
-pub async fn capture_raw_body(request: Request<Body>, next: Next) -> Response {
-    let (parts, body) = request.into_parts();
-    // 上限与 router 的 DefaultBodyLimit 同源，避免两处各写一个数导致行为分叉。
-    let bytes = match axum::body::to_bytes(body, super::router::MAX_BODY_SIZE).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!("读取请求体失败: {}", e);
-            let error = ErrorResponse::new("invalid_request_error", "failed to read request body");
-            return (StatusCode::BAD_REQUEST, Json(error)).into_response();
-        }
-    };
-
-    let mut request = Request::from_parts(parts, Body::from(bytes.clone()));
-    request.extensions_mut().insert(RawBody(bytes));
-    next.run(request).await
 }
 
 /// CORS 中间件层

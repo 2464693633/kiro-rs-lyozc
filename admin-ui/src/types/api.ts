@@ -4,7 +4,63 @@ export interface CredentialsStatusResponse {
   available: number
   /** 优先级模式下的当前优先凭据 ID；均衡模式为 0 */
   currentId: number
+  /** 描述 metadata 字段、值类型和选项的 JSON Schema */
+  metadataSchema: CredentialMetadataSchema
   credentials: CredentialStatusItem[]
+}
+
+export type CredentialType = 'normal' | 'boom'
+export type CredentialSaleStatus = 'not_for_sale' | 'for_sale' | 'sold'
+
+/** 可扩展的凭据元数据；type 和 saleStatus 是固定字段，其余键由后端原样保存。 */
+export interface CredentialMetadata {
+  type: CredentialType
+  saleStatus: CredentialSaleStatus
+  /** 人民币销售价格；未设置时不展示。 */
+  salePrice?: number
+  [key: string]: unknown
+}
+
+/** `/api/admin/credentials` 返回的单个 metadata 字段。 */
+export interface CredentialMetadataDisplay {
+  title: string
+  description?: string
+  value: unknown
+  /** Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"），无命中时为 undefined。 */
+  valueLabel?: string
+}
+
+/** 状态接口中的 metadata：字段 key 映射到其描述与当前值。 */
+export type CredentialStatusMetadata = Record<string, CredentialMetadataDisplay>
+
+export interface CredentialMetadataSchemaOption {
+  const: unknown
+  title: string
+}
+
+export interface CredentialMetadataFieldSchema {
+  title: string
+  description?: string
+  type: 'string' | 'number' | 'integer' | 'boolean'
+  default?: unknown
+  minimum?: number
+  oneOf?: CredentialMetadataSchemaOption[]
+  /** 应用于卡片字段值的安全内联 CSS 声明。 */
+  'x-css'?: string
+}
+
+export interface CredentialMetadataSchema {
+  $schema?: string
+  $id?: string
+  title?: string
+  type: 'object'
+  properties: Record<string, CredentialMetadataFieldSchema>
+  required?: string[]
+  additionalProperties: boolean
+}
+
+export interface CredentialMetadataSchemaConfig {
+  schema: CredentialMetadataSchema
 }
 
 // 单个凭据状态
@@ -21,7 +77,11 @@ export interface CredentialStatusItem {
   authMethod: string | null
   provider?: string | null
   hasProfileArn: boolean
+  /** Profile ARN 原文。上游 prompt cache 按 profile 隔离：同 profile 的账号互相共享缓存 */
+  profileArn?: string | null
   email?: string
+  /** 后端持久化的最近一次订阅等级；封禁时仍可显示。 */
+  subscriptionTitle?: string | null
   refreshTokenHash?: string
   apiKeyHash?: string
   maskedApiKey?: string
@@ -31,35 +91,21 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
-  /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
+  /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 已关联描述与当前值的凭据 metadata。 */
+  metadata: CredentialStatusMetadata
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
   balanceUpdatedAt?: number
-  /** 是否为上游 Anthropic API 凭据 */
-  isUpstream?: boolean
-  /** 上游 API Base URL */
-  upstreamBaseUrl?: string
-  /** 近 7 天 token 用量统计 */
-  tokenUsage7d?: CredentialTokenUsage
   /** 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 undefined */
   createdAt?: string
-}
-
-/** 凭据近 7 天 token 用量统计 */
-export interface CredentialTokenUsage {
-  calls: number
-  inputTokens: number
-  outputTokens: number
-  cacheCreationTokens: number
-  cacheReadTokens: number
-  credits: number
 }
 
 // 余额响应
@@ -134,7 +180,7 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp' | 'upstream'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   clientId?: string
   clientSecret?: string
@@ -157,10 +203,7 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
-  /** 上游 Anthropic API Base URL（upstream 凭据必填） */
-  upstreamBaseUrl?: string
-  /** 上游 Anthropic API Key（upstream 凭据必填） */
-  upstreamApiKey?: string
+  metadata?: CredentialMetadata
 }
 
 // 添加凭据响应
@@ -181,10 +224,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
-  /** 上游 API Base URL（仅上游凭据） */
-  upstreamBaseUrl?: string
-  /** 上游 API Key；空字符串表示清除 */
-  upstreamApiKey?: string
+  /** 整体更新 metadata；调用方应保留不认识的扩展字段 */
+  metadata?: CredentialMetadata
 }
 
 // 更新 refreshToken 请求
@@ -272,10 +313,15 @@ export interface AssignRoundRobinResponse {
 // 全局代理配置
 export interface GlobalProxyResponse {
   proxyUrl: string | null
+  proxyUsername: string | null
+  proxyPasswordSet: boolean
 }
 
 export interface SetGlobalProxyRequest {
   proxyUrl: string | null
+  proxyUsername?: string | null
+  /** Omit to preserve the existing password; send null to clear it. */
+  proxyPassword?: string | null
 }
 
 // 在线更新配置
@@ -395,16 +441,6 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
-/**
- * 该 Key 使用哪套缓存模拟引擎。
- *
- * - `rust`：引擎 A，带会话隔离（按 session / key 隔离前缀，主 Key 无 session 时不模拟）
- * - `go`：引擎 B，移植自 kiro-go，全局共享指纹表（不同 Key 的相同前缀会互相命中）
- *
- * 省略即 `rust`，与后端 `#[serde(default)]` 对齐。
- */
-export type CacheEngineKind = 'rust' | 'go' | 'real' | 'nocache'
-
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -419,12 +455,14 @@ export interface ClientKeyItem {
   totalOutputTokens: number
   totalCacheCreationTokens: number
   totalCacheReadTokens: number
+  /** 累计 credit 使用量 */
+  totalCredits: number
+  /** 积分使用上限（未设置时为 undefined，表示不限制） */
+  maxCredits?: number
   /** 绑定的账号分组（未绑定时为 undefined） */
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
-  /** 该 Key 使用的缓存模拟引擎（老 Key 无此字段时后端按 rust 返回） */
-  cacheEngine?: CacheEngineKind
 }
 
 export interface ClientKeysResponse {
@@ -436,25 +474,12 @@ export interface CreateClientKeyRequest {
   name: string
   description?: string
   group?: string
-  /** 省略即 rust（引擎 A） */
-  cacheEngine?: CacheEngineKind
+  /** 积分使用上限（可选，不传表示不限制） */
+  maxCredits?: number
 }
 
-/** 创建/轮换响应：返回刚生成的新明文 */
+/** 创建响应：明文 Key 仅在此处返回一次 */
 export interface CreateClientKeyResponse {
-  id: number
-  key: string
-  name: string
-  createdAt: string
-}
-
-/**
- * 查看既有 Key 明文的响应（`GET /client-keys/:id/reveal`）。
- *
- * 形状与 `CreateClientKeyResponse` 相同但不复用，与后端
- * `ClientKeyPlaintextResponse` 一一对应：一个是「刚生成的新值」、一个是「回看旧值」。
- */
-export interface ClientKeyPlaintextResponse {
   id: number
   key: string
   name: string
@@ -465,8 +490,6 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
-  /** 省略 = 不改动该 Key 的引擎选择 */
-  cacheEngine?: CacheEngineKind
 }
 
 // ============ 用量统计 ============
@@ -486,8 +509,6 @@ export interface StatsFilter {
   keyId?: number
   /** 按账号分组筛选（仅影响 timeseries / by-credential，by-model 不支持） */
   group?: string
-  /** 按单个上游凭据筛选（仅费用对比接口使用） */
-  credentialId?: number
 }
 
 export interface OverviewStats {
@@ -531,45 +552,16 @@ export interface CredentialDistribution {
   errors: number
 }
 
-export interface ModelPricing {
-  inputPerMillion: number
-  outputPerMillion: number
-  cacheCreationPerMillion: number
-  cacheReadPerMillion: number
-}
-
-export interface BillingConfig {
-  modelPrices: Record<string, ModelPricing>
-  upstreamMultipliers: Record<string, number>
-  rustMultiplier: number
-  goMultiplier: number
-  realMultiplier: number
-  nocacheMultiplier: number
-}
-
-export interface EngineBillingRow {
-  engine: string
-  upstreamCost: number
-  clientCost: number
-  upstreamTokens: number
-  clientTokens: number
+export interface KeyDistribution {
+  keyId: number
+  name: string
   calls: number
-}
-
-export interface BillingUsagePoint {
-  ts: string
-  upstreamCost: number
-  clientCost: number
-  calls: number
-  engines: EngineBillingRow[]
-}
-
-export interface BillingComparisonResponse {
-  points: BillingUsagePoint[]
-  upstreamCost: number
-  clientCost: number
-  calls: number
-  engines: EngineBillingRow[]
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  errors: number
+  credits: number
 }
 
 // ============ 请求链路追踪 ============
@@ -589,13 +581,6 @@ export interface TraceAttempt {
   durationMs: number
 }
 
-export interface TraceBillingUsage {
-  inputTokens: number
-  outputTokens: number
-  cacheCreationTokens: number
-  cacheReadTokens: number
-}
-
 /** 一个外部请求的完整链路 */
 export interface TraceRecord {
   traceId: string
@@ -611,7 +596,6 @@ export interface TraceRecord {
   finalStatus: string
   finalCredentialId: number
   finalEmail?: string | null
-  finalCredentialIsUpstream?: boolean
   errorType: string | null
   errorMessage: string | null
   totalAttempts: number
@@ -632,12 +616,21 @@ export interface TraceRecord {
   credits?: number
   /** 首 Token 延迟（毫秒，仅流式有值） */
   firstTokenMs?: number | null
-  /** 上游 API 原始用量及两套客户端缓存模拟用量 */
-  upstreamUsage?: TraceBillingUsage | null
-  rustUsage?: TraceBillingUsage | null
-  goUsage?: TraceBillingUsage | null
+  /** 发给上游的 conversationId；同一会话多轮共享，可据此串起整个会话 */
+  sessionId?: string | null
+  /** 会话粘性路由结果：hit / miss_first / miss_unavailable / off；老记录为 null */
+  stickyOutcome?: StickyOutcome | null
+  /** 本次请求前该会话绑定的凭据；与 finalCredentialId 不同即为「换号」 */
+  previousCredentialId?: number | null
+  /** token/cache 三项来源：provider（上游真值）/ simulated（本地估算）/ none（无断点） */
+  usageSource?: UsageSource | null
+  /** 客户端 IP（X-Forwarded-For / X-Real-IP 优先，回落到 TCP 对端）；老记录为 null */
+  clientIp?: string | null
   attempts: TraceAttempt[]
 }
+
+export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
+export type UsageSource = 'provider' | 'simulated' | 'none'
 
 /** 链路查询参数 */
 export interface TraceQuery {
@@ -649,17 +642,21 @@ export interface TraceQuery {
   /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
   failedAttemptCredentialId?: number
   model?: string
-  /** 凭据来源 */
-  source?: 'upstream' | 'kiro'
-  /** Unix 秒，包含 */
-  fromTs?: number
-  /** Unix 秒，不包含 */
-  toTs?: number
-  billingStatus?: 'with' | 'unpriced'
-  sort?: 'newest' | 'oldest' | 'tokens' | 'duration' | 'attempts'
   /** 按账号分组名筛选（只返回 final_credential_id 属于该分组的 trace） */
   group?: string
   onlyFailed?: boolean
+  /** 会话 id 精确匹配：把同一会话的全部轮次拉出来 */
+  sessionId?: string
+  /** 仅返回换号请求（previousCredentialId 非空且 != finalCredentialId） */
+  onlySwitched?: boolean
+  /** 客户端 IP 精确匹配 */
+  clientIp?: string
+  /** 时间窗口起点（Unix 秒，含）。与后端 traces.ts_epoch 同单位 */
+  startTime?: number
+  /** 时间窗口终点（Unix 秒，含） */
+  endTime?: number
+  /** 关键字模糊匹配：模型名 / traceId / 错误信息 / sessionId / clientIp */
+  q?: string
   limit?: number
   offset?: number
 }
@@ -670,7 +667,7 @@ export interface TracePage {
   total: number
 }
 
-/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+/** 单凭据失败分类计数（鉴权 / 账号限流 / 其他） */
 export interface FailureStats {
   auth: number
   throttle: number
@@ -679,6 +676,19 @@ export interface FailureStats {
 
 /** credentialId(字符串) → 失败分类计数 */
 export type FailureStatsMap = Record<string, FailureStats>
+
+// ============ 自定义模型 ============
+
+/** 单条自定义模型（与 config.json customModels 数组一一对应） */
+export interface CustomModelItem {
+  id: string
+  backendId: string
+  displayName?: string
+  contextWindow?: number
+  maxTokens?: number
+  supportsReasoning?: boolean
+  ownedBy?: string
+}
 
 // ============ 账号分组（独立实体）============
 

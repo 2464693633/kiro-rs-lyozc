@@ -17,21 +17,23 @@ use std::sync::Arc;
 use super::{
     client_keys::mask_client_key,
     middleware::AdminState,
-    trace_db::{TraceQuery, TraceSort},
+    trace_db::TraceQuery,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
-        BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
-        BillingConfigPayload, ClientKeyItem, ClientKeyPlaintextResponse, ClientKeysResponse,
-        CompleteSocialLoginRequest,
-        CreateClientKeyRequest, CreateClientKeyResponse, CredentialTokenUsage, GlobalProxyResponse,
-        ModelTestRequest, SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetKeyFeedConfigRequest,
-        SetUpstreamFailoverConfigRequest,
-        SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetPriorityRequest, SetSelfHealConfigRequest,
-        SetTokenInflationConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-        StartSocialLoginRequest, SuccessResponse, UpdateAdminKeyRequest, UpdateClientKeyRequest,
-        UpdateCredentialRequest, UpdateRefreshTokenRequest, UpstreamHealthCheckRequest,
+        AddCredentialRequest, AddProxyRequest, ApiDomainConfig, AssignProxyRequest,
+        AssignRoundRobinRequest, BatchAddProxyRequest, BatchImportEvent, BatchImportRequest, BatchImportSummary,
+        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
+        CreateClientKeyResponse, ModelTestRequest,
+        CredentialMetadataSchemaConfig,
+        SetAccountRpmLimitConfigRequest, SetAccountThrottleConfigRequest, SetDisabledRequest,
+        SetGlobalProxyRequest,
+        SetCacheMeteringConfigRequest, SetSessionAffinityConfigRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
+        SetModelApiRetryConfigRequest, SetQuotaResetRecoveryConfigRequest,
+        SetSelfHealConfigRequest,
+        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
+        UpdateRefreshTokenRequest,
+        SetCustomModelsRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -41,36 +43,27 @@ type CredSessionPath = (u64, String);
 
 /// GET /api/admin/credentials
 /// 获取所有凭据状态
-/// GET /api/admin/credentials
-/// 获取所有凭据状态（含近 7 天 token 用量统计）
 pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    let mut response = state.service.get_all_credentials();
-
-    // 查询近 7 天各凭据 token 用量，附加到对应凭据
-    let window = StatsQueryWindow::preset(Range::Last7d, StatsGranularity::Day);
-    let usage_map: HashMap<u64, _> = state
-        .usage_aggregator
-        .query_by_credential(window, None, None)
-        .into_iter()
-        .map(|d| (d.credential_id, d))
-        .collect();
-
-    for cred in &mut response.credentials {
-        if let Some(dist) = usage_map.get(&cred.id) {
-            if dist.calls > 0 {
-                cred.token_usage_7d = Some(CredentialTokenUsage {
-                    calls: dist.calls,
-                    input_tokens: dist.input_tokens,
-                    output_tokens: dist.output_tokens,
-                    cache_creation_tokens: dist.cache_creation_tokens,
-                    cache_read_tokens: dist.cache_read_tokens,
-                    credits: dist.credits,
-                });
-            }
-        }
-    }
-
+    let response = state.service.get_all_credentials();
     Json(response)
+}
+
+/// GET /api/admin/config/credential-metadata-schema
+pub async fn get_credential_metadata_schema(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    Json(state.service.get_credential_metadata_schema())
+}
+
+/// PUT /api/admin/config/credential-metadata-schema
+pub async fn set_credential_metadata_schema(
+    State(state): State<AdminState>,
+    Json(payload): Json<CredentialMetadataSchemaConfig>,
+) -> impl IntoResponse {
+    match state.service.set_credential_metadata_schema(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// GET /api/admin/credentials/export
@@ -151,13 +144,13 @@ pub async fn reset_failure_count(
 }
 
 /// POST /api/admin/credentials/:id/clear-throttle
-/// 手动解除凭据的账号级风控冷却
+/// 手动解除凭据的账号级限流冷却
 pub async fn clear_throttle(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 限流冷却已解除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -205,32 +198,6 @@ pub async fn test_model(
         Ok(response) => Json(response).into_response(),
         Err(error) => error.into_http_response(),
     }
-}
-
-/// POST /api/admin/credentials/:id/health
-/// 独立检查单个上游 Anthropic 凭据，不改变凭据池故障计数。
-pub async fn check_upstream_health(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-) -> impl IntoResponse {
-    match state.service.check_upstream_health(id).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => error.into_http_response(),
-    }
-}
-
-/// POST /api/admin/credentials/upstream-health
-/// 并发检查多个上游 Anthropic 凭据；请求体可传 credentialIds，省略则检查全部。
-pub async fn check_upstream_health_batch(
-    State(state): State<AdminState>,
-    Json(request): Json<UpstreamHealthCheckRequest>,
-) -> impl IntoResponse {
-    Json(
-        state
-            .service
-            .check_upstream_health_batch(request.credential_ids)
-            .await,
-    )
 }
 
 /// POST /api/admin/credentials/disable-quota-exceeded
@@ -377,6 +344,7 @@ pub async fn batch_import_credentials(
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
         .header(header::CONNECTION, "keep-alive")
         .body(Body::from_stream(body))
         .unwrap()
@@ -602,14 +570,32 @@ pub async fn set_load_balancing_mode(
     }
 }
 
+/// GET /api/admin/config/api-domain
+/// 获取对话 / MCP 上游域名
+pub async fn get_api_domain(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_api_domain())
+}
+
+/// PUT /api/admin/config/api-domain
+/// 设置对话 / MCP 上游域名
+pub async fn set_api_domain(
+    State(state): State<AdminState>,
+    Json(payload): Json<ApiDomainConfig>,
+) -> impl IntoResponse {
+    match state.service.set_api_domain(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/account-throttle
-/// 获取账号级风控故障转移配置
+/// 获取账号级 429 限流故障转移配置
 pub async fn get_account_throttle_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_account_throttle_config())
 }
 
 /// PUT /api/admin/config/account-throttle
-/// 更新账号级风控故障转移配置
+/// 更新账号级 429 限流故障转移配置
 pub async fn set_account_throttle_config(
     State(state): State<AdminState>,
     Json(payload): Json<SetAccountThrottleConfigRequest>,
@@ -620,41 +606,19 @@ pub async fn set_account_throttle_config(
     }
 }
 
-/// GET /api/admin/config/upstream-failover
-/// 获取上游直通凭据的故障转移检测配置
-pub async fn get_upstream_failover_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_upstream_failover_config())
+/// GET /api/admin/config/model-api-retry
+/// 获取普通模型 API 429 自动重试配置
+pub async fn get_model_api_retry_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_model_api_retry_config())
 }
 
-/// PUT /api/admin/config/upstream-failover
-/// 更新上游直通凭据的故障转移检测配置（热生效 + 持久化）
-pub async fn set_upstream_failover_config(
+/// PUT /api/admin/config/model-api-retry
+/// 更新普通模型 API 429 自动重试配置
+pub async fn set_model_api_retry_config(
     State(state): State<AdminState>,
-    Json(payload): Json<SetUpstreamFailoverConfigRequest>,
+    Json(payload): Json<SetModelApiRetryConfigRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_upstream_failover_config(payload) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// GET /api/admin/config/token-inflation
-/// 获取 Token 膨胀倍率配置
-pub async fn get_token_inflation_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_token_inflation_config())
-}
-
-/// GET /api/admin/config/billing
-pub async fn get_billing_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_billing_config())
-}
-
-/// PUT /api/admin/config/billing
-pub async fn set_billing_config(
-    State(state): State<AdminState>,
-    Json(payload): Json<BillingConfigPayload>,
-) -> impl IntoResponse {
-    match state.service.set_billing_config(payload) {
+    match state.service.set_model_api_retry_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -678,204 +642,19 @@ pub async fn set_account_rpm_limit_config(
     }
 }
 
-/// GET /api/admin/config/cache-engines
-///
-/// 返回磁盘配置经 `sanitized()` 后的值，即**运行时真正生效的参数**。直接回显原始
-/// 文件内容会在配置非法时误导运维（文件写 0，运行时其实用的是默认值）。
-pub async fn get_cache_engines_config(State(state): State<AdminState>) -> impl IntoResponse {
-    // 配置接口保存后 tracker 会热更新，但 TokenManager 内的 Config 是启动快照；
-    // 优先从磁盘读取，避免重新打开弹窗时回显旧倍率并覆盖刚保存的值。
-    let loaded = state
-        .service
-        .token_manager()
-        .config()
-        .config_path()
-        .and_then(|path| crate::model::config::Config::load(path).ok());
-    let config = loaded
-        .as_ref()
-        .unwrap_or_else(|| state.service.token_manager().config());
-    Json(super::types::CacheEnginesConfigPayload {
-        rust: config.cache_engine_rust.sanitized(),
-        go: config.cache_engine_go.sanitized(),
-        real: Some(config.cache_engine_real.sanitized()),
-        nocache: Some(config.cache_engine_nocache.sanitized()),
-        // 引擎 A 的倍率来自全局配置，与 B / C / D 各自那套并列展示在同一个弹窗里。
-        // 这里读的是磁盘快照（与上面四套同源），而非 TokenManager 的原子量 ——
-        // 两者在正常路径下一致，但磁盘值才是"重启后仍生效"的那份。
-        global: Some(super::types::GlobalInflationPayload {
-            input_multiplier: config.input_inflation_multiplier,
-            output_multiplier: config.output_inflation_multiplier,
-            cache_multiplier: config.cache_inflation_multiplier,
-        }),
-    })
+/// GET /api/admin/config/quota-reset-recovery
+pub async fn get_quota_reset_recovery_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_quota_reset_recovery_config())
 }
 
-/// PUT /api/admin/config/cache-engines
-///
-/// 落盘后立即对两个 tracker 调 `apply_config`（内部是原子量），**无需重启生效**。
-pub async fn set_cache_engines_config(
+/// PUT /api/admin/config/quota-reset-recovery
+pub async fn set_quota_reset_recovery_config(
     State(state): State<AdminState>,
-    Json(payload): Json<super::types::CacheEnginesConfigPayload>,
+    Json(payload): Json<SetQuotaResetRecoveryConfigRequest>,
 ) -> impl IntoResponse {
-    use axum::http::StatusCode;
-
-    let rust_cfg = payload.rust.sanitized();
-    let go_cfg = payload.go.sanitized();
-    // C / D 缺省时沿用磁盘现值，不回落默认 —— 老前端不带这两段时不该清掉已配倍率。
-    let disk = state
-        .service
-        .token_manager()
-        .config()
-        .config_path()
-        .and_then(|path| crate::model::config::Config::load(path).ok());
-    // 缺省回落顺序：磁盘现值 → 运行时现值 → 默认。
-    //
-    // 不能直接 `unwrap_or_default()`：磁盘读失败（文件被占用 / 路径未知）时那会把
-    // C 的倍率静默重置成 1.0，且紧接着的 apply_real_config 会把这个"重置"真正生效。
-    // 运行时值取自与请求路径共享的那个 Arc，即当前真正在用的倍率，比默认值更接近真相。
-    let real_cfg = payload
-        .real
-        .or_else(|| disk.as_ref().map(|c| c.cache_engine_real))
-        .or_else(|| {
-            state.stateless_multipliers.as_ref().map(|s| {
-                let (input, output, cache_read, cache_creation) = s.real();
-                crate::model::config::CacheEngineRealConfig {
-                    input_multiplier: input,
-                    output_multiplier: output,
-                    cache_read_multiplier: cache_read,
-                    cache_creation_multiplier: cache_creation,
-                }
-            })
-        })
-        .unwrap_or_default()
-        .sanitized();
-    let nocache_cfg = payload
-        .nocache
-        .or_else(|| disk.as_ref().map(|c| c.cache_engine_nocache))
-        .or_else(|| {
-            state.stateless_multipliers.as_ref().map(|s| {
-                let (input, output) = s.nocache();
-                crate::model::config::CacheEngineNoCacheConfig {
-                    input_multiplier: input,
-                    output_multiplier: output,
-                }
-            })
-        })
-        .unwrap_or_default()
-        .sanitized();
-
-    // 全局倍率先校验再落盘：`set_token_inflation_config` 限定 [1.0, 100.0]，
-    // 若等到四段引擎配置已写入磁盘后才失败，就会留下"引擎参数已改、倍率未改"的
-    // 半应用状态 —— 而前端拿到的是 500，运维无从知道哪一半生效了。
-    if let Some(g) = payload.global {
-        for (name, val) in [
-            ("input", g.input_multiplier),
-            ("output", g.output_multiplier),
-            ("cache", g.cache_multiplier),
-        ] {
-            if !val.is_finite() || val < 1.0 || val > 100.0 {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(super::types::AdminErrorResponse::invalid_request(format!(
-                        "{name} 膨胀倍率必须在 1.0..=100.0 范围内: {val}"
-                    ))),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    if let Err(e) = state
-        .service
-        .token_manager()
-        .persist_cache_engines_config(rust_cfg, go_cfg, real_cfg, nocache_cfg)
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(super::types::AdminErrorResponse::internal_error(format!(
-                "写入配置失败: {e}"
-            ))),
-        )
-            .into_response();
-    }
-
-    // 全局倍率：引擎 A 用它，故同一个弹窗要能改。走 TokenManager 既有入口
-    // （它自己校验 + 落盘 + 原子量生效 + 失败回滚），不在这里另写一套。
-    //
-    // 它内部会重新 load 配置文件，读到的正是上面刚写好的四段引擎参数，故两次写
-    // 不会互相覆盖。范围校验已在函数开头做过，此处失败只可能是磁盘问题。
-    if let Some(g) = payload.global {
-        if let Err(e) = state.service.token_manager().set_token_inflation_config(
-            g.input_multiplier,
-            g.output_multiplier,
-            g.cache_multiplier,
-        ) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(super::types::AdminErrorResponse::internal_error(format!(
-                    "四段引擎参数已写入，但全局倍率写入失败: {e}"
-                ))),
-            )
-                .into_response();
-        }
-    }
-
-    // 热更新：四套引擎全部无需重启。C / D 是对共享 Arc 里的原子量做 store ——
-    // 该 Arc 与请求路径同一份分配（见 AdminState::with_cache_engines 文档），
-    // 否则这里改完、请求路径永远读默认值。
-    if let Some(meter) = &state.cache_meter {
-        meter.apply_config(rust_cfg);
-    }
-    if let Some(tracker) = &state.go_cache_tracker {
-        tracker.apply_config(go_cfg);
-    }
-    if let Some(stateless) = &state.stateless_multipliers {
-        stateless.apply_real_config(real_cfg);
-        stateless.apply_nocache_config(nocache_cfg);
-    }
-
-    // 回显生效值（已 sanitize），使前端能显示"哪些非法值被夹取了"。
-    Json(super::types::CacheEnginesConfigPayload {
-        rust: rust_cfg,
-        go: go_cfg,
-        real: Some(real_cfg),
-        nocache: Some(nocache_cfg),
-        global: Some(super::types::GlobalInflationPayload {
-            input_multiplier: state.service.token_manager().get_input_inflation_multiplier(),
-            output_multiplier: state.service.token_manager().get_output_inflation_multiplier(),
-            cache_multiplier: state.service.token_manager().get_cache_inflation_multiplier(),
-        }),
-    })
-    .into_response()
-}
-
-/// GET /api/admin/cache-engines/stats
-///
-/// 引擎未启用时返回全零而非报错 —— 该端点用于仪表盘轮询，不该因此变红。
-pub async fn get_cache_engines_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(super::types::CacheEnginesStatsResponse {
-        rust: state
-            .cache_meter
-            .as_ref()
-            .map(|m| m.stats())
-            .unwrap_or_default(),
-        go: state
-            .go_cache_tracker
-            .as_ref()
-            .map(|t| t.stats())
-            .unwrap_or_default(),
-    })
-}
-
-/// PUT /api/admin/config/token-inflation
-/// 设置 Token 膨胀倍率配置
-pub async fn set_token_inflation_config(
-    State(state): State<AdminState>,
-    Json(payload): Json<SetTokenInflationConfigRequest>,
-) -> impl IntoResponse {
-    match state.service.set_token_inflation_config(payload) {
+    match state.service.set_quota_reset_recovery_config(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
     }
 }
 
@@ -910,6 +689,42 @@ pub async fn set_log_governance_config(
     Json(payload): Json<SetLogGovernanceConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/cache-metering
+/// 获取 prompt cache 本地计量模拟开关
+pub async fn get_cache_metering_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_cache_metering_config())
+}
+
+/// PUT /api/admin/config/cache-metering
+/// 切换 prompt cache 本地计量模拟开关（运行时生效 + 持久化 config.json）
+pub async fn set_cache_metering_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetCacheMeteringConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_cache_metering_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/session-affinity
+/// 获取会话粘性路由配置与命中统计
+pub async fn get_session_affinity_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_session_affinity_config())
+}
+
+/// PUT /api/admin/config/session-affinity
+/// 更新会话粘性路由开关 / TTL（运行时生效 + 持久化 config.json）
+pub async fn set_session_affinity_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSessionAffinityConfigRequest>,
+) -> impl IntoResponse {
+    match state.service.set_session_affinity_config(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -991,9 +806,7 @@ pub async fn complete_social_login(
 /// GET /api/admin/config/global-proxy
 /// 获取当前全局代理配置
 pub async fn get_global_proxy(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(GlobalProxyResponse {
-        proxy_url: state.service.get_global_proxy(),
-    })
+    Json(state.service.get_global_proxy())
 }
 
 /// PUT /api/admin/config/global-proxy
@@ -1002,36 +815,31 @@ pub async fn set_global_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<SetGlobalProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_global_proxy(payload.proxy_url) {
+    match state
+        .service
+        .set_global_proxy(payload.proxy_url, payload.proxy_username, payload.proxy_password)
+    {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
 
-/// GET /api/admin/config/key-feed
-/// 获取 API Key 订阅源配置（token 只回布尔，不回明文）
-pub async fn get_key_feed_config(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.get_key_feed_config())
+/// GET /api/admin/config/custom-models
+/// 获取所有自定义模型配置
+pub async fn get_custom_models(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_custom_models())
 }
 
-/// PUT /api/admin/config/key-feed
-/// 更新 API Key 订阅源配置（热生效 + 落盘）
-pub async fn set_key_feed_config(
+/// PUT /api/admin/config/custom-models
+/// 批量替换自定义模型配置（运行时热更新 + 持久化 config.json）
+pub async fn set_custom_models(
     State(state): State<AdminState>,
-    Json(payload): Json<SetKeyFeedConfigRequest>,
+    Json(payload): Json<SetCustomModelsRequest>,
 ) -> impl IntoResponse {
-    match state.service.set_key_feed_config(payload) {
+    match state.service.set_custom_models(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
-}
-
-/// POST /api/admin/key-feed/pull
-///
-/// 立即拉取一次订阅源并导入其中的新 key。与后台调度共用同一把互斥锁，
-/// 不会与正在进行的自动轮询并发。
-pub async fn pull_key_feed(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.pull_key_feed().await)
 }
 
 /// GET /api/admin/config/update
@@ -1218,9 +1026,10 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_output_tokens: k.total_output_tokens,
         total_cache_creation_tokens: k.total_cache_creation_tokens,
         total_cache_read_tokens: k.total_cache_read_tokens,
+        total_credits: k.total_credits,
+        max_credits: k.max_credits,
         group: k.group.clone(),
         is_system: k.is_system,
-        cache_engine: k.cache_engine,
     }
 }
 
@@ -1250,6 +1059,18 @@ pub async fn create_client_key(
         )
             .into_response();
     }
+    // 校验积分上限（若提供）：必须是非负有限值
+    if let Some(v) = payload.max_credits {
+        if !v.is_finite() || v < 0.0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "maxCredits 必须是非负数",
+                )),
+            )
+                .into_response();
+        }
+    }
     let entry = state.client_keys.create(
         name.to_string(),
         payload
@@ -1260,8 +1081,11 @@ pub async fn create_client_key(
             .group
             .map(|g| g.trim().to_string())
             .filter(|g| !g.is_empty()),
-        payload.cache_engine,
     );
+    // 创建后若指定了上限则应用
+    if let Some(v) = payload.max_credits {
+        state.client_keys.set_max_credits(entry.id, Some(v));
+    }
     Json(CreateClientKeyResponse {
         id: entry.id,
         key: entry.key,
@@ -1269,6 +1093,43 @@ pub async fn create_client_key(
         created_at: entry.created_at,
     })
     .into_response()
+}
+
+/// POST /api/admin/client-keys/:id/max-credits
+/// 设置或清除单个 Key 的积分使用上限。body: { "maxCredits": <number|null> }
+pub async fn set_client_key_max_credits(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetClientKeyMaxCreditsRequest>,
+) -> impl IntoResponse {
+    use axum::http::StatusCode;
+    if let Some(v) = payload.max_credits {
+        if !v.is_finite() || v < 0.0 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "maxCredits 必须是非负数",
+                )),
+            )
+                .into_response();
+        }
+    }
+    if state.client_keys.set_max_credits(id, payload.max_credits) {
+        let msg = match payload.max_credits {
+            Some(v) => format!("Key #{} 积分上限已设为 {:.2}", id, v),
+            None => format!("Key #{} 已取消积分上限", id),
+        };
+        Json(SuccessResponse::new(msg)).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(super::types::AdminErrorResponse::not_found(format!(
+                "Key #{} 不存在",
+                id
+            ))),
+        )
+            .into_response()
+    }
 }
 
 /// DELETE /api/admin/client-keys/:id
@@ -1320,7 +1181,7 @@ pub async fn update_client_key(
     });
     if state
         .client_keys
-        .update_meta(id, payload.name, description, group, payload.cache_engine)
+        .update_meta(id, payload.name, description, group)
     {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
@@ -1357,41 +1218,6 @@ pub async fn set_client_key_disabled(
     }
 }
 
-/// GET /api/admin/client-keys/:id/reveal
-///
-/// 回看既有 Key 的明文。列表接口只给脱敏值，明文走这个单独端点按需取，
-/// 这样每 30s 的列表轮询不会把所有明文反复送上网络。
-///
-/// 明文本就以原值存在 `client_api_keys.json`（鉴权需要按原值比较，不做 hash），
-/// 所以这里不是"降低了安全等级"，只是把已有的信息交给已通过管理端鉴权的调用方。
-pub async fn reveal_client_key(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-) -> impl IntoResponse {
-    use axum::http::StatusCode;
-    match state.client_keys.get(id) {
-        Some(entry) => {
-            // 留一条审计痕迹：明文外泄排查时能知道何时被读过（只记 id/名称，不记明文）
-            tracing::info!(key_id = id, name = %entry.name, "管理端查看客户端 Key 明文");
-            Json(ClientKeyPlaintextResponse {
-                id: entry.id,
-                key: entry.key,
-                name: entry.name,
-                created_at: entry.created_at,
-            })
-            .into_response()
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(super::types::AdminErrorResponse::not_found(format!(
-                "Key #{} 不存在",
-                id
-            ))),
-        )
-            .into_response(),
-    }
-}
-
 /// POST /api/admin/client-keys/:id/reset-stats
 pub async fn reset_client_key_stats(
     State(state): State<AdminState>,
@@ -1414,7 +1240,7 @@ pub async fn reset_client_key_stats(
 
 /// POST /api/admin/client-keys/:id/rotate
 ///
-/// 轮换 Key 值：生成新明文返回，**旧明文立即失效**（曾有 7 天宽限期，已移除）。
+/// 轮换 Key 值：旧明文立即失效，生成新明文返回（仅此一次可见）。
 /// 保留 id/name/description/group/统计/disabled 不变，无需重新分组绑定。
 pub async fn rotate_client_key(
     State(state): State<AdminState>,
@@ -1655,110 +1481,74 @@ pub async fn stats_by_credential(
     Json(enriched).into_response()
 }
 
-fn billing_cred_ids(
-    state: &AdminState,
-    params: &HashMap<String, String>,
-) -> Result<Option<std::collections::HashSet<u64>>, String> {
-    let mut ids = group_to_cred_ids(state, parse_group_filter(params).as_deref());
-    let Some(raw_id) = params.get("credentialId") else {
-        return Ok(ids);
-    };
-    let credential_id = raw_id
-        .parse::<u64>()
-        .map_err(|_| "credentialId 必须是数字".to_string())?;
-    match &mut ids {
-        Some(group_ids) => group_ids.retain(|id| *id == credential_id),
-        None => ids = Some(std::iter::once(credential_id).collect()),
-    }
-    Ok(ids)
-}
-
-/// GET /api/admin/stats/billing?range=24h|7d|30d&granularity=hour|day&keyId=...
-pub async fn stats_billing(
+/// GET /api/admin/stats/by-key?range=24h|7d|30d&group=...
+/// 按入口 Key 横向汇总时间窗内用量，附加 Key 名称方便前端展示。
+pub async fn stats_by_key(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
-    let (window, key_id) = match stats_query_parts(&params) {
-        Ok(parts) => parts,
+    let window = match parse_stats_window(&params) {
+        Ok(w) => w,
         Err(message) => return stats_bad_request(message),
     };
-    let config = state.service.current_billing_config();
-    let cred_ids = match billing_cred_ids(&state, &params) {
-        Ok(ids) => ids,
-        Err(message) => return stats_bad_request(message),
-    };
-    let (_, summary) =
-        state
-            .usage_aggregator
-            .query_billing(window, key_id, cred_ids.as_ref(), &config);
-    Json(summary).into_response()
+    let group = parse_group_filter(&params);
+    let cred_ids = group_to_cred_ids(&state, group.as_deref());
+    let data = state.usage_aggregator.query_by_key(window, cred_ids.as_ref());
+    // Key 名称解析：命中客户端 Key 名称表则取名称，否则回退 #id
+    let key_name_map: HashMap<u64, String> = state
+        .client_keys
+        .list()
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let enriched: Vec<serde_json::Value> = data
+        .into_iter()
+        .map(|d| {
+            let name = key_name_map
+                .get(&d.key_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", d.key_id));
+            serde_json::json!({
+                "keyId": d.key_id,
+                "name": name,
+                "calls": d.calls,
+                "inputTokens": d.input_tokens,
+                "outputTokens": d.output_tokens,
+                "cacheCreationTokens": d.cache_creation_tokens,
+                "cacheReadTokens": d.cache_read_tokens,
+                "errors": d.errors,
+                "credits": d.credits,
+            })
+        })
+        .collect();
+    Json(enriched).into_response()
 }
 
 /// GET /api/admin/traces
 /// 查询请求链路追踪记录（含每跳明细）。
-/// query 参数：status / errorType / credentialId / keyId / group / model / source /
-/// fromTs / toTs / billingStatus / onlyFailed / sort / limit / offset
+/// query 参数：status / errorType / credentialId / keyId / group / model / onlyFailed /
+///            sessionId / onlySwitched / clientIp / startTime / endTime（Unix 秒）/ q（关键字）/
+///            limit / offset
 /// 返回：{ records: [...], total: N }
 pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let snapshot = state.service.get_all_credentials();
-
-    // 分组和凭据来源都转换为凭据 id 白名单，保证筛选发生在数据库分页之前。
+    // 解析分组筛选：把 group 名转为凭据 id 白名单（先于查询执行，避免分页错位）
     let group = params
         .get("group")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let credential_ids: Option<Vec<u64>> = group.as_ref().map(|g| {
-        snapshot
+        state
+            .service
+            .get_all_credentials()
             .credentials
             .iter()
             .filter(|c| c.groups.iter().any(|cg| cg == g))
             .map(|c| c.id)
             .collect()
     });
-    let source_ids: Option<Vec<u64>> = match params.get("source").map(String::as_str) {
-        Some("upstream") => Some(
-            snapshot
-                .credentials
-                .iter()
-                .filter(|c| c.is_upstream)
-                .map(|c| c.id)
-                .collect(),
-        ),
-        Some("kiro") => Some(
-            snapshot
-                .credentials
-                .iter()
-                .filter(|c| !c.is_upstream)
-                .map(|c| c.id)
-                .collect(),
-        ),
-        _ => None,
-    };
-    let credential_ids = match (credential_ids, source_ids) {
-        (Some(group_ids), Some(source_ids)) => Some(
-            group_ids
-                .into_iter()
-                .filter(|id| source_ids.contains(id))
-                .collect(),
-        ),
-        (Some(ids), None) | (None, Some(ids)) => Some(ids),
-        (None, None) => None,
-    };
-    let billing_status = params.get("billingStatus").map(String::as_str);
-    let priced_models = if billing_status == Some("unpriced") {
-        state
-            .service
-            .current_billing_config()
-            .model_prices
-            .keys()
-            .cloned()
-            .collect()
-    } else {
-        Vec::new()
-    };
 
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
@@ -1771,16 +1561,30 @@ pub async fn list_traces(
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
-        from_epoch: params.get("fromTs").and_then(|s| s.parse::<i64>().ok()),
-        to_epoch: params.get("toTs").and_then(|s| s.parse::<i64>().ok()),
-        billing_only: billing_status == Some("with"),
-        unpriced_only: billing_status == Some("unpriced"),
-        priced_models,
         only_failed: params
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
             .unwrap_or(false),
+        session_id: params
+            .get("sessionId")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        only_switched: params
+            .get("onlySwitched")
+            .map(|s| s == "true" || s == "1")
+            .unwrap_or(false),
+        client_ip: params
+            .get("clientIp")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         credential_ids,
+        // startTime / endTime 为 Unix 秒，与 traces.ts_epoch 同单位
+        start_ts: params.get("startTime").and_then(|s| s.parse::<i64>().ok()),
+        end_ts: params.get("endTime").and_then(|s| s.parse::<i64>().ok()),
+        keyword: params
+            .get("q")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
         limit: params
             .get("limit")
             .and_then(|s| s.parse::<usize>().ok())
@@ -1790,26 +1594,15 @@ pub async fn list_traces(
             .get("offset")
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0),
-        sort: match params.get("sort").map(String::as_str) {
-            Some("oldest") => TraceSort::Oldest,
-            Some("tokens") => TraceSort::TokensDesc,
-            Some("duration") => TraceSort::DurationDesc,
-            Some("attempts") => TraceSort::AttemptsDesc,
-            _ => TraceSort::Newest,
-        },
     };
     let (records, total) = state.trace_store.query_paged(&query);
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
+    let snapshot = state.service.get_all_credentials();
     let email_map: HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
         .map(|c| (c.id, c.email.clone()))
-        .collect();
-    let upstream_map: HashMap<u64, bool> = snapshot
-        .credentials
-        .iter()
-        .map(|c| (c.id, c.is_upstream))
         .collect();
     let client_key_name_map: HashMap<u64, String> = state
         .client_keys
@@ -1829,14 +1622,7 @@ pub async fn list_traces(
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
-            // v1 老行的 engine / client_usage 为空，靠 rust_usage / go_usage 哪个非空
-            // 隐式表达引擎。不折叠的话，升级前落库的 trace 在前端会显示"无计费数据"。
-            let r = r.normalized();
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
-            let final_is_upstream = upstream_map
-                .get(&r.final_credential_id)
-                .copied()
-                .unwrap_or(r.upstream_usage.is_some());
             let key_name = key_label(r.key_id);
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
@@ -1867,7 +1653,6 @@ pub async fn list_traces(
                 "finalStatus": r.final_status,
                 "finalCredentialId": r.final_credential_id,
                 "finalEmail": final_email,
-                "finalCredentialIsUpstream": final_is_upstream,
                 "errorType": r.error_type,
                 "errorMessage": r.error_message,
                 "totalAttempts": r.total_attempts,
@@ -1880,12 +1665,11 @@ pub async fn list_traces(
                 "totalTokens": r.input_tokens + r.output_tokens + r.cache_creation_tokens + r.cache_read_tokens,
                 "credits": r.credits,
                 "firstTokenMs": r.first_token_ms,
-                // 逐引擎配对：engine 标明这一次用了哪个引擎，upstreamUsage 与
-                // clientUsage 是同一次请求的两个口径，故可直接相除得加价倍数。
-                // v1 的 rustUsage / goUsage 已由 normalized() 折叠进这三个字段。
-                "engine": r.engine,
-                "upstreamUsage": r.upstream_usage,
-                "clientUsage": r.client_usage,
+                "sessionId": r.session_id,
+                "stickyOutcome": r.sticky_outcome,
+                "previousCredentialId": r.previous_credential_id,
+                "usageSource": r.usage_source,
+                "clientIp": r.client_ip,
                 "attempts": attempts,
             })
         })
@@ -2117,32 +1901,4 @@ pub async fn delete_group(
         name
     )))
     .into_response()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn custom_billing_window_includes_the_whole_end_date() {
-        let window = custom_stats_window("2026-07-01", "2026-07-07", StatsGranularity::Day)
-            .expect("valid custom date range");
-        let expected_start =
-            local_midnight_ts(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()).unwrap();
-        let expected_end = local_midnight_ts(NaiveDate::from_ymd_opt(2026, 7, 8).unwrap()).unwrap();
-
-        assert_eq!(window.start_ts, expected_start);
-        assert_eq!(window.end_ts, expected_end);
-        assert_eq!(window.granularity, StatsGranularity::Day);
-    }
-
-    #[test]
-    fn custom_billing_window_rejects_incomplete_or_reversed_dates() {
-        let incomplete = HashMap::from([
-            ("startDate".to_string(), "2026-07-01".to_string()),
-            ("granularity".to_string(), "day".to_string()),
-        ]);
-        assert!(parse_stats_window(&incomplete).is_err());
-        assert!(custom_stats_window("2026-07-08", "2026-07-01", StatsGranularity::Day).is_err());
-    }
 }

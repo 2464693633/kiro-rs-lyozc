@@ -47,9 +47,9 @@ function formatTs(ts: string, granularity: StatsGranularity): string {
   return `${d.getFullYear()}-${md} ${String(d.getHours()).padStart(2, '0')}:00`
 }
 
-/** 命中率 = cacheRead / (input + cacheRead)，无缓存读取时为 0 */
+/** 命中率 = cacheRead / (input + cacheCreation + cacheRead)，无 prompt 时为 0 */
 function calcHitRate(p: TimeSeriesPoint): number {
-  const denom = p.inputTokens + p.cacheReadTokens
+  const denom = p.inputTokens + p.cacheCreationTokens + p.cacheReadTokens
   if (denom <= 0) return 0
   return (p.cacheReadTokens / denom) * 100
 }
@@ -250,9 +250,7 @@ function chartLines() {
       dot={false}
       strokeWidth={s.kind === 'percent' ? 1.8 : 2}
       strokeDasharray={s.kind === 'percent' ? '4 4' : undefined}
-      isAnimationActive
-      animationDuration={550}
-      animationEasing="ease-out"
+      isAnimationActive={false}
     />
   ))
 }

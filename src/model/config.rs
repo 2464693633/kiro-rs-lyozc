@@ -17,6 +17,28 @@ impl Default for TlsBackend {
     }
 }
 
+/// 对话 / MCP 请求使用的上游域名。
+///
+/// - `Amazonaws`（默认）：`q.{region}.amazonaws.com`
+/// - `Kiro`：`runtime.{region}.kiro.dev`，新版 Kiro IDE / Kiro CLI 使用的域名，
+///   官方客户端仅内置 us-east-1、eu-central-1 等少数区域
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApiDomain {
+    #[default]
+    Amazonaws,
+    Kiro,
+}
+
+impl ApiDomain {
+    pub fn runtime_host(self, region: &str) -> String {
+        match self {
+            Self::Amazonaws => format!("q.{}.amazonaws.com", region),
+            Self::Kiro => format!("runtime.{}.kiro.dev", region),
+        }
+    }
+}
+
 /// 工具兼容模式。
 ///
 /// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
@@ -108,6 +130,21 @@ pub struct Config {
     #[serde(default = "default_tls_backend")]
     pub tls_backend: TlsBackend,
 
+    /// Deadline for establishing an upstream API connection.
+    #[serde(default = "default_upstream_connect_timeout_secs")]
+    pub upstream_connect_timeout_secs: u64,
+
+    /// Maximum silence while waiting for headers or the next upstream body read.
+    #[serde(default = "default_upstream_read_timeout_secs")]
+    pub upstream_read_timeout_secs: u64,
+
+    /// Deadline for a whole upstream API request, body included. An active
+    /// stream cannot reset it, so it also caps how long an answer may be.
+    /// Defaults to the previously hardcoded 720s; set 0 to disable it and
+    /// leave stalled upstreams to `upstream_read_timeout_secs`.
+    #[serde(default = "default_upstream_total_timeout_secs")]
+    pub upstream_total_timeout_secs: u64,
+
     /// 外部 count_tokens API 地址（可选）
     #[serde(default)]
     pub count_tokens_api_url: Option<String>,
@@ -166,17 +203,39 @@ pub struct Config {
     #[serde(default = "default_load_balancing_mode")]
     pub load_balancing_mode: String,
 
-    /// 账号级 429 风控触发时是否对当前凭据进入冷却并故障转移（默认 true）。
+    /// 会话粘性路由开关（默认 true）。
     ///
-    /// 关闭后：429 + suspicious activity 仍按普通瞬态错误重试，不切换凭据。
-    /// 开启后：识别到 suspicious activity 字符串时，把当前凭据冷却 `account_throttle_cooldown_secs` 秒，
-    /// 立即切换到下一个可用凭据。
+    /// 开启后同一 `conversationId` 的后续轮次优先沿用上一轮成功的凭据；该凭据不可用
+    /// （禁用 / 冷却 / RPM 打满 / 不支持模型 / 不在分组）时才回落到 `load_balancing_mode`。
+    /// 注意：Kiro 上游 prompt cache 按 profile 隔离而非按账号，同 profile 的账号之间换号
+    /// 不会丢缓存；粘性主要在多 profile 部署下保住缓存，单 profile 下作用是会话可追溯。
+    /// 注意：粘性优先于 priority 模式的「高优先级恢复后立即回切」，代价是
+    /// 会话在 TTL 内不会主动迁回高优先级凭据。
+    #[serde(default = "default_session_affinity_enabled")]
+    pub session_affinity_enabled: bool,
+
+    /// 会话绑定的有效期（秒，默认 3600）。每次成功请求都会续期。
+    #[serde(default = "default_session_affinity_ttl_secs")]
+    pub session_affinity_ttl_secs: u64,
+
+    /// 账号级 429 限流触发时是否冷却当前凭据并故障转移（默认 true）。
+    ///
+    /// 适用于 USER_REQUEST_RATE_EXCEEDED、CREDIT_CONSUMPTION_RATE_EXCEEDED
+    /// 和 suspicious activity 等明确绑定账号的 429。关闭后直接返回客户端，不会由
+    /// `model_api_429_retry_enabled` 在原账号上继续重试。
     #[serde(default = "default_account_throttle_failover")]
     pub account_throttle_failover: bool,
 
-    /// 账号级风控冷却时长（秒，默认 1800 = 30 分钟）。
+    /// 账号级 429 限流冷却时长（秒，默认 1800 = 30 分钟）。
     #[serde(default = "default_account_throttle_cooldown_secs")]
     pub account_throttle_cooldown_secs: u64,
+
+    /// 普通模型 API 429 是否由中转侧自动重试（默认 true）。
+    ///
+    /// 仅控制不需要切换凭据的容量类 429（如 `INSUFFICIENT_MODEL_CAPACITY`）。
+    /// 关闭后首个普通 429 立即返回客户端；账号级故障转移不受影响。
+    #[serde(default = "default_model_api_429_retry_enabled")]
+    pub model_api_429_retry_enabled: bool,
 
     /// 是否启用单账号每分钟请求次数（RPM）主动限流（默认 false）。
     ///
@@ -224,6 +283,14 @@ pub struct Config {
     #[serde(default = "default_self_heal_max_consecutive_rounds")]
     pub self_heal_max_consecutive_rounds: u32,
 
+    /// 是否在上游月度额度重置后自动恢复 `QuotaExceeded` 凭据（默认 false）。
+    ///
+    /// 开启后，后台余额任务仅在该凭据的 `nextResetAt` 到期时复查它自己；确认
+    /// `remaining > 0` 后才恢复调度。关闭时，`QuotaExceeded` 凭据保持禁用，
+    /// 需管理员手动恢复。
+    #[serde(default)]
+    pub quota_reset_recovery_enabled: bool,
+
     /// 按凭据缓存上游可用模型列表的 TTL（秒，默认 3600）。
     #[serde(default = "default_model_cache_ttl_secs")]
     pub model_cache_ttl_secs: u64,
@@ -243,6 +310,49 @@ pub struct Config {
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
+
+    /// 对话 / MCP 请求的上游域名：`amazonaws`（默认）或 `kiro`。
+    /// 仅影响 ide / cli 端点的 generateAssistantResponse 与 mcp，不影响 token 刷新和用量查询
+    #[serde(default)]
+    pub api_domain: ApiDomain,
+
+    /// 是否启用中转层 prompt cache 本地计量模拟。未设置时回落到
+    /// `KIRO_RS_CACHE_METERING` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后：不查不写任何缓存态，usage 全量计入 `input_tokens`、
+    /// `cache_creation_input_tokens` / `cache_read_input_tokens` 恒为 0。
+    /// 上游若下发真实 `metadataEvent.tokenUsage`，仍按真值上报，不受此开关影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_enabled: Option<bool>,
+
+    /// prompt cache 计量模拟的条目上限。未设置时回落到 `KIRO_RS_CACHE_CAPACITY`
+    /// 环境变量，再回落到内置默认 262144。
+    ///
+    /// 选型公式：`C >= peak_req_per_sec * entries_per_req * TTL_secs`。
+    /// 生效值钳到 `[1024, 8388608]`。启动时固定，运行时不可改。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_capacity: Option<usize>,
+
+    /// 是否把 prompt cache 计量快照落到 `cache_metering.json`。未设置时回落到
+    /// `KIRO_RS_CACHE_PERSIST` 环境变量，再回落到默认**关闭**。
+    ///
+    /// 关闭后启动不读该文件、运行与退出都不写该文件，也不会删除已有文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_persist_enabled: Option<bool>,
+
+    /// prompt cache 计量快照的落盘间隔（秒）。未设置时回落到
+    /// `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` 环境变量，再回落到默认 300。
+    /// 生效值钳到 `[10, 3600]`。仅在落盘开启时有意义。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_flush_interval_secs: Option<u64>,
+
+    /// 是否开启 miss 归因（墓碑表，用于区分 `miss_evicted` / `miss_expired`）。
+    /// 未设置时回落到 `KIRO_RS_CACHE_MISS_DIAGNOSTICS` 环境变量，再回落到默认开启。
+    ///
+    /// 关闭后不建墓碑表（内存归零），`miss_evicted` 退化为 `miss_no_entry`，
+    /// 其余计数器与 `entries_len` 仍然输出。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_metering_miss_diagnostics: Option<bool>,
 
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
@@ -266,36 +376,6 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
-    /// Input token 膨胀倍率（应用于 input_tokens，>= 1.0）
-    #[serde(default = "default_inflation_multiplier")]
-    pub input_inflation_multiplier: f64,
-
-    /// Output token 膨胀倍率（应用于 output_tokens，>= 1.0）
-    #[serde(default = "default_inflation_multiplier")]
-    pub output_inflation_multiplier: f64,
-
-    /// Cache token 膨胀倍率（应用于 cache_creation + cache_read，>= 1.0）
-    #[serde(default = "default_inflation_multiplier")]
-    pub cache_inflation_multiplier: f64,
-
-    /// rust 缓存模拟引擎参数（引擎 A，默认引擎）
-    #[serde(default)]
-    pub cache_engine_rust: CacheEngineRustConfig,
-
-    /// go 缓存模拟引擎参数（引擎 B，移植自 kiro-go）
-    #[serde(default)]
-    pub cache_engine_go: CacheEngineGoConfig,
-
-    /// real 引擎参数（引擎 C：上游真实 usage + 自己一组倍率，无缓存状态）
-    #[serde(default)]
-    pub cache_engine_real: CacheEngineRealConfig,
-
-    /// nocache 引擎参数（引擎 D：cache 恒为 0、token 并入 input，无缓存状态）
-    #[serde(default)]
-    pub cache_engine_nocache: CacheEngineNoCacheConfig,
-    /// Billing comparison prices and source multipliers.
-    #[serde(default)]
-    pub billing: BillingConfig,
     /// 自定义模型映射表。
     ///
     /// 每条把一个客户端模型别名映射到 Kiro 后端模型 ID 并附带元数据。默认空数组
@@ -304,690 +384,13 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
-    /// API Key 订阅源（拼车链接）自动导入配置。
-    #[serde(default)]
-    pub key_feed: KeyFeedConfig,
-
-    /// 上游直通凭据的故障转移检测配置（欠费/封禁文案、429 冷却切号）。
-    #[serde(default)]
-    pub upstream_failover: UpstreamFailoverConfig,
+    /// 凭据 metadata 的 JSON Schema。未配置时使用程序内置 schema。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_metadata_schema: Option<serde_json::Value>,
 
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
-}
-
-/// API Key 订阅源自动导入配置。
-///
-/// 面向「拼车链接」这类持续发号的 HTTP 源：定期 GET 一个返回 API Key 列表的
-/// JSON 接口，把其中的新 key 自动导入为 `api_key` 类型凭据。
-///
-/// 去重完全依赖 `MultiTokenManager::add_credential` 已有的
-/// `sha256(kiroApiKey)` 指纹（在任何网络调用之前就 bail），所以轮询天然幂等，
-/// 无需本模块自己记账「哪些 key 已导入过」。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyFeedConfig {
-    /// 是否启用后台轮询。关闭时调度器空转，手动拉取端点仍可用。
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// 订阅源 URL（不含 token 查询参数）。
-    ///
-    /// token 单独存在 [`Self::token`]，便于 Admin API 只回 `tokenSet` 布尔而不回显明文。
-    #[serde(default)]
-    pub url: Option<String>,
-
-    /// 订阅源访问令牌，作为 `?{tokenParam}=` 拼到 [`Self::url`] 上。
-    #[serde(default)]
-    pub token: Option<String>,
-
-    /// 令牌的查询参数名，默认 `token`。
-    ///
-    /// 不同订阅源的鉴权参数名不一样（`token` / `key` / `accessKey`…）。做成可配置是为了
-    /// **让脱敏对任意源都成立**：只有参数名匹配，才能把令牌拆到 [`Self::token`] 单独存，
-    /// Admin API 才能只回 `tokenSet` 而不回显明文。否则令牌会留在 `url` 里被接口回显。
-    #[serde(default = "default_key_feed_token_param")]
-    pub token_param: String,
-
-    /// 轮询间隔（秒）。下限 60 秒，避免把上游发号接口打成限流。
-    #[serde(default = "default_key_feed_interval_secs")]
-    pub interval_secs: u64,
-
-    /// 导入时是否验活（拉一次余额）。
-    ///
-    /// 建议保持 `true`：`supports_opus()` 在 `subscription_title` 为 `None` 时返回
-    /// `true`，未验活的 Free key 会被放进 Opus 调度然后失败；验活顺带把订阅等级填上。
-    #[serde(default = "default_key_feed_verify")]
-    pub verify: bool,
-
-    /// 导入的凭据优先级（数字越小越优先）。
-    #[serde(default)]
-    pub priority: u32,
-
-    /// 导入的凭据所属分组。空数组表示不绑定分组。
-    #[serde(default)]
-    pub groups: Vec<String>,
-
-    /// 导入的凭据使用的端点名。`None` 表示回退 `defaultEndpoint`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-
-    /// 是否清理本订阅源导入且**已被自动禁用**的凭据。
-    ///
-    /// 默认关闭。开启后每轮拉取结束会删除满足全部条件的凭据：
-    /// - `sourceChannel` 带本模块的 `keyfeed:` 前缀（不误伤手工添加的号）；
-    /// - 已禁用，且禁用原因不是 `Manual`（手动禁用视为运维显式意图，保留）。
-    ///
-    /// 注意这里不按 `warrantyUntil` 到点删：保修期过了 key 未必失效，硬删会浪费
-    /// 还能用的号。交给现有失败计数 / 自愈机制自然淘汰，这里只做善后。
-    #[serde(default)]
-    pub reap_disabled: bool,
-}
-
-impl Default for KeyFeedConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            url: None,
-            token: None,
-            token_param: default_key_feed_token_param(),
-            interval_secs: default_key_feed_interval_secs(),
-            verify: default_key_feed_verify(),
-            priority: 0,
-            groups: Vec::new(),
-            endpoint: None,
-            reap_disabled: false,
-        }
-    }
-}
-
-/// 轮询间隔的绝对下限（秒）。防止误配成个位数秒把上游打挂。
-pub const KEY_FEED_MIN_INTERVAL_SECS: u64 = 60;
-
-fn default_key_feed_interval_secs() -> u64 {
-    300
-}
-
-fn default_key_feed_verify() -> bool {
-    true
-}
-
-/// 令牌查询参数名的默认值。
-pub fn default_key_feed_token_param() -> String {
-    "token".to_string()
-}
-
-impl KeyFeedConfig {
-    /// 夹取到合法区间后的轮询间隔。
-    pub fn effective_interval_secs(&self) -> u64 {
-        self.interval_secs.max(KEY_FEED_MIN_INTERVAL_SECS)
-    }
-
-    /// 生效的令牌参数名（空配置回退到默认 `token`）。
-    pub fn effective_token_param(&self) -> &str {
-        let trimmed = self.token_param.trim();
-        if trimmed.is_empty() {
-            "token"
-        } else {
-            trimmed
-        }
-    }
-
-    /// 拼出完整请求 URL（`url` + `?{tokenParam}=`）。
-    ///
-    /// 未配置 `url` 时返回 `None`。`token` 为空时只返回 base URL —— 有些源把凭证放在
-    /// 路径里，或参数已经写在 `url` 上，不强制要求单独的 token。
-    pub fn request_url(&self) -> Option<String> {
-        let base = self.url.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
-        let token = self
-            .token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-
-        let Some(token) = token else {
-            return Some(base.to_string());
-        };
-
-        // base 可能自带查询串（用户直接粘了带其它参数的链接）
-        let separator = if base.contains('?') { '&' } else { '?' };
-        Some(format!(
-            "{}{}{}={}",
-            base,
-            separator,
-            urlencoding::encode(self.effective_token_param()),
-            urlencoding::encode(token)
-        ))
-    }
-}
-
-/// 上游直通凭据的故障转移检测配置。
-///
-/// 上游多为各家中转站，欠费 / 封禁的返回文案格式互不相同且随时会变，故检测
-/// 规则做成**可配置的子串列表**（大小写不敏感、按字面匹配、不是正则）。
-/// 所有规则只作用于上游凭据分支；Kiro 凭据路径有自己的一套检测，互不影响。
-///
-/// 三类动作与 Kiro 路径的机制一一对应，复用同一套凭据池管理：
-/// - 封禁命中 → `report_suspended_for_request`：立即禁用、不参与自愈、切号；
-/// - 欠费命中 → `report_quota_exhausted_for_request`：立即禁用并切号；
-/// - 429 → `report_account_throttled_for_request`：冷却当前凭据并立即切号
-///   （旧行为是在同一凭据上原地退避重试，池里有其它 key 时纯属浪费）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpstreamFailoverConfig {
-    /// 总开关（默认 true）。关闭后上游分支完全回退旧行为：
-    /// 401/403 攒失败计数、429 原地退避、400 直接终止。
-    #[serde(default = "default_upstream_failover_enabled")]
-    pub enabled: bool,
-
-    /// 欠费 / 额度用尽文案（子串，大小写不敏感）。
-    ///
-    /// 匹配范围：400 / 401 / 402 / 403 的响应体 —— 中转站表达"没钱了"的状态码
-    /// 五花八门，Anthropic 官方是 400（"credit balance is too low"），不少
-    /// OpenAI 风格网关用 403（"insufficient_quota"）。命中后立即禁用该凭据
-    /// （`QuotaExceeded`）并切号。429 刻意不在此列：429 语义是限流，多为临时
-    /// 状态，走下面的冷却切号；把它禁死会误杀还能恢复的 key。
-    #[serde(default = "default_upstream_quota_patterns")]
-    pub quota_patterns: Vec<String>,
-
-    /// 封禁 / 停用文案（子串，大小写不敏感）。
-    ///
-    /// 匹配范围：401 / 403 的响应体。命中后立即禁用（`Suspended`，不参与自愈，
-    /// 需人工在面板重置）并切号，不必等 401/403 攒满 3 次失败计数。
-    #[serde(default = "default_upstream_suspended_patterns")]
-    pub suspended_patterns: Vec<String>,
-
-    /// 429 时是否冷却当前凭据并切号（默认 true）。
-    ///
-    /// 冷却时长优先取上游 `Retry-After` 头；没有时用
-    /// [`Self::throttle_cooldown_secs`]。关闭后 429 回退旧行为（原地退避重试）。
-    #[serde(default = "default_upstream_failover_enabled")]
-    pub throttle_failover: bool,
-
-    /// 429 无 `Retry-After` 时的冷却时长（秒，默认 60）。
-    ///
-    /// 比 Kiro 账号级风控的 30 分钟短得多：中转站的 429 多为短时限流而非风控，
-    /// 长冷却会让池子无谓萎缩。
-    #[serde(default = "default_upstream_throttle_cooldown_secs")]
-    pub throttle_cooldown_secs: u64,
-}
-
-impl Default for UpstreamFailoverConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_upstream_failover_enabled(),
-            quota_patterns: default_upstream_quota_patterns(),
-            suspended_patterns: default_upstream_suspended_patterns(),
-            throttle_failover: default_upstream_failover_enabled(),
-            throttle_cooldown_secs: default_upstream_throttle_cooldown_secs(),
-        }
-    }
-}
-
-impl UpstreamFailoverConfig {
-    /// 响应体是否命中欠费文案。`enabled` 关闭时恒 false。
-    pub fn matches_quota(&self, body: &str) -> bool {
-        self.enabled && matches_any_pattern(&self.quota_patterns, body)
-    }
-
-    /// 响应体是否命中封禁文案。`enabled` 关闭时恒 false。
-    pub fn matches_suspended(&self, body: &str) -> bool {
-        self.enabled && matches_any_pattern(&self.suspended_patterns, body)
-    }
-
-    /// 429 是否走冷却切号。
-    pub fn throttle_failover_enabled(&self) -> bool {
-        self.enabled && self.throttle_failover
-    }
-}
-
-/// 大小写不敏感的子串匹配。空 pattern（含纯空白）跳过，防止空串 `contains` 恒真
-/// 把所有错误都误判成命中。
-fn matches_any_pattern(patterns: &[String], body: &str) -> bool {
-    if body.is_empty() {
-        return false;
-    }
-    let body_lower = body.to_lowercase();
-    patterns.iter().any(|p| {
-        let p = p.trim();
-        !p.is_empty() && body_lower.contains(&p.to_lowercase())
-    })
-}
-
-fn default_upstream_failover_enabled() -> bool {
-    true
-}
-
-fn default_upstream_throttle_cooldown_secs() -> u64 {
-    60
-}
-
-/// 默认欠费文案：覆盖 Anthropic 官方、OpenAI 风格网关和常见中文中转站。
-/// 全部取高特异性短语，避免误伤普通错误消息。
-fn default_upstream_quota_patterns() -> Vec<String> {
-    [
-        // Anthropic 官方 / 兼容网关
-        "credit balance is too low",
-        // OpenAI 风格网关（one-api / new-api 系）
-        "insufficient_quota",
-        "insufficient quota",
-        "quota exceeded",
-        "exceeded your current quota",
-        "余额不足",
-        "额度已用尽",
-        "额度不足",
-        "欠费",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-/// 默认封禁文案。刻意不收录裸 "banned" / "disabled" 单词 —— 太宽，普通错误
-/// 消息（如 "streaming is disabled"）会误命中。
-fn default_upstream_suspended_patterns() -> Vec<String> {
-    [
-        "account has been disabled",
-        "account has been suspended",
-        "account is suspended",
-        "user has been banned",
-        "账号已被封禁",
-        "账户已被禁用",
-        "账号已被禁用",
-        "已被封禁",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
-/// rust 缓存模拟引擎（`anthropic::cache_metering`）参数。
-///
-/// 这些值原为源码内硬编码常量，提取为配置以便与 go 引擎独立调参。默认值与
-/// 提取前的常量完全一致，故缺省配置行为不变。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEngineRustConfig {
-    /// 条目上限，超出后按 `last_hit_at` 淘汰最旧
-    #[serde(default = "default_rust_cache_capacity")]
-    pub capacity: usize,
-    /// 单条目最长 TTL（秒），与 Anthropic `ttl="1h"` 对齐
-    #[serde(default = "default_rust_cache_max_ttl_secs")]
-    pub max_ttl_secs: i64,
-    /// 默认 TTL（秒），对应 ephemeral 缺省值
-    #[serde(default = "default_rust_cache_default_ttl_secs")]
-    pub default_ttl_secs: i64,
-
-    // ---- 引擎 A 专属倍率 ----
-    //
-    // **为什么是 `Option` 而非直接 `f64` 默认 1.0**：引擎 A 历史上一直用全局
-    // 「Token 膨胀倍率」（`input_inflation_multiplier` 等三个顶层字段）。若这里直接
-    // 默认 1.0，现有部署升级后 A 会突然从「全局配的 2×」变成「自己的 1×」——
-    // 倍率静默失效，且配置文件里那三个全局字段看着还在生效。
-    //
-    // `None` = 未单独设置，回退全局；一旦从 UI 保存过就变成具体值并从此独立。
-    /// input 倍率。`None` = 用全局 `input_inflation_multiplier`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub input_multiplier: Option<f64>,
-    /// output 倍率。`None` = 用全局 `output_inflation_multiplier`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_multiplier: Option<f64>,
-    /// cache_read 倍率。`None` = 用全局 `cache_inflation_multiplier`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_multiplier: Option<f64>,
-    /// cache_creation 倍率。`None` = 用全局 `cache_inflation_multiplier`。
-    ///
-    /// 注意全局那套只有**一个** cache 倍率，creation 与 read 同值。拆成两个后
-    /// A 才能像 B/C 那样独立调这两项。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_creation_multiplier: Option<f64>,
-}
-
-/// go 缓存模拟引擎（`anthropic::cache_metering_go`）参数。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEngineGoConfig {
-    /// 可缓存前缀占总 input 的上限比例，保证总有未缓存尾部（0, 1]
-    #[serde(default = "default_go_cache_max_ratio")]
-    pub max_ratio: f64,
-    /// 断点 TTL 上限（秒）。调小可让历史前缀更早过期，从而产出更多 creation
-    #[serde(default = "default_go_cache_ttl_seconds")]
-    pub ttl_seconds: i64,
-    /// 条目上限（LRU）
-    #[serde(default = "default_go_cache_max_entries")]
-    pub max_entries: usize,
-    /// 最小可缓存前缀 token 数，低于此值的断点不参与匹配 / 存储
-    #[serde(default = "default_go_min_cacheable_tokens")]
-    pub min_cacheable_tokens: i64,
-    /// Opus 系列的最小可缓存前缀 token 数
-    #[serde(default = "default_go_opus_min_cacheable_tokens")]
-    pub opus_min_cacheable_tokens: i64,
-    /// 下发前对 `input_tokens` 的缩放倍率（go 引擎专属，不走全局膨胀倍率）
-    #[serde(default = "default_go_multiplier")]
-    pub input_token_multiplier: f64,
-    /// 下发前对 `cache_read_input_tokens` 的缩放倍率（go 引擎专属）
-    #[serde(default = "default_go_multiplier")]
-    pub cache_read_multiplier: f64,
-    /// 下发前对 `cache_creation_input_tokens` 的缩放倍率（go 引擎专属）。
-    ///
-    /// 默认 1.0（不缩放）= Go 原实现行为 —— Go 的 `buildClaudeUsageMap` 只缩放
-    /// `input_tokens` 与 `cache_read_input_tokens`，creation 原样下发。
-    ///
-    /// 调离 1.0 会偏离 Go 原实现，且会影响两套引擎在「creation/read 划分」这个
-    /// 维度上的可比性（数字差异将无法区分是引擎算法不同还是倍率不同造成的）。
-    #[serde(default = "default_go_multiplier")]
-    pub cache_creation_multiplier: f64,
-    /// 下发前对 `output_tokens` 的缩放倍率（go 引擎专属）。
-    ///
-    /// **Go 原实现没有这个倍率**（`buildClaudeUsageMap` 只缩放 input 与
-    /// cache_read），故默认 1.0 = 原行为。开放它是为了让四套引擎在「可调维度」上
-    /// 对称：否则 B 是唯一无法调 output 的引擎，运维要改 B 的 output 只能去动
-    /// 全局倍率，而那会同时影响引擎 A。
-    #[serde(default = "default_go_multiplier")]
-    pub output_multiplier: f64,
-}
-
-/// 引擎 C（`real`）参数：上游真实 usage + 自己一组倍率。
-///
-/// 无缓存状态（无指纹表 / TTL / 容量），故只有倍率字段。四个倍率各自独立，
-/// 与引擎 A 的全局膨胀倍率、引擎 B 的三倍率互不影响。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEngineRealConfig {
-    /// 对上游真实 `input_tokens` 的缩放倍率
-    #[serde(default = "default_go_multiplier")]
-    pub input_multiplier: f64,
-    /// 对上游真实 `output_tokens` 的缩放倍率
-    #[serde(default = "default_go_multiplier")]
-    pub output_multiplier: f64,
-    /// 对上游真实 `cache_read_input_tokens` 的缩放倍率
-    #[serde(default = "default_go_multiplier")]
-    pub cache_read_multiplier: f64,
-    /// 对上游真实 `cache_creation_input_tokens` 的缩放倍率
-    #[serde(default = "default_go_multiplier")]
-    pub cache_creation_multiplier: f64,
-}
-
-/// 引擎 D（`nocache`）参数：cache 字段恒为 0，token 并入 input。
-///
-/// 只有 input / output 两个倍率 —— cache 倍率对本引擎无意义（cache 恒为 0，
-/// 乘任何倍率都是 0），故不提供，避免出现「配了却无效」的旋钮。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEngineNoCacheConfig {
-    /// 对**客户端请求本地估算**的 input 的缩放倍率。
-    ///
-    /// 注意口径：引擎 D 不读上游 usage，input 取 `token::count_all_tokens` 对客户端
-    /// 请求的本地估算值（请求发出前即已确定）。上游可能本身就是另一个 kiro-rs 反代，
-    /// 它报的 usage 已被模拟 / 膨胀过一轮，拿来当"真值"会二次加工。
-    #[serde(default = "default_go_multiplier")]
-    pub input_multiplier: f64,
-    /// 对**实际返回内容本地估算**的 output 的缩放倍率。
-    ///
-    /// 同样不读上游 usage：非流式从响应 `content` 数组估算，流式累积 SSE delta 后
-    /// 整体估算一次（`count_tokens` 非线性，逐 delta 求和会显著高估）。
-    #[serde(default = "default_go_multiplier")]
-    pub output_multiplier: f64,
-}
-
-impl Default for CacheEngineRealConfig {
-    fn default() -> Self {
-        Self {
-            input_multiplier: default_go_multiplier(),
-            output_multiplier: default_go_multiplier(),
-            cache_read_multiplier: default_go_multiplier(),
-            cache_creation_multiplier: default_go_multiplier(),
-        }
-    }
-}
-
-impl Default for CacheEngineNoCacheConfig {
-    fn default() -> Self {
-        Self {
-            input_multiplier: default_go_multiplier(),
-            output_multiplier: default_go_multiplier(),
-        }
-    }
-}
-
-impl CacheEngineRealConfig {
-    /// 非法倍率（<= 0 / NaN / inf）一律回落 1.0，与引擎 B 同规则。
-    pub fn sanitized(self) -> Self {
-        Self {
-            input_multiplier: sanitize_multiplier(self.input_multiplier),
-            output_multiplier: sanitize_multiplier(self.output_multiplier),
-            cache_read_multiplier: sanitize_multiplier(self.cache_read_multiplier),
-            cache_creation_multiplier: sanitize_multiplier(self.cache_creation_multiplier),
-        }
-    }
-}
-
-impl CacheEngineNoCacheConfig {
-    /// 非法倍率（<= 0 / NaN / inf）一律回落 1.0，与引擎 B 同规则。
-    pub fn sanitized(self) -> Self {
-        Self {
-            input_multiplier: sanitize_multiplier(self.input_multiplier),
-            output_multiplier: sanitize_multiplier(self.output_multiplier),
-        }
-    }
-}
-
-fn default_rust_cache_capacity() -> usize {
-    4096
-}
-
-fn default_rust_cache_max_ttl_secs() -> i64 {
-    3600
-}
-
-fn default_rust_cache_default_ttl_secs() -> i64 {
-    300
-}
-
-fn default_go_cache_max_ratio() -> f64 {
-    0.85
-}
-
-fn default_go_cache_ttl_seconds() -> i64 {
-    300
-}
-
-fn default_go_cache_max_entries() -> usize {
-    131072
-}
-
-fn default_go_min_cacheable_tokens() -> i64 {
-    1024
-}
-
-/// Per-million-token model prices used by the billing comparison view.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelPricing {
-    #[serde(default)]
-    pub input_per_million: f64,
-    #[serde(default)]
-    pub output_per_million: f64,
-    #[serde(default)]
-    pub cache_creation_per_million: f64,
-    #[serde(default)]
-    pub cache_read_per_million: f64,
-}
-
-impl Default for ModelPricing {
-    fn default() -> Self {
-        Self {
-            input_per_million: 0.0,
-            output_per_million: 0.0,
-            cache_creation_per_million: 0.0,
-            cache_read_per_million: 0.0,
-        }
-    }
-}
-
-/// Billing comparison configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingConfig {
-    #[serde(default)]
-    pub model_prices: HashMap<String, ModelPricing>,
-    #[serde(default)]
-    pub upstream_multipliers: HashMap<u64, f64>,
-    #[serde(default = "default_inflation_multiplier")]
-    pub rust_multiplier: f64,
-    #[serde(default = "default_inflation_multiplier")]
-    pub go_multiplier: f64,
-    /// 引擎 C（real）的计费对比调节系数。
-    #[serde(default = "default_inflation_multiplier")]
-    pub real_multiplier: f64,
-    /// 引擎 D（nocache）的计费对比调节系数。
-    #[serde(default = "default_inflation_multiplier")]
-    pub nocache_multiplier: f64,
-}
-
-impl BillingConfig {
-    /// 按引擎标识取计费对比的成本调节系数。
-    ///
-    /// 这**不是**下发给客户端的 token 膨胀倍率（那个已经作用在记录下来的 client
-    /// usage 上了），而是计费对比视图专用的二次调节 —— 用于把不同引擎的账面成本
-    /// 拉到同一口径下比较。未知引擎（历史 JSONL 里将来新增的名字）取 1.0，
-    /// 使其成本仍按原样计入而不是被静默归零。
-    pub fn engine_multiplier(&self, engine: &str) -> f64 {
-        match engine {
-            "rust" => self.rust_multiplier,
-            "go" => self.go_multiplier,
-            "real" => self.real_multiplier,
-            "nocache" => self.nocache_multiplier,
-            _ => 1.0,
-        }
-    }
-}
-
-impl Default for BillingConfig {
-    fn default() -> Self {
-        Self {
-            model_prices: HashMap::new(),
-            upstream_multipliers: HashMap::new(),
-            rust_multiplier: 1.0,
-            go_multiplier: 1.0,
-            real_multiplier: 1.0,
-            nocache_multiplier: 1.0,
-        }
-    }
-}
-
-fn default_go_opus_min_cacheable_tokens() -> i64 {
-    // kiro-go's opusMinCacheableTokens is 1024.
-    1024
-}
-
-fn default_go_multiplier() -> f64 {
-    1.0
-}
-
-impl Default for CacheEngineRustConfig {
-    fn default() -> Self {
-        Self {
-            capacity: default_rust_cache_capacity(),
-            max_ttl_secs: default_rust_cache_max_ttl_secs(),
-            default_ttl_secs: default_rust_cache_default_ttl_secs(),
-            // None = 回退全局膨胀倍率。默认不填，使升级后行为与升级前完全一致。
-            input_multiplier: None,
-            output_multiplier: None,
-            cache_read_multiplier: None,
-            cache_creation_multiplier: None,
-        }
-    }
-}
-
-impl Default for CacheEngineGoConfig {
-    fn default() -> Self {
-        Self {
-            max_ratio: default_go_cache_max_ratio(),
-            ttl_seconds: default_go_cache_ttl_seconds(),
-            max_entries: default_go_cache_max_entries(),
-            min_cacheable_tokens: default_go_min_cacheable_tokens(),
-            opus_min_cacheable_tokens: default_go_opus_min_cacheable_tokens(),
-            input_token_multiplier: default_go_multiplier(),
-            output_multiplier: default_go_multiplier(),
-            cache_read_multiplier: default_go_multiplier(),
-            cache_creation_multiplier: default_go_multiplier(),
-        }
-    }
-}
-
-impl CacheEngineRustConfig {
-    /// 夹取到安全范围。0 / 负值一律回落默认，避免配置错误让缓存彻底失效。
-    pub fn sanitized(self) -> Self {
-        Self {
-            capacity: if self.capacity == 0 {
-                default_rust_cache_capacity()
-            } else {
-                self.capacity
-            },
-            max_ttl_secs: if self.max_ttl_secs <= 0 {
-                default_rust_cache_max_ttl_secs()
-            } else {
-                self.max_ttl_secs
-            },
-            default_ttl_secs: if self.default_ttl_secs <= 0 {
-                default_rust_cache_default_ttl_secs()
-            } else {
-                self.default_ttl_secs
-            },
-            // 非法值回落 `None`（= 回退全局）而非 1.0：`None` 是本字段既有的
-            // 「未设置」语义，回落到它可保持升级前的行为；回落 1.0 则会把已配的
-            // 全局倍率静默抹成不缩放。
-            input_multiplier: sanitize_opt_multiplier(self.input_multiplier),
-            output_multiplier: sanitize_opt_multiplier(self.output_multiplier),
-            cache_read_multiplier: sanitize_opt_multiplier(self.cache_read_multiplier),
-            cache_creation_multiplier: sanitize_opt_multiplier(self.cache_creation_multiplier),
-        }
-    }
-}
-
-/// `Option<f64>` 倍率的夹取：`Some(非法)` → `None`，其余原样。
-fn sanitize_opt_multiplier(v: Option<f64>) -> Option<f64> {
-    v.filter(|x| x.is_finite() && *x > 0.0)
-}
-
-impl CacheEngineGoConfig {
-    /// 夹取到安全范围（对齐 Go 侧 getter 的兜底逻辑）。
-    pub fn sanitized(self) -> Self {
-        Self {
-            // 命中率调节旋钮。范围对齐 Go admin 端点的 0.5–0.99：低于 0.5 会让
-            // 缓存几乎不起作用，等于 1.0 则整个 prompt 都可命中、下游永远看不到
-            // 未缓存尾部（不真实）。越界一律回落默认。
-            max_ratio: if self.max_ratio < 0.5 || self.max_ratio > 0.99 {
-                default_go_cache_max_ratio()
-            } else {
-                self.max_ratio
-            },
-            ttl_seconds: if self.ttl_seconds <= 0 {
-                default_go_cache_ttl_seconds()
-            } else {
-                self.ttl_seconds
-            },
-            // Go 侧有 256 下限，防止把缓存配到几乎不可用
-            max_entries: self.max_entries.max(256),
-            min_cacheable_tokens: self.min_cacheable_tokens.max(0),
-            opus_min_cacheable_tokens: self.opus_min_cacheable_tokens.max(0),
-            // Go 侧校验 `> 0`；NaN / inf 也一并挡掉，否则会污染整条下发口径。
-            input_token_multiplier: sanitize_multiplier(self.input_token_multiplier),
-            cache_read_multiplier: sanitize_multiplier(self.cache_read_multiplier),
-            cache_creation_multiplier: sanitize_multiplier(self.cache_creation_multiplier),
-            output_multiplier: sanitize_multiplier(self.output_multiplier),
-        }
-    }
-}
-
-fn sanitize_multiplier(v: f64) -> f64 {
-    if v.is_finite() && v > 0.0 {
-        v
-    } else {
-        default_go_multiplier()
-    }
 }
 
 fn default_host() -> String {
@@ -1022,8 +425,26 @@ fn default_tls_backend() -> TlsBackend {
     TlsBackend::Rustls
 }
 
+fn default_upstream_connect_timeout_secs() -> u64 {
+    15
+}
+fn default_upstream_read_timeout_secs() -> u64 {
+    120
+}
+fn default_upstream_total_timeout_secs() -> u64 {
+    720
+}
+
 fn default_load_balancing_mode() -> String {
     "priority".to_string()
+}
+
+fn default_session_affinity_enabled() -> bool {
+    true
+}
+
+fn default_session_affinity_ttl_secs() -> u64 {
+    3600
 }
 
 fn default_account_throttle_failover() -> bool {
@@ -1032,6 +453,10 @@ fn default_account_throttle_failover() -> bool {
 
 fn default_account_throttle_cooldown_secs() -> u64 {
     30 * 60
+}
+
+fn default_model_api_429_retry_enabled() -> bool {
+    true
 }
 
 fn default_account_rpm_limit_enabled() -> bool {
@@ -1090,10 +515,6 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
-fn default_inflation_multiplier() -> f64 {
-    1.0
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -1108,6 +529,9 @@ impl Default for Config {
             system_version: default_system_version(),
             node_version: default_node_version(),
             tls_backend: default_tls_backend(),
+            upstream_connect_timeout_secs: default_upstream_connect_timeout_secs(),
+            upstream_read_timeout_secs: default_upstream_read_timeout_secs(),
+            upstream_total_timeout_secs: default_upstream_total_timeout_secs(),
             count_tokens_api_url: None,
             count_tokens_api_key: None,
             count_tokens_auth_type: default_count_tokens_auth_type(),
@@ -1121,33 +545,34 @@ impl Default for Config {
             update_auto_apply: false,
             update_auto_apply_time: default_update_auto_apply_time(),
             load_balancing_mode: default_load_balancing_mode(),
+            session_affinity_enabled: default_session_affinity_enabled(),
+            session_affinity_ttl_secs: default_session_affinity_ttl_secs(),
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
+            model_api_429_retry_enabled: default_model_api_429_retry_enabled(),
             account_rpm_limit_enabled: default_account_rpm_limit_enabled(),
             account_rpm_limit: default_account_rpm_limit(),
             suspended_detection_enabled: default_suspended_detection_enabled(),
             self_heal_enabled: default_self_heal_enabled(),
             self_heal_min_interval_secs: default_self_heal_min_interval_secs(),
             self_heal_max_consecutive_rounds: default_self_heal_max_consecutive_rounds(),
+            quota_reset_recovery_enabled: false,
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
+            api_domain: ApiDomain::default(),
+            cache_metering_enabled: None,
+            cache_metering_capacity: None,
+            cache_metering_persist_enabled: None,
+            cache_metering_flush_interval_secs: None,
+            cache_metering_miss_diagnostics: None,
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
-            input_inflation_multiplier: default_inflation_multiplier(),
-            output_inflation_multiplier: default_inflation_multiplier(),
-            cache_inflation_multiplier: default_inflation_multiplier(),
-            cache_engine_rust: CacheEngineRustConfig::default(),
-            cache_engine_go: CacheEngineGoConfig::default(),
-            cache_engine_real: CacheEngineRealConfig::default(),
-            cache_engine_nocache: CacheEngineNoCacheConfig::default(),
-            billing: BillingConfig::default(),
             custom_models: Vec::new(),
-            key_feed: KeyFeedConfig::default(),
-            upstream_failover: UpstreamFailoverConfig::default(),
+            credential_metadata_schema: None,
             config_path: None,
         }
     }
@@ -1215,328 +640,50 @@ impl Config {
 }
 
 #[cfg(test)]
-mod cache_engine_config_tests {
-    use super::*;
-
-    /// 默认值必须等于引擎 A 迁移前的硬编码常量。这条与 `cache_metering.rs` 里的
-    /// `default_config_matches_legacy_constants` 互为两侧断言：任一侧改了默认值，
-    /// 都会被判为**行为变更**而非无害重构。
-    #[test]
-    fn rust_engine_defaults_match_legacy_constants() {
-        let c = CacheEngineRustConfig::default();
-        assert_eq!(c.capacity, 4096);
-        assert_eq!(c.max_ttl_secs, 3600);
-        assert_eq!(c.default_ttl_secs, 300);
-    }
-
-    #[test]
-    fn go_engine_defaults_match_go_source() {
-        let c = CacheEngineGoConfig::default();
-        assert_eq!(c.max_ratio, 0.85);
-        assert_eq!(c.ttl_seconds, 300);
-        assert_eq!(c.max_entries, 131072);
-        assert_eq!(c.min_cacheable_tokens, 1024);
-        assert_eq!(c.opus_min_cacheable_tokens, 1024);
-    }
-
-    /// 老配置文件完全没有这两个键时，必须反序列化成默认值而非报错。
-    #[test]
-    fn legacy_config_without_cache_engine_keys_deserializes() {
-        let json = r#"{"host":"127.0.0.1","port":8990,"region":"us-east-1"}"#;
-        let cfg: Config = serde_json::from_str(json).expect("老配置应可解析");
-        assert_eq!(cfg.cache_engine_rust.capacity, 4096);
-        assert_eq!(cfg.cache_engine_go.max_ratio, 0.85);
-        // C / D 是后加的两段：老文件必然没有，且默认必须是 1.0（不缩放）。
-        // 若默认不是 1.0，升级即静默改变所有既有 Key 的下发口径。
-        assert_eq!(cfg.cache_engine_real.input_multiplier, 1.0);
-        assert_eq!(cfg.cache_engine_real.output_multiplier, 1.0);
-        assert_eq!(cfg.cache_engine_real.cache_read_multiplier, 1.0);
-        assert_eq!(cfg.cache_engine_real.cache_creation_multiplier, 1.0);
-        assert_eq!(cfg.cache_engine_nocache.input_multiplier, 1.0);
-        assert_eq!(cfg.cache_engine_nocache.output_multiplier, 1.0);
-    }
-
-    /// C / D 的默认值：全 1.0。与「配置段缺失时行为不变」是同一条约束的两面 ——
-    /// 上一条测反序列化，这条测结构体本身的 `Default`。
-    #[test]
-    fn stateless_engine_defaults_are_all_one() {
-        let real = CacheEngineRealConfig::default();
-        assert_eq!(
-            (
-                real.input_multiplier,
-                real.output_multiplier,
-                real.cache_read_multiplier,
-                real.cache_creation_multiplier
-            ),
-            (1.0, 1.0, 1.0, 1.0)
-        );
-        let nocache = CacheEngineNoCacheConfig::default();
-        assert_eq!(
-            (nocache.input_multiplier, nocache.output_multiplier),
-            (1.0, 1.0)
-        );
-    }
-
-    /// C / D 的非法倍率必须夹回 1.0。
-    ///
-    /// 0 / 负数 / NaN / inf 都要挡：这四个值乘上去会分别得到"永远 0 token"、
-    /// 负 token、NaN（序列化成 null）、inf（序列化成 null），全都会让客户端
-    /// 拿到不可用的 usage。复用 `sanitize_multiplier`，与 go 引擎同一套判据。
-    #[test]
-    fn stateless_engine_sanitize_clamps_illegal_multipliers() {
-        let real = CacheEngineRealConfig {
-            input_multiplier: 0.0,
-            output_multiplier: -2.0,
-            cache_read_multiplier: f64::NAN,
-            cache_creation_multiplier: f64::INFINITY,
-        }
-        .sanitized();
-        assert_eq!(
-            (
-                real.input_multiplier,
-                real.output_multiplier,
-                real.cache_read_multiplier,
-                real.cache_creation_multiplier
-            ),
-            (1.0, 1.0, 1.0, 1.0),
-            "0 / 负 / NaN / inf 一律夹回 1.0"
-        );
-
-        let nocache = CacheEngineNoCacheConfig {
-            input_multiplier: f64::NEG_INFINITY,
-            output_multiplier: 0.0,
-        }
-        .sanitized();
-        assert_eq!((nocache.input_multiplier, nocache.output_multiplier), (1.0, 1.0));
-
-        // 合法值必须原样保留（含小于 1 的缩小倍率 —— 那是合法运营选择）。
-        let ok = CacheEngineRealConfig {
-            input_multiplier: 2.5,
-            output_multiplier: 0.3,
-            cache_read_multiplier: 10.0,
-            cache_creation_multiplier: 0.75,
-        }
-        .sanitized();
-        assert_eq!(
-            (
-                ok.input_multiplier,
-                ok.output_multiplier,
-                ok.cache_read_multiplier,
-                ok.cache_creation_multiplier
-            ),
-            (2.5, 0.3, 10.0, 0.75),
-            "合法值不得被改动"
-        );
-    }
-
-    /// 嵌套结构存在但字段缺失时，逐字段回落默认。
-    #[test]
-    fn partial_cache_engine_config_falls_back_per_field() {
-        let json = r#"{
-            "host":"127.0.0.1","port":8990,"region":"us-east-1",
-            "cacheEngineGo": {"ttlSeconds": 60}
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.cache_engine_go.ttl_seconds, 60, "显式给的值应生效");
-        assert_eq!(cfg.cache_engine_go.max_ratio, 0.85, "缺失字段应回落默认");
-        assert_eq!(cfg.cache_engine_go.max_entries, 131072);
-    }
-
-    /// 非法值一律夹取回默认，避免误配把缓存彻底关掉（0 容量 = 永不命中）。
-    #[test]
-    fn sanitized_clamps_illegal_values() {
-        let bad_rust = CacheEngineRustConfig {
-            capacity: 0,
-            max_ttl_secs: 0,
-            default_ttl_secs: -5,
-            ..Default::default()
-        }
-        .sanitized();
-        assert_eq!(bad_rust.capacity, 4096);
-        assert_eq!(bad_rust.max_ttl_secs, 3600);
-        assert_eq!(bad_rust.default_ttl_secs, 300);
-
-        let bad_go = CacheEngineGoConfig {
-            max_ratio: 5.0,
-            ttl_seconds: 0,
-            max_entries: 1,
-            min_cacheable_tokens: -100,
-            opus_min_cacheable_tokens: -1,
-            input_token_multiplier: -3.0,
-            output_multiplier: f64::INFINITY,
-            cache_read_multiplier: 0.0,
-            cache_creation_multiplier: f64::NAN,
-        }
-        .sanitized();
-        assert_eq!(bad_go.max_ratio, 0.85, "比例 > 1 非法");
-        assert_eq!(bad_go.ttl_seconds, 300);
-        assert_eq!(bad_go.max_entries, 256, "容量有 256 下限");
-        assert_eq!(bad_go.min_cacheable_tokens, 0, "负阈值夹到 0");
-        assert_eq!(bad_go.opus_min_cacheable_tokens, 0);
-        // B 的倍率非法时回落 1.0（不是 None —— B 的字段不是 Option，
-        // 它没有「回退全局」的语义，全局倍率从来不作用在 go 路径上）。
-        assert_eq!(bad_go.input_token_multiplier, 1.0, "负倍率非法");
-        assert_eq!(bad_go.output_multiplier, 1.0, "inf 非法");
-        assert_eq!(bad_go.cache_read_multiplier, 1.0, "0 倍率非法");
-        assert_eq!(bad_go.cache_creation_multiplier, 1.0, "NaN 非法");
-    }
-
-    /// 命中率旋钮的合法区间是 [0.5, 0.99]，对齐 Go admin 端点的校验。
-    /// 两个端点值都必须被保留；越界（含 1.0）一律回落默认。
-    #[test]
-    fn ratio_range_matches_go_admin_validation() {
-        let at = |r: f64| {
-            CacheEngineGoConfig {
-                max_ratio: r,
-                ..CacheEngineGoConfig::default()
-            }
-            .sanitized()
-            .max_ratio
-        };
-        assert_eq!(at(0.5), 0.5, "下界应保留");
-        assert_eq!(at(0.99), 0.99, "上界应保留");
-        assert_eq!(at(0.7), 0.7);
-        // 1.0 意味着整个 prompt 都可命中、永无未缓存尾部 —— Go 也拒绝
-        assert_eq!(at(1.0), 0.85, "1.0 越界应回落默认");
-        assert_eq!(at(0.49), 0.85);
-        assert_eq!(at(0.0), 0.85);
-        assert_eq!(at(-1.0), 0.85);
-    }
-
-    /// go 引擎专属倍率：默认 1.0（不缩放），非法值回落。
-    #[test]
-    fn go_engine_multipliers_default_and_sanitize() {
-        let d = CacheEngineGoConfig::default();
-        assert_eq!(d.input_token_multiplier, 1.0);
-        assert_eq!(d.cache_read_multiplier, 1.0);
-
-        let ok = CacheEngineGoConfig {
-            input_token_multiplier: 2.5,
-            cache_read_multiplier: 0.3,
-            ..CacheEngineGoConfig::default()
-        }
-        .sanitized();
-        assert_eq!(ok.input_token_multiplier, 2.5, "合法倍率原样保留");
-        assert_eq!(ok.cache_read_multiplier, 0.3, "允许 < 1 缩小");
-
-        // Go 校验 `> 0`；NaN / inf 会污染整条下发口径，一并挡掉
-        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let c = CacheEngineGoConfig {
-                input_token_multiplier: bad,
-                cache_read_multiplier: bad,
-                ..CacheEngineGoConfig::default()
-            }
-            .sanitized();
-            assert_eq!(c.input_token_multiplier, 1.0, "非法值 {bad} 应回落");
-            assert_eq!(c.cache_read_multiplier, 1.0, "非法值 {bad} 应回落");
-        }
-    }
-
-    /// 合法值必须原样保留（`sanitized()` 不能顺手改动正常配置）。
-    #[test]
-    fn sanitized_preserves_legal_values() {
-        let c = CacheEngineGoConfig {
-            max_ratio: 0.5,
-            ttl_seconds: 1800,
-            max_entries: 4096,
-            min_cacheable_tokens: 2048,
-            opus_min_cacheable_tokens: 4096,
-            input_token_multiplier: 1.5,
-            output_multiplier: 2.5,
-            cache_read_multiplier: 2.0,
-            cache_creation_multiplier: 0.5,
-        };
-        let s = c.sanitized();
-        assert_eq!(s.output_multiplier, 2.5, "合法 output 倍率不得被改动");
-        // 幂等：再夹一次不应变化
-        assert_eq!(s.sanitized().max_ratio, s.max_ratio);
-        assert_eq!(s.sanitized().max_entries, s.max_entries);
-        assert_eq!(s.max_ratio, 0.5);
-        assert_eq!(s.ttl_seconds, 1800);
-        assert_eq!(s.max_entries, 4096);
-        assert_eq!(s.min_cacheable_tokens, 2048);
-        assert_eq!(s.opus_min_cacheable_tokens, 4096);
-        assert_eq!(s.input_token_multiplier, 1.5);
-        assert_eq!(s.cache_read_multiplier, 2.0);
-        assert_eq!(s.cache_creation_multiplier, 0.5);
-    }
-}
-
-#[cfg(test)]
-mod upstream_failover_config_tests {
-    use super::{Config, UpstreamFailoverConfig};
-
-    /// 老 config.json（无该段）反序列化后必须整段取默认值，且默认启用。
-    #[test]
-    fn defaults_for_existing_configs() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-        assert!(config.upstream_failover.enabled);
-        assert!(config.upstream_failover.throttle_failover);
-        assert_eq!(config.upstream_failover.throttle_cooldown_secs, 60);
-        assert!(!config.upstream_failover.quota_patterns.is_empty());
-        assert!(!config.upstream_failover.suspended_patterns.is_empty());
-    }
-
-    /// 匹配是大小写不敏感的子串匹配，中英文都要能命中。
-    #[test]
-    fn pattern_matching_is_case_insensitive_substring() {
-        let cfg = UpstreamFailoverConfig::default();
-        assert!(cfg.matches_quota(
-            r#"{"error":{"message":"Your Credit Balance Is Too Low to access the API."}}"#
-        ));
-        assert!(cfg.matches_quota(r#"{"message":"当前分组余额不足，请联系管理员"}"#));
-        assert!(cfg.matches_suspended(
-            r#"{"error":{"message":"Your account has been disabled."}}"#
-        ));
-        // 普通错误不得误命中
-        assert!(!cfg.matches_quota(r#"{"message":"model not found"}"#));
-        assert!(!cfg.matches_suspended(r#"{"message":"streaming is disabled for this model"}"#));
-    }
-
-    /// 空 pattern（含纯空白）必须被跳过：空串 `contains` 恒真，会把一切错误
-    /// 都判成命中，等于把所有 4xx 的凭据全部禁用。
-    #[test]
-    fn blank_patterns_never_match() {
-        let cfg = UpstreamFailoverConfig {
-            quota_patterns: vec!["".to_string(), "   ".to_string()],
-            ..UpstreamFailoverConfig::default()
-        };
-        assert!(!cfg.matches_quota(r#"{"message":"anything"}"#));
-    }
-
-    /// 总开关关闭后所有检测恒 false（完全回退旧行为）。
-    #[test]
-    fn disabled_flag_turns_everything_off() {
-        let cfg = UpstreamFailoverConfig {
-            enabled: false,
-            ..UpstreamFailoverConfig::default()
-        };
-        assert!(!cfg.matches_quota("credit balance is too low"));
-        assert!(!cfg.matches_suspended("account has been disabled"));
-        assert!(!cfg.throttle_failover_enabled());
-    }
-
-    /// 用户自定义规则覆盖默认列表后按自定义生效。
-    #[test]
-    fn custom_patterns_replace_defaults() {
-        let config: Config = serde_json::from_str(
-            r#"{"upstreamFailover":{"quotaPatterns":["my custom broke message"],"throttleCooldownSecs":120}}"#,
-        )
-        .unwrap();
-        let cfg = &config.upstream_failover;
-        assert!(cfg.matches_quota("MY CUSTOM BROKE MESSAGE with details"));
-        // 默认规则已被替换，不再命中
-        assert!(!cfg.matches_quota("credit balance is too low"));
-        assert_eq!(cfg.throttle_cooldown_secs, 120);
-        // 未提供的字段仍取默认
-        assert!(cfg.enabled);
-        assert!(!cfg.suspended_patterns.is_empty());
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::Config;
+
+    #[test]
+    fn upstream_deadlines_default_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 15);
+        assert_eq!(config.upstream_read_timeout_secs, 120);
+        assert_eq!(Config::default().upstream_connect_timeout_secs, 15);
+        assert_eq!(Config::default().upstream_read_timeout_secs, 120);
+    }
+
+    /// The default keeps the previously hardcoded deadline, so existing
+    /// deployments behave exactly as before this became configurable.
+    #[test]
+    fn upstream_total_timeout_defaults_to_previous_hardcoded_value() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 720);
+        assert_eq!(Config::default().upstream_total_timeout_secs, 720);
+    }
+
+    #[test]
+    fn upstream_deadlines_accept_explicit_values() {
+        let config: Config = serde_json::from_str(
+            r#"{"upstreamConnectTimeoutSecs":7,"upstreamReadTimeoutSecs":45}"#,
+        )
+        .unwrap();
+        assert_eq!(config.upstream_connect_timeout_secs, 7);
+        assert_eq!(config.upstream_read_timeout_secs, 45);
+    }
+
+    #[test]
+    fn upstream_total_timeout_accepts_explicit_value() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":1800}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 1800);
+    }
+
+    /// 0 is a meaningful setting, not a missing one: it turns the overall
+    /// deadline off for deployments that would rather let long answers finish.
+    #[test]
+    fn upstream_total_timeout_accepts_zero_to_disable() {
+        let config: Config = serde_json::from_str(r#"{"upstreamTotalTimeoutSecs":0}"#).unwrap();
+        assert_eq!(config.upstream_total_timeout_secs, 0);
+    }
 
     #[test]
     fn model_cache_ttl_defaults_for_existing_configs() {
@@ -1584,6 +731,14 @@ mod tests {
     }
 
     #[test]
+    fn quota_reset_recovery_defaults_to_disabled() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(!config.quota_reset_recovery_enabled);
+        let config: Config = serde_json::from_str(r#"{"quotaResetRecoveryEnabled":true}"#).unwrap();
+        assert!(config.quota_reset_recovery_enabled);
+    }
+
+    #[test]
     fn account_rpm_limit_defaults_for_existing_configs() {
         let config: Config = serde_json::from_str("{}").unwrap();
         assert!(!config.account_rpm_limit_enabled);
@@ -1592,6 +747,19 @@ mod tests {
         let default = Config::default();
         assert!(!default.account_rpm_limit_enabled);
         assert_eq!(default.account_rpm_limit, 60);
+    }
+
+    #[test]
+    fn model_api_429_retry_defaults_to_enabled_for_existing_configs() {
+        let config: Config = serde_json::from_str("{}").unwrap();
+        assert!(config.model_api_429_retry_enabled);
+        assert!(Config::default().model_api_429_retry_enabled);
+    }
+
+    #[test]
+    fn model_api_429_retry_accepts_explicitly_disabled() {
+        let config: Config = serde_json::from_str(r#"{"modelApi429RetryEnabled":false}"#).unwrap();
+        assert!(!config.model_api_429_retry_enabled);
     }
 
     #[test]
@@ -1607,4 +775,3 @@ mod tests {
         assert_eq!(config.account_rpm_limit, 120);
     }
 }
-

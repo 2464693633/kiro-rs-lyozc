@@ -1,14 +1,16 @@
-import { useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import {
   Dialog,
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogDescription,
   DialogFooter,
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { RegionSelect } from '@/components/region-select'
 import {
   Select,
   SelectTrigger,
@@ -20,15 +22,21 @@ import { useAddCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
 import { GroupMultiSelect } from '@/components/group-select'
+import {
+  CredentialMetadataEditor,
+  metadataDefaults,
+} from '@/components/credential-metadata-field'
+import type { CredentialMetadata, CredentialMetadataSchema } from '@/types/api'
 
 interface AddCredentialDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
+  metadataSchema?: CredentialMetadataSchema
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp' | 'upstream'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
-export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
+function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
   const [kiroApiKey, setKiroApiKey] = useState('')
   const [authMethod, setAuthMethod] = useState<AuthMethod>('social')
@@ -46,12 +54,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
-  const [upstreamBaseUrl, setUpstreamBaseUrl] = useState('')
-  const [upstreamApiKey, setUpstreamApiKey] = useState('')
+  const [metadata, setMetadata] = useState<CredentialMetadata>({
+    type: 'normal',
+    saleStatus: 'not_for_sale',
+  })
 
   const groupOptions = useGroupOptions()
 
   const { mutate, isPending } = useAddCredential()
+
+  useEffect(() => {
+    if (open) {
+      setMetadata((current) => ({ ...metadataDefaults(metadataSchema), ...current }))
+    }
+  }, [open, metadataSchema])
 
   const resetForm = () => {
     setRefreshToken('')
@@ -71,28 +87,17 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
-    setUpstreamBaseUrl('')
-    setUpstreamApiKey('')
+    setMetadata(metadataDefaults(metadataSchema))
   }
 
   const isApiKey = authMethod === 'api_key'
   const isExternalIdp = authMethod === 'external_idp'
-  const isUpstream = authMethod === 'upstream'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
 
     // 验证必填字段
-    if (isUpstream) {
-      if (!upstreamBaseUrl.trim()) {
-        toast.error('请输入上游 API Base URL')
-        return
-      }
-      if (!upstreamApiKey.trim()) {
-        toast.error('请输入上游 API Key')
-        return
-      }
-    } else if (isApiKey) {
+    if (isApiKey) {
       if (!kiroApiKey.trim()) {
         toast.error('请输入 Kiro API Key')
         return
@@ -118,12 +123,12 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       {
         authMethod,
         provider: isExternalIdp ? 'AzureAD' : undefined,
-        refreshToken: isApiKey || isUpstream ? undefined : refreshToken.trim(),
+        refreshToken: isApiKey ? undefined : refreshToken.trim(),
         kiroApiKey: isApiKey ? kiroApiKey.trim() : undefined,
         authRegion: authRegion.trim() || undefined,
         apiRegion: apiRegion.trim() || undefined,
-        clientId: isApiKey || isUpstream ? undefined : clientId.trim() || undefined,
-        clientSecret: isApiKey || isExternalIdp || isUpstream ? undefined : clientSecret.trim() || undefined,
+        clientId: isApiKey ? undefined : clientId.trim() || undefined,
+        clientSecret: isApiKey || isExternalIdp ? undefined : clientSecret.trim() || undefined,
         tokenEndpoint: isExternalIdp ? tokenEndpoint.trim() || undefined : undefined,
         issuerUrl: isExternalIdp ? issuerUrl.trim() || undefined : undefined,
         scopes: isExternalIdp ? scopes.trim() || undefined : undefined,
@@ -134,8 +139,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
-        upstreamBaseUrl: isUpstream ? upstreamBaseUrl.trim() : undefined,
-        upstreamApiKey: isUpstream ? upstreamApiKey.trim() : undefined,
+        metadata,
       },
       {
         onSuccess: (data) => {
@@ -155,9 +159,35 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
       <DialogContent className="sm:max-w-lg max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>添加凭据</DialogTitle>
+          <DialogDescription>
+            添加 OAuth、企业 SSO 或 API Key 凭据，并配置分组、Metadata 与代理。
+          </DialogDescription>
         </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1">
+        <form
+          onSubmit={handleSubmit}
+          className="flex flex-col min-h-0 flex-1"
+          autoComplete="off"
+          autoCapitalize="off"
+          autoCorrect="off"
+          spellCheck="false"
+        >
+          {/* 阻止浏览器与密码管理器自动填充账号密码 */}
+          <input
+            type="text"
+            name="prevent_autofill_user"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="off"
+          />
+          <input
+            type="password"
+            name="prevent_autofill_pwd"
+            style={{ display: 'none' }}
+            tabIndex={-1}
+            autoComplete="new-password"
+          />
+
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
             {/* 认证方式 */}
             <div className="space-y-2">
@@ -177,7 +207,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   <SelectItem value="idc">IdC/Builder-ID/IAM</SelectItem>
                   <SelectItem value="external_idp">企业 SSO (Microsoft Entra / Azure AD)</SelectItem>
                   <SelectItem value="api_key">API Key</SelectItem>
-                  <SelectItem value="upstream">上游 API（Anthropic 兼容）</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -195,49 +224,15 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={kiroApiKey}
                   onChange={(e) => setKiroApiKey(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
 
-            {/* 上游 API 配置 */}
-            {isUpstream && (
-              <>
-                <div className="space-y-2">
-                  <label htmlFor="upstreamBaseUrl" className="text-sm font-medium">
-                    Base URL <span className="text-red-500">*</span>
-                  </label>
-                  <Input
-                    id="upstreamBaseUrl"
-                    placeholder="https://api.anthropic.com"
-                    value={upstreamBaseUrl}
-                    onChange={(e) => setUpstreamBaseUrl(e.target.value)}
-                    disabled={isPending}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    上游 Anthropic 兼容 API 的地址，请求将转发到 {'{baseUrl}'}/v1/messages
-                  </p>
-                </div>
-                <div className="space-y-2">
-                  <label htmlFor="upstreamApiKey" className="text-sm font-medium">
-                    API Key <span className="text-red-500">*</span>
-                  </label>
-                  <Input
-                    id="upstreamApiKey"
-                    type="password"
-                    placeholder="sk-ant-xxxxxxxx"
-                    value={upstreamApiKey}
-                    onChange={(e) => setUpstreamApiKey(e.target.value)}
-                    disabled={isPending}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    作为 x-api-key 头发送到上游
-                  </p>
-                </div>
-              </>
-            )}
-
             {/* Refresh Token (OAuth 模式) */}
-            {!isApiKey && !isUpstream && (
+            {!isApiKey && (
               <div className="space-y-2">
                 <label htmlFor="refreshToken" className="text-sm font-medium">
                   Refresh Token <span className="text-red-500">*</span>
@@ -249,6 +244,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={refreshToken}
                   onChange={(e) => setRefreshToken(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
             )}
@@ -256,28 +254,32 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
             {/* Region 配置 */}
             <div className="space-y-2">
               <label className="text-sm font-medium">Region 配置</label>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <Input
-                    id="authRegion"
-                    placeholder="Auth Region"
+              <div className="space-y-2">
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    Auth Region（Token 刷新）
+                  </span>
+                  <RegionSelect
                     value={authRegion}
-                    onChange={(e) => setAuthRegion(e.target.value)}
+                    onChange={setAuthRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
-                <div>
-                  <Input
-                    id="apiRegion"
-                    placeholder="API Region"
+                <div className="space-y-1">
+                  <span className="text-xs text-muted-foreground">
+                    API Region（API 请求）
+                  </span>
+                  <RegionSelect
                     value={apiRegion}
-                    onChange={(e) => setApiRegion(e.target.value)}
+                    onChange={setApiRegion}
+                    allowInherit
                     disabled={isPending}
                   />
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">
-                均可留空使用全局配置。Auth Region 用于 Token 刷新，API Region 用于 API 请求
+                选「跟随全局配置」即沿用 config.json 的 region；预设里没有的区域可直接手输
               </p>
             </div>
 
@@ -294,6 +296,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -307,6 +312,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientSecret}
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
+                    autoComplete="new-password"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -325,6 +333,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={clientId}
                     onChange={(e) => setClientId(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -337,6 +348,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={tokenEndpoint}
                     onChange={(e) => setTokenEndpoint(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                   <p className="text-xs text-muted-foreground">
                     仅允许 *.microsoftonline.com / .us / .cn 主机（https）
@@ -352,6 +366,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={issuerUrl}
                     onChange={(e) => setIssuerUrl(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
                 <div className="space-y-2">
@@ -364,6 +381,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     value={scopes}
                     onChange={(e) => setScopes(e.target.value)}
                     disabled={isPending}
+                    autoComplete="off"
+                    data-lpignore="true"
+                    data-1p-ignore="true"
                   />
                 </div>
               </>
@@ -380,6 +400,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={machineId}
                 onChange={(e) => setMachineId(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选，64 位十六进制字符串，留空使用配置中字段, 否则由刷新Token自动派生
@@ -397,6 +420,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={endpoint}
                 onChange={(e) => setEndpoint(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
@@ -428,11 +454,21 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={sourceChannel}
                 onChange={(e) => setSourceChannel(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <p className="text-xs text-muted-foreground">
                 可选。纯备注，标记账号来源/渠道，便于追踪
               </p>
             </div>
+
+            <CredentialMetadataEditor
+              schema={metadataSchema}
+              value={metadata}
+              onChange={setMetadata}
+              disabled={isPending}
+            />
 
             {/* 代理配置 */}
             <div className="space-y-2">
@@ -443,6 +479,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 value={proxyUrl}
                 onChange={(e) => setProxyUrl(e.target.value)}
                 disabled={isPending}
+                autoComplete="off"
+                data-lpignore="true"
+                data-1p-ignore="true"
               />
               <div className="grid grid-cols-2 gap-2">
                 <Input
@@ -451,6 +490,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={proxyUsername}
                   onChange={(e) => setProxyUsername(e.target.value)}
                   disabled={isPending}
+                  autoComplete="off"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
                 <Input
                   id="proxyPassword"
@@ -459,6 +501,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                   value={proxyPassword}
                   onChange={(e) => setProxyPassword(e.target.value)}
                   disabled={isPending}
+                  autoComplete="new-password"
+                  data-lpignore="true"
+                  data-1p-ignore="true"
                 />
               </div>
               <p className="text-xs text-muted-foreground">
@@ -485,3 +530,8 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     </Dialog>
   )
 }
+
+export const AddCredentialDialog = memo(function AddCredentialDialog(props: AddCredentialDialogProps) {
+  if (!props.open) return null
+  return <AddCredentialDialogInner {...props} />
+})

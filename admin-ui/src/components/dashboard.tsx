@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useDeferredValue, useCallback, useMemo } from "react";
 import {
   RefreshCw,
   LogOut,
@@ -12,6 +12,7 @@ import {
   Trash2,
   RotateCcw,
   CheckCircle2,
+  CheckSquare,
   Globe,
   LogIn,
   Key,
@@ -58,6 +59,7 @@ import { storage, type CredentialView } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { PageHeader } from "@/components/console/page-header";
 import { Input } from "@/components/ui/input";
 import {
   Dialog,
@@ -75,7 +77,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { CredentialCard } from "@/components/credential-card";
+import { CredentialCard, profileShortId } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
 import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
@@ -134,13 +136,20 @@ import {
   updateAdminKey,
 } from "@/api/credentials";
 import {
+  cn,
   extractErrorMessage,
   parseError,
   generateApiKey,
-  formatNumber,
   overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse, CredentialStatusItem } from "@/types/api";
+import { StatusStrip } from "@/components/console/status-strip";
+import { BulkBar } from "@/components/console/bulk-bar";
+import {
+  countByState,
+  matchesStateFilter,
+  type StateFilter,
+} from "@/components/console/credential-state";
 
 interface DashboardProps {
   onLogout: () => void;
@@ -167,6 +176,59 @@ const TIER_LABELS: Record<Tier, string> = {
 // 每页数量可选项；另有“全部”（pageSize = 0）由下拉单独追加
 const PAGE_SIZE_OPTIONS = [12, 24, 48, 96] as const;
 
+/** 仅供本地开发预览卡片布局，不会随生产构建或任何 API 请求出现。 */
+const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
+  id: -1,
+  priority: 0,
+  disabled: false,
+  failureCount: 0,
+  totalFailureCount: 0,
+  isCurrent: true,
+  expiresAt: null,
+  authMethod: "api_key",
+  hasProfileArn: false,
+  email: "demo.credential@preview.local",
+  subscriptionTitle: "KIRO PRO",
+  maskedApiKey: "ksk_…demo",
+  successCount: 1_284,
+  lastUsedAt: new Date().toISOString(),
+  hasProxy: true,
+  proxyUrl: "http://demo:demo@127.0.0.1:8080",
+  refreshFailureCount: 0,
+  endpoint: "ide",
+  groups: ["开发预览"],
+  sourceChannel: "Demo（不保存）",
+  metadata: {
+    type: {
+      title: "账号类型",
+      description: "账号运营分类，仅用于标记，不参与调度。",
+      value: "normal",
+    },
+    saleStatus: {
+      title: "在售状态",
+      description: "账号运营销售状态，仅用于标记，不参与调度。",
+      value: "for_sale",
+    },
+    salePrice: {
+      title: "销售价格（CNY）",
+      description: "账号销售价格，单位为人民币。",
+      value: 99,
+    },
+  },
+  balance: {
+    id: -1,
+    subscriptionTitle: "KIRO PRO",
+    currentUsage: 186.5,
+    usageLimit: 500,
+    remaining: 313.5,
+    usagePercentage: 37.3,
+    nextResetAt: 1780300800,
+    overageCapable: true,
+    overageEnabled: false,
+  },
+  createdAt: "2026-08-01T10:30:00Z",
+};
+
 // 字段排序：'manual' = 服务端顺序（保留拖拽调优先级）；其余字段选中后拖拽自动禁用
 type SortField =
   | "manual"
@@ -192,55 +254,8 @@ const SORT_LABELS: Record<SortField, string> = {
   id: "ID",
 };
 
-// 按状态隐藏：勾选即隐藏对应状态的凭据。状态含义与卡片徽章一致。
-type StatusKey =
-  | "current"
-  | "enabled"
-  | "disabled"
-  | "throttled"
-  | "quotaExceeded";
-const STATUS_OPTIONS: { value: StatusKey; label: string }[] = [
-  { value: "current", label: "当前优先" },
-  { value: "enabled", label: "已启用" },
-  { value: "disabled", label: "已禁用" },
-  { value: "throttled", label: "冷却中" },
-  { value: "quotaExceeded", label: "已超额" },
-];
-
-/**
- * 判断凭据是否命中某个隐藏状态。
- *
- * `enabled` 指“正常启用且无异常态”（非禁用 / 非冷却 / 非超额）；`current` 与
- * 主状态正交（一个当前优先的凭据同时也可能是 enabled），勾选任一命中即隐藏。
- * 超额判定优先用本地验活/缓存余额，回落到 disabledReason。
- */
-function credentialHasStatus(
-  c: CredentialStatusItem,
-  key: StatusKey,
-  balance: BalanceResponse | undefined,
-): boolean {
-  const quotaByBalance = balance
-    ? balance.remaining <= 0 || balance.usagePercentage >= 100
-    : false;
-  const quotaExceeded =
-    (!c.disabled && quotaByBalance) ||
-    (c.disabled && c.disabledReason === "QuotaExceeded");
-  const throttled = !c.disabled && (c.throttledRemainingSecs ?? 0) > 0;
-  switch (key) {
-    case "current":
-      return c.isCurrent;
-    case "disabled":
-      return c.disabled;
-    case "throttled":
-      return throttled;
-    case "quotaExceeded":
-      return quotaExceeded;
-    case "enabled":
-      return !c.disabled && !throttled && !quotaExceeded;
-    default:
-      return false;
-  }
-}
+// 注：PR #56 的 StatusKey / STATUS_OPTIONS / credentialHasStatus 已随「隐藏状态」
+// 下拉一并移除，改由顶部状态账条（StatusStrip + credential-state.ts）承担同一职责。
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
@@ -328,6 +343,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
   const groupOptions = useGroupOptions();
+  const allCredentials = import.meta.env.DEV
+    ? [DEV_PREVIEW_CREDENTIAL, ...(data?.credentials ?? [])]
+    : (data?.credentials ?? []);
+
+  // 按 profile 分组：上游 prompt cache 按 profile 隔离，同 profile 的账号共享缓存。
+  // 只有一个 profile 时，会话在账号间换号不会丢缓存；多个 profile 才需要关心粘性路由。
+  const profileSummary = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of allCredentials) {
+      if (c.profileArn) counts.set(c.profileArn, (counts.get(c.profileArn) ?? 0) + 1);
+    }
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [allCredentials]);
 
   // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
@@ -335,13 +363,45 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
   // 模糊搜索：按来源渠道（备注）/ 邮箱做大小写不敏感的子串匹配；空串 = 不限
   const [searchQuery, setSearchQuery] = useState("");
-  // 字段排序：'manual' 保留服务端顺序与拖拽调优先级；其余字段按方向排序并禁用拖拽
+  const deferredSearchQuery = useDeferredValue(searchQuery);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // 快捷键支持：按下 '/' 或 'Cmd/Ctrl+K' 聚焦搜索框；'Esc' 快速清空并失焦
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (searchQuery || document.activeElement === searchInputRef.current) {
+          setSearchQuery("");
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+
+      if (
+        e.key === "/" &&
+        !["INPUT", "TEXTAREA", "SELECT"].includes(
+          (e.target as HTMLElement)?.tagName,
+        ) &&
+        !(e.target as HTMLElement)?.isContentEditable
+      ) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [searchQuery]);
+
+  // 字段排序（来自 PR #56）：'manual' 保留服务端顺序与拖拽调优先级；
+  // 其余字段按方向排序并禁用拖拽。console-ui 没有同类能力，纯增量保留。
   const [sortField, setSortField] = useState<SortField>("manual");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
-  // 按状态隐藏（多选）：集合内的状态对应的凭据不显示；空集合 = 不隐藏任何状态
-  const [hiddenStatuses, setHiddenStatuses] = useState<Set<StatusKey>>(
-    new Set(),
-  );
   // 选中排序字段：点已选字段则切换升/降序；换字段时用该字段的直观默认方向
   const applySort = (field: SortField) => {
     if (field === "manual") {
@@ -356,13 +416,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     // 成功次数/最后使用默认降序（大/新在前），其余默认升序
     setSortDir(field === "successCount" || field === "lastUsedAt" ? "desc" : "asc");
   };
-  const toggleStatus = (s: StatusKey) => {
-    setHiddenStatuses((prev) => {
-      const next = new Set(prev);
-      if (next.has(s)) next.delete(s);
-      else next.add(s);
-      return next;
-    });
+  // 状态筛选：由顶部状态账条驱动。'' = 全部
+  //
+  // 默认落在「可用」而非全部：这一屏最常做的事是调排队顺序，而只有可用凭据才真的
+  // 在队列里 —— 混进禁用/超额的行会让拖拽出来的次序与实际调度顺序对不上。
+  // 其余状态的计数仍在账条上，点一下即可切过去。
+  const [stateFilter, setStateFilter] = useState<StateFilter>("healthy");
+  const clearAllFilters = () => {
+    setSearchQuery("");
+    setGroupFilter("");
+    setTierFilter(new Set());
+    setStateFilter("");
   };
   const toggleTier = (t: Tier) => {
     setTierFilter((prev) => {
@@ -374,8 +438,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   // 应用分组 + 分级筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
-  const filteredCredentials = (() => {
-    const all = data?.credentials ?? [];
+  const filteredCredentials = useMemo(() => {
+    const all = allCredentials;
     let out = all;
     if (groupFilter) {
       out =
@@ -388,7 +452,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         tierFilter.has(detectTier(c.balance?.subscriptionTitle)),
       );
     }
-    const q = searchQuery.trim().toLowerCase();
+    const q = deferredSearchQuery.trim().toLowerCase();
     if (q) {
       out = out.filter(
         (c) =>
@@ -396,13 +460,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           (c.email ?? "").toLowerCase().includes(q),
       );
     }
-    // 按状态隐藏：命中任一被勾选状态的凭据不显示
-    if (hiddenStatuses.size > 0) {
-      out = out.filter(
-        (c) =>
-          ![...hiddenStatuses].some((s) =>
-            credentialHasStatus(c, s, balanceMap.get(c.id) || c.balance),
-          ),
+    // 状态筛选：点状态账条某一段时只留该状态的凭据
+    if (stateFilter) {
+      out = out.filter((c) =>
+        matchesStateFilter(c, balanceMap.get(c.id) ?? c.balance, stateFilter),
       );
     }
     // 字段排序（'manual' 保留服务端顺序）。复制后排序，不修改筛选中间数组。
@@ -439,12 +500,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       });
     }
     return out;
-  })();
+  }, [allCredentials, groupFilter, tierFilter, deferredSearchQuery, stateFilter, balanceMap, sortField, sortDir]);
 
-  // 切换分组 / 分级筛选 / 搜索 / 状态隐藏 / 排序时复位到第 1 页，避免空页
+  // 各状态计数（状态账条用）。基于全量凭据而非当前筛选结果 ——
+  // 账条是导航器，点进某一段之后其余段的数字不该跟着变。
+  const stateCounts = countByState(
+    data?.credentials ?? [],
+    (c) => balanceMap.get(c.id) ?? c.balance,
+  );
+
+  // 切换分组 / 分级筛选 / 搜索 / 状态 / 排序时复位到第 1 页，避免空页
   useEffect(() => {
     setCurrentPage(1);
-  }, [groupFilter, tierFilter, searchQuery, hiddenStatuses, sortField, sortDir]);
+  }, [groupFilter, tierFilter, deferredSearchQuery, stateFilter, sortField, sortDir]);
 
   // pageSize === 0 表示“全部”：单页容纳全部已筛选凭据
   const effectivePageSize =
@@ -505,15 +573,48 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const newOrder = arrayMove(ids, oldIndex, newIndex);
     setPageOrder(newOrder);
 
-    // 按新视觉顺序赋连续递增的 priority（全局位置 = startIndex + 页内索引）。
-    // 不依赖原有 priority 值域：即使原值全为默认 0 / 相同，也能保证数字更新、排序持久化；
-    // 跨页也不冲突（第 1 页 0..11、第 2 页 12..23）。只对实际变化的卡片发请求。
-    const prevPriority = new Map(
-      currentCredentials.map((c) => [c.id, c.priority]),
+    // 把新的视觉顺序写回 priority。
+    //
+    // 关键约束：当前页只是全量凭据的一个**子集**（筛选 + 分页），页内索引不等于全局
+    // 位置。若直接按页内索引赋值（早先的 startIndex + i 就是这么做的），筛选态下拖拽
+    // 会写出与被隐藏凭据撞号的 priority —— 例如筛「可用」时隐藏了一个 priority=2 的
+    // 禁用凭据，可见项又被赋了 2，同值再按 id 排序，最终顺序就不是拖出来的那个。
+    //
+    // 正确做法：只在这批被拖动的凭据**原本占据的那些全局槽位**里重新分配。
+    // 隐藏的凭据一格都不动，可见的几个在自己已有的槽位之间换位。
+    const queue = [...(data?.credentials ?? [])].sort(
+      (a, b) => a.priority - b.priority || a.id - b.id,
     );
-    const updates = newOrder
-      .map((id, i) => ({ id, priority: startIndex + i }))
-      .filter((u) => prevPriority.get(u.id) !== u.priority);
+    const dragged = new Set(ids);
+    // 这些凭据当前占用的 priority 值，升序 —— 即可供重排的槽位
+    const slots = queue
+      .filter((c) => dragged.has(c.id))
+      .map((c) => c.priority)
+      .sort((a, b) => a - b);
+
+    const prevPriority = new Map(queue.map((c) => [c.id, c.priority]));
+
+    // 槽位必须严格递增才能表达顺序。全新账号池的 priority 默认全是 0，此时
+    // slots = [0,0,0…]，换位换不出任何差别（同值只能靠 id 排），拖了像没反应。
+    // 这种情况下退回到"给整个队列重编号"：按当前全局顺序（已含本次拖动）写 0..n-1。
+    // 写入量大一些，但只会在第一次拖拽时发生 —— 编号完成后各值互不相同，
+    // 后续拖拽都走上面那条只动几格的轻路径。
+    const slotsUsable = slots.every((v, i) => i === 0 || v > slots[i - 1]);
+
+    let updates: { id: number; priority: number }[];
+    if (slotsUsable) {
+      updates = newOrder.map((id, i) => ({ id, priority: slots[i] }));
+    } else {
+      // 用新顺序替换掉队列中这批凭据的相对次序，其余保持原位
+      const reordered = [...newOrder];
+      const globalOrder = queue.map((c) =>
+        dragged.has(c.id) ? reordered.shift()! : c.id,
+      );
+      updates = globalOrder.map((id, i) => ({ id, priority: i }));
+    }
+    updates = updates.filter(
+      (u) => u.priority != null && prevPriority.get(u.id) !== u.priority,
+    );
     if (updates.length === 0) return;
 
     Promise.all(
@@ -522,7 +623,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       ),
     )
       .then(() => {
-        toast.success("优先级顺序已更新");
+        toast.success("顺序已保存 · 越靠上越先被使用");
         queryClient.invalidateQueries({ queryKey: ["credentials"] });
       })
       .catch((err) => {
@@ -532,7 +633,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const gridRef = useRef<HTMLElement | null>(null);
-  const rectSelection = useRectSelect({
+  useRectSelect({
     containerRef: gridRef,
     itemSelector: "[data-credential-id]",
     idAttribute: "credential-id",
@@ -636,12 +737,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   }, [error]);
 
-  const toggleSelect = (id: number) => {
-    const next = new Set(selectedIds);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setSelectedIds(next);
-  };
+  const toggleSelect = useCallback((id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
   const deselectAll = () => setSelectedIds(new Set());
 
   /** 全选 / 取消全选当前页凭据。已选中其他页的不会被清除。 */
@@ -836,9 +939,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("当前页没有可查询的凭据");
       return;
     }
-    const ids = currentCredentials
-      .filter((c) => !c.disabled && !c.isUpstream)
-      .map((c) => c.id);
+    const ids = currentCredentials.filter((c) => !c.disabled).map((c) => c.id);
     if (ids.length === 0) {
       toast.error("当前页没有可查询的启用凭据");
       return;
@@ -890,7 +991,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     else toast.warning(`查询完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
-  const handleRefreshBalance = async (id: number) => {
+  const handleRefreshBalance = useCallback(async (id: number) => {
     setLoadingBalanceIds((prev) => {
       const n = new Set(prev);
       n.add(id);
@@ -913,7 +1014,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
     }
-  };
+  }, []);
 
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
@@ -1394,72 +1495,44 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         ref={gridRef}
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
-        {/* 大标题 */}
-        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
-              凭据管理
-            </h1>
-            <p className="mt-1 text-sm text-muted-foreground">
-              管理 Kiro 的所有访问凭据、负载均衡与登录信息
-            </p>
-          </div>
-        </div>
+        <PageHeader
+          breadcrumbs={[{ label: '控制台' }, { label: '凭据管理', active: true }]}
+          icon={<Server className="h-4 w-4" />}
+          title="凭据管理"
+          description="上游提供商凭据集群、配额健康度与多通道负载均衡管理。"
+          badge={
+            profileSummary.length > 0 && (
+              <Badge
+                variant="outline"
+                className={`font-mono text-xs ${
+                  profileSummary.length === 1
+                    ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                    : "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                }`}
+                title={
+                  profileSummary.length === 1
+                    ? `全部账号同属 profile ${profileShortId(profileSummary[0][0])}\n上游 prompt cache 按 profile 隔离：这些账号互相共享缓存，会话在它们之间换号不会丢缓存`
+                    : `账号分布在 ${profileSummary.length} 个 profile：\n${profileSummary
+                        .map(([arn, n]) => `  ${profileShortId(arn)} × ${n}`)
+                        .join("\n")}\n跨 profile 换号会丢上游 prompt cache，此时会话粘性路由才真正起作用`
+                }
+              >
+                {profileSummary.length === 1
+                  ? `同一 profile · 缓存共享`
+                  : `${profileSummary.length} 个 profile`}
+              </Badge>
+            )
+          }
+        />
 
-        {/* 统计卡片 */}
-        <div className="mb-5 grid grid-cols-3 gap-2 sm:mb-6 sm:gap-4">
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                凭据总数
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.total)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                可用凭据
-              </div>
-              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
-                {formatNumber(data?.available)}
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-3 sm:p-5">
-              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
-                {loadBalancingData?.mode === "balanced" ? "调度模式" : "当前优先"}
-              </div>
-              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
-                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-                  {loadBalancingData?.mode === "balanced"
-                    ? "均衡负载"
-                    : `#${data?.currentId || "-"}`}
-                </span>
-                {loadBalancingData?.mode === "balanced" ? (
-                  <Badge variant="secondary">动态选择</Badge>
-                ) : (
-                  data?.currentId && <Badge variant="success">当前优先</Badge>
-                )}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+        {/* 状态标签条已下移到紧贴列表处（见下方 <StatusStrip />）：
+            它是列表的表头兼筛选器，放在标题下方会与它筛选的列表隔开两行工具栏。 */}
 
         {/* 工具栏 */}
         <div className="mb-5 flex flex-col gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
-            {data?.credentials && data.credentials.length > 0 && (
-              <Badge variant="secondary">
-                {groupFilter || tierFilter.size > 0
-                  ? `${filteredCredentials.length} / ${data.credentials.length}`
-                  : data.credentials.length}
-              </Badge>
-            )}
+            {/* 原先这里有「凭据列表」标题 + 总数徽章：标题与页面大标题「凭据管理」
+                说的是同一件事，总数已由状态标签条的「全部 N」给出，两者都删掉。 */}
             {groupFilter && (
               <Badge variant="outline" className="gap-1">
                 筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
@@ -1490,47 +1563,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </Badge>
             )}
 
-            {currentCredentials.length > 0 && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="px-2 sm:px-3"
-                onClick={toggleSelectCurrentPage}
-                title={currentPageAllSelected ? "取消选择当前页" : "全选当前页"}
-              >
-                {currentPageAllSelected ? "取消全选" : "全选当前页"}
-              </Button>
-            )}
-            {filteredCredentials.length > currentCredentials.length && (
-              <Button
-                size="sm"
-                variant="ghost"
-                className="px-2 sm:px-3"
-                onClick={toggleSelectAllFiltered}
-                title={
-                  allFilteredSelected
-                    ? "取消选择全部筛选结果"
-                    : `全选所有 ${filteredCredentials.length} 个筛选结果`
-                }
-              >
-                {allFilteredSelected
-                  ? "取消全选所有页"
-                  : `全选所有页 (${filteredCredentials.length})`}
-              </Button>
-            )}
-            {selectedIds.size > 0 && (
-              <>
-                <Badge variant="default">已选 {selectedIds.size}</Badge>
-                <Button
-                  onClick={deselectAll}
-                  size="sm"
-                  variant="ghost"
-                  className="px-2 sm:px-3"
-                >
-                  取消选择
-                </Button>
-              </>
-            )}
+            {/* 全选按钮已移到「添加凭据」左侧，与其它操作同处一行 */}
+            {/* 已选计数与取消选择由吸底批量栏承担；状态筛选态由下方标签条的
+                激活样式直接体现，不再额外挂一枚可关闭徽章。 */}
             {verifying && !verifyDialogOpen && (
               <Button
                 onClick={() => setVerifyDialogOpen(true)}
@@ -1553,25 +1588,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex w-full flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
             {/* 筛选器 — 左（移动端两列网格并排，桌面端内联） */}
             <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 200px */}
-              <div className="relative col-span-2 sm:col-span-1 sm:w-[200px]">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              {/* 模糊搜索：来源渠道（备注）/ 邮箱；移动端整行、桌面端 210px */}
+              <div className="relative col-span-2 sm:col-span-1 sm:w-[210px]">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground opacity-80" />
                 <input
+                  ref={searchInputRef}
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索来源渠道 / 备注 / 邮箱"
-                  className="h-8 w-full rounded-full border border-border bg-card/60 pl-5 pr-5 text-base backdrop-blur placeholder:text-muted-foreground/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-sm"
+                  className="h-8 w-full rounded-md border border-border bg-card pl-8 pr-7 text-xs placeholder:text-muted-foreground/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring sm:text-xs"
                 />
-                {searchQuery && (
+                {searchQuery ? (
                   <button
                     type="button"
                     onClick={() => setSearchQuery("")}
-                    className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                    title="清除搜索"
+                    className="absolute right-2 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                    title="清除搜索 (Esc)"
                   >
-                    <X className="h-3.5 w-3.5" />
+                    <X className="h-3 w-3" />
                   </button>
+                ) : (
+                  <kbd className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 hidden select-none rounded border border-border bg-muted/60 px-1 font-mono text-[10px] font-medium text-muted-foreground opacity-70 sm:inline-block">
+                    /
+                  </kbd>
                 )}
               </div>
               <Select
@@ -1579,7 +1619,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 onValueChange={(v) => setGroupFilter(v === "all" ? "" : v)}
               >
                 <SelectTrigger
-                  className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
+                  className="h-8 w-full rounded-md border-border bg-card px-2.5 text-xs sm:w-[130px]"
                   title="按分组筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
@@ -1601,7 +1641,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按订阅分级筛选凭据（可多选，依据最近一次余额缓存）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-md border border-border bg-card px-2.5 text-xs hover:bg-accent sm:w-[120px]"
                   >
                     <span className="truncate">
                       {tierFilter.size > 0
@@ -1649,7 +1689,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <button
                     type="button"
                     title="按字段排序凭据（再次点击同一字段切换升 / 降序）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[136px]"
+                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-md border border-border bg-card px-2.5 text-xs hover:bg-accent sm:w-[124px]"
                   >
                     <span className="inline-flex min-w-0 items-center gap-1">
                       {sortField === "manual" ? (
@@ -1701,69 +1741,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 </DropdownMenuContent>
               </DropdownMenu>
 
-              {/* 按状态隐藏（多选） */}
-              <DropdownMenu modal={false}>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    type="button"
-                    title="隐藏指定状态的凭据（可多选）"
-                    className="inline-flex h-8 w-full items-center justify-between gap-1 rounded-full border border-border bg-card/60 px-3 text-sm backdrop-blur hover:bg-accent sm:w-[128px]"
-                  >
-                    <span className="inline-flex min-w-0 items-center gap-1">
-                      <EyeOff
-                        className={`h-3.5 w-3.5 shrink-0 ${hiddenStatuses.size > 0 ? "text-primary" : "opacity-70"}`}
-                      />
-                      <span className="truncate">
-                        {hiddenStatuses.size > 0
-                          ? `隐藏 ·${hiddenStatuses.size}`
-                          : "隐藏状态"}
-                      </span>
-                    </span>
-                    <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-60" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="min-w-[10rem]">
-                  <DropdownMenuLabel>隐藏这些状态</DropdownMenuLabel>
-                  {STATUS_OPTIONS.map((s) => (
-                    <DropdownMenuItem
-                      key={s.value}
-                      onSelect={(e) => {
-                        e.preventDefault();
-                        toggleStatus(s.value);
-                      }}
-                      className="gap-2"
-                    >
-                      <Checkbox checked={hiddenStatuses.has(s.value)} />
-                      <span>{s.label}</span>
-                    </DropdownMenuItem>
-                  ))}
-                  {hiddenStatuses.size > 0 && (
-                    <>
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          setHiddenStatuses(new Set());
-                        }}
-                        className="text-muted-foreground"
-                      >
-                        显示全部状态
-                      </DropdownMenuItem>
-                    </>
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
-
-              {/* 卡片 / 列表 视图切换（iOS 分段控件） */}
-              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
+              {/* 卡片 / 列表 视图切换 */}
+              <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-md border border-border bg-secondary/50 p-0.5 sm:col-span-1">
                 <button
                   type="button"
                   onClick={() => changeViewMode("card")}
                   aria-pressed={viewMode === "card"}
                   title="卡片视图"
-                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                  className={`inline-flex h-7 items-center gap-1 rounded px-2 text-xs font-medium transition-colors ${
                     viewMode === "card"
-                      ? "bg-background text-foreground shadow-apple-sm"
+                      ? "bg-card text-foreground shadow-xs border border-border/80"
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
@@ -1775,9 +1762,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={() => changeViewMode("list")}
                   aria-pressed={viewMode === "list"}
                   title="列表视图"
-                  className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                  className={`inline-flex h-7 items-center gap-1 rounded px-2 text-xs font-medium transition-colors ${
                     viewMode === "list"
-                      ? "bg-background text-foreground shadow-apple-sm"
+                      ? "bg-card text-foreground shadow-xs border border-border/80"
                       : "text-muted-foreground hover:text-foreground"
                   }`}
                 >
@@ -1789,43 +1776,54 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
 
             {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
             <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center">
-              {selectedIds.size > 0 && (
-                <>
-                  <Button
-                    onClick={() => setBatchEditDialogOpen(true)}
-                    size="sm"
-                    variant="outline"
-                    title="批量编辑分组 / 来源渠道"
-                  >
-                    <Tags className="h-3.5 w-3.5" />
-                    分组/来源
-                  </Button>
-                  <Button
-                    onClick={handleBatchDelete}
-                    size="sm"
-                    variant="destructive"
-                    className="w-full sm:w-auto"
-                    disabled={selectedIds.size === 0 || batchDeleting}
-                  >
-                    {batchDeleting ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 className="h-3.5 w-3.5" />
-                    )}
-                    删除
-                  </Button>
-                  <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
-                </>
+              {/* 选中后的批量操作已移到吸底批量栏，见本页底部 BulkBar */}
+
+              {/* 全选：紧邻主操作，因为"先选再批量操作"是同一条动线 */}
+              {currentCredentials.length > 0 && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={toggleSelectCurrentPage}
+                  title={
+                    currentPageAllSelected
+                      ? "取消选择当前页"
+                      : `全选当前页 ${currentCredentials.length} 个`
+                  }
+                >
+                  <CheckSquare className="h-3.5 w-3.5" />
+                  {currentPageAllSelected ? "取消全选" : "全选当前页"}
+                </Button>
+              )}
+              {filteredCredentials.length > currentCredentials.length && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                  onClick={toggleSelectAllFiltered}
+                  title={
+                    allFilteredSelected
+                      ? "取消选择全部筛选结果"
+                      : `全选所有 ${filteredCredentials.length} 个筛选结果`
+                  }
+                >
+                  <CheckSquare className="h-3.5 w-3.5" />
+                  {allFilteredSelected
+                    ? "取消全选所有页"
+                    : `全选所有页 (${filteredCredentials.length})`}
+                </Button>
               )}
 
-              {/* 主操作 */}
+              {/* 刷新按钮 */}
               <Button
-                onClick={() => setAddDialogOpen(true)}
                 size="sm"
+                variant="outline"
+                onClick={handleRefresh}
+                title="刷新凭据状态与余额"
                 className="w-full sm:w-auto"
               >
-                <Plus className="h-3.5 w-3.5" />
-                添加凭据
+                <RefreshCw className="h-3.5 w-3.5" />
+                刷新
               </Button>
 
               {/* 导入 / 登录折叠菜单 */}
@@ -1898,36 +1896,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuLabel>批量操作</DropdownMenuLabel>
-                  <DropdownMenuItem
-                    onSelect={handleBatchVerify}
-                    disabled={selectedIds.size === 0}
-                  >
-                    <CheckCircle2 />
-                    批量验活
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      handleBatchForceRefresh();
-                    }}
-                    disabled={selectedIds.size === 0 || batchRefreshing}
-                  >
-                    <RefreshCw
-                      className={batchRefreshing ? "animate-spin" : ""}
-                    />
-                    {batchRefreshing
-                      ? `刷新中… ${batchRefreshProgress.current}/${batchRefreshProgress.total}`
-                      : "刷新 Token"}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={handleBatchResetFailure}
-                    disabled={selectedIds.size === 0}
-                  >
-                    <RotateCcw />
-                    恢复异常
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
+                  {/*
+                    批量操作（验活 / 刷新 Token / 恢复异常 / 分组 / 删除）已移到吸底
+                    批量栏：它们只在选中若干行后才有意义，藏在二级菜单里等于选完还要
+                    再点两层，而且操作入口会随页面滚动离开视野。
+                    这里只保留与选中无关的全局维护动作。
+                  */}
                   <DropdownMenuLabel>维护</DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={(e) => {
@@ -2027,12 +2001,99 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
+
+              {/* 主操作：添加凭据 */}
+              <Button
+                onClick={() => setAddDialogOpen(true)}
+                size="sm"
+                className="w-full sm:w-auto"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                添加凭据
+              </Button>
             </div>
           </div>
         </div>
 
+        {/*
+          状态标签条 —— 列表的表头兼筛选器。
+          位置刻意压到工具栏之下、列表之上：上面那些控件是"缩小候选集"（搜索 / 分组 /
+          分级），这里回答的是"看哪一批结果"，所以它属于列表本身，紧贴着列表才说得清
+          改哪个数字影响哪片区域。激活项的底边线用该状态的色轨色，与下方行的左侧色轨
+          是同一个信号。
+        */}
+        {(data?.credentials.length ?? 0) > 0 && (
+          <StatusStrip
+            className="mb-2"
+            segments={[
+              {
+                label: "全部",
+                count: stateCounts.total,
+                tone: "none",
+                active: stateFilter === "",
+                onClick: () => setStateFilter(""),
+                hint: "不按状态筛选",
+              },
+              {
+                label: "可用",
+                count: stateCounts.healthy,
+                tone: "ok",
+                active: stateFilter === "healthy",
+                onClick: () => setStateFilter("healthy"),
+                hint: "正常参与调度的凭据 —— 排队顺序只在这批里生效",
+              },
+              {
+                label: "冷却",
+                count: stateCounts.throttled,
+                tone: "cool",
+                active: stateFilter === "throttled",
+                onClick: () => setStateFilter("throttled"),
+                hint: "账号级限流冷却中，到期自动恢复",
+              },
+              {
+                label: "超额",
+                count: stateCounts.quota,
+                tone: "warn",
+                active: stateFilter === "quota",
+                onClick: () => setStateFilter("quota"),
+                hint: "额度用尽，需等重置或开启超额",
+              },
+              {
+                label: "禁用",
+                count: stateCounts.dead,
+                tone: "dead",
+                active: stateFilter === "dead",
+                onClick: () => setStateFilter("dead"),
+                hint: "鉴权失败 / 封禁 / 手动禁用，需要处置",
+              },
+            ]}
+            trailing={
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs text-muted-foreground">
+                <span
+                  className={cn(
+                    "h-2 w-2 rounded-sm",
+                    loadBalancingData?.mode === "balanced"
+                      ? "bg-emerald-500 animate-pulse"
+                      : "bg-blue-500"
+                  )}
+                />
+                {loadBalancingData?.mode === "balanced" ? (
+                  <span className="font-medium text-foreground/90">均衡负载模式</span>
+                ) : (
+                  <span>
+                    优先调度{" "}
+                    <span className="console-num font-mono font-bold text-foreground">
+                      #{data?.currentId || "-"}
+                    </span>
+                  </span>
+                )}
+              </div>
+            }
+          />
+        )}
+
         {/* 列表 */}
-        {data?.credentials.length === 0 ? (
+        {allCredentials.length === 0 ? (
           <Card>
             <CardContent className="py-16 text-center">
               <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
@@ -2041,6 +2102,32 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <p className="text-sm text-muted-foreground">
                 暂无凭据，点击右上角“添加凭据”开始
               </p>
+            </CardContent>
+          </Card>
+        ) : filteredCredentials.length === 0 ? (
+          /*
+            有凭据但当前筛选下一个都不剩。默认筛「可用」时这很容易发生（全池超额
+            或全被禁用），此时说"暂无凭据，去添加"是假话 —— 凭据在，只是都不健康。
+            空态要说清真实情况，并给出下一步。
+          */
+          <Card>
+            <CardContent className="py-16 text-center">
+              <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-secondary text-muted-foreground">
+                <Server className="h-5 w-5" />
+              </div>
+              <p className="text-sm text-muted-foreground">
+                {stateFilter === "healthy" && stateCounts.total > 0
+                  ? `${stateCounts.total} 个凭据里没有可用的：冷却 ${stateCounts.throttled} · 超额 ${stateCounts.quota} · 禁用 ${stateCounts.dead}`
+                  : "当前筛选条件下没有凭据"}
+              </p>
+              <Button
+                size="sm"
+                variant="outline"
+                className="mt-3"
+                onClick={clearAllFilters}
+              >
+                显示全部凭据
+              </Button>
             </CardContent>
           </Card>
         ) : (
@@ -2061,8 +2148,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <div
                   className={
                     viewMode === "list"
-                      ? "flex select-none flex-col gap-2"
-                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3"
+                      ? "flex select-none flex-col gap-2 [transform:translateZ(0)]"
+                      : "grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3 [transform:translateZ(0)]"
                   }
                 >
                   {currentCredentials.map((credential) => (
@@ -2071,35 +2158,116 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       credential={credential}
                       view={viewMode}
                       selected={selectedIds.has(credential.id)}
-                      onToggleSelect={() => toggleSelect(credential.id)}
+                      onToggleSelect={toggleSelect}
                       balance={
                         balanceMap.get(credential.id) ||
                         credential.balance ||
                         null
                       }
                       loadingBalance={loadingBalanceIds.has(credential.id)}
-                      onRefreshBalance={() =>
-                        handleRefreshBalance(credential.id)
-                      }
+                      onRefreshBalance={handleRefreshBalance}
                       failureStats={failureStatsMap?.[String(credential.id)]}
-                      dragDisabled={dragDisabled}
+                      dragDisabled={dragDisabled || credential.id === DEV_PREVIEW_CREDENTIAL.id}
+                      preview={credential.id === DEV_PREVIEW_CREDENTIAL.id}
+                      metadataSchema={data?.metadataSchema}
                     />
                   ))}
                 </div>
               </SortableContext>
             </DndContext>
 
+            {/* 隔开与 BulkBar 吸底栏的垂直安全间距 */}
+            <div className="h-6 sm:h-8" />
+
+            {/*
+              吸底批量栏：选中 > 0 时滑入，操作直接摆在表面。
+              解决的是"选完还要去顶部菜单里翻"以及"滚到列表中段后操作入口已滚出视野"。
+            */}
+            <BulkBar
+              count={selectedIds.size}
+              onClear={deselectAll}
+              noun="个凭据"
+            >
+              <Button
+                onClick={() => setBatchEditDialogOpen(true)}
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                title="批量编辑分组 / 来源渠道"
+              >
+                <Tags className="h-3.5 w-3.5" />
+                分组/来源
+              </Button>
+              <Button
+                onClick={handleBatchVerify}
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                disabled={verifying}
+              >
+                <CheckCircle2
+                  className={`h-3.5 w-3.5 ${verifying ? "animate-spin" : ""}`}
+                />
+                {verifying
+                  ? `验活中 ${verifyProgress.current}/${verifyProgress.total}`
+                  : "验活"}
+              </Button>
+              <Button
+                onClick={handleBatchForceRefresh}
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                disabled={batchRefreshing}
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 ${batchRefreshing ? "animate-spin" : ""}`}
+                />
+                {batchRefreshing
+                  ? `刷新中 ${batchRefreshProgress.current}/${batchRefreshProgress.total}`
+                  : "刷新 Token"}
+              </Button>
+              <Button
+                onClick={handleBatchResetFailure}
+                size="sm"
+                variant="ghost"
+                className="h-7 px-2.5 text-xs gap-1 rounded hover:bg-accent"
+                title="清零失败计数并恢复禁用状态"
+              >
+                <RotateCcw className="h-3.5 w-3.5" />
+                恢复异常
+              </Button>
+              <Button
+                onClick={handleBatchDelete}
+                size="sm"
+                variant="ghost"
+                disabled={batchDeleting}
+                className="h-7 px-2.5 text-xs gap-1 rounded text-destructive hover:bg-destructive/10 hover:text-destructive"
+              >
+                {batchDeleting ? (
+                  <>
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    删除中 {deleteProgress.current}/{deleteProgress.total}
+                  </>
+                ) : (
+                  <>
+                    <Trash2 className="h-3.5 w-3.5" />
+                    删除
+                  </>
+                )}
+              </Button>
+            </BulkBar>
+
             {filteredCredentials.length > 0 && (
               <div className="mt-6 flex flex-col items-center justify-center gap-3 sm:mt-8 sm:flex-row sm:gap-5">
                 {/* 每页数量 */}
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
                   <span className="whitespace-nowrap">每页</span>
                   <Select
                     value={String(pageSize)}
                     onValueChange={(v) => changePageSize(Number(v))}
                   >
                     <SelectTrigger
-                      className="h-8 w-[92px] rounded-full border-border bg-card/60 px-3 backdrop-blur"
+                      className="h-7 w-[80px] rounded-md border-border bg-card px-2 text-xs"
                       title="设置每页显示数量"
                     >
                       <SelectValue />
@@ -2155,188 +2323,201 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         )}
       </main>
 
-      {/* 弹窗们 */}
-      <AddCredentialDialog
-        open={addDialogOpen}
-        onOpenChange={setAddDialogOpen}
-      />
-      <BatchImportDialog
-        open={batchImportDialogOpen}
-        onOpenChange={setBatchImportDialogOpen}
-      />
-      <BatchEditCredentialDialog
-        open={batchEditDialogOpen}
-        onOpenChange={setBatchEditDialogOpen}
-        credentials={(data?.credentials ?? []).filter((c) =>
-          selectedIds.has(c.id),
-        )}
-        groupOptions={groupOptions}
-        onDone={deselectAll}
-      />
-      <SocialLoginDialog
-        open={socialLoginDialogOpen}
-        onOpenChange={setSocialLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <IdcLoginDialog
-        open={idcLoginDialogOpen}
-        onOpenChange={setIdcLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <IdcLoginDialog
-        mode="enterprise"
-        open={enterpriseLoginDialogOpen}
-        onOpenChange={setEnterpriseLoginDialogOpen}
-        onSuccess={() =>
-          queryClient.invalidateQueries({ queryKey: ["credentials"] })
-        }
-      />
-      <KamImportDialog
-        open={kamImportDialogOpen}
-        onOpenChange={setKamImportDialogOpen}
-      />
-      <ProxyPoolDialog
-        open={proxyPoolDialogOpen}
-        onOpenChange={setProxyPoolDialogOpen}
-      />
-      <ImageUpdateDialog
-        open={imageUpdateDialogOpen}
-        onOpenChange={setImageUpdateDialogOpen}
-      />
-
-      {/* 修改登录API密钥对话框（adminApiKey —— 管理面板登录密钥） */}
-      <Dialog
-        open={adminKeyDialogOpen}
-        onOpenChange={(open) => {
-          if (!updatingAdminKey) setAdminKeyDialogOpen(open);
-        }}
-      >
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Key className="h-4 w-4" />
-              修改登录API密钥
-            </DialogTitle>
-            <DialogDescription>
-              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
-            </DialogDescription>
-          </DialogHeader>
-          <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
-            <div className="relative">
-              <Input
-                type={showAdminKeyPlain ? "text" : "password"}
-                placeholder="输入或生成新的登录API密钥"
-                value={newAdminKey}
-                onChange={(e) => setNewAdminKey(e.target.value)}
-                disabled={updatingAdminKey}
-                autoFocus
-                className="pr-20 font-mono text-[13px]"
-              />
-              <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={() => setShowAdminKeyPlain((v) => !v)}
-                  disabled={updatingAdminKey}
-                  title={showAdminKeyPlain ? "隐藏" : "显示"}
-                >
-                  {showAdminKeyPlain ? (
-                    <EyeOff className="h-3.5 w-3.5" />
-                  ) : (
-                    <Eye className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-                <Button
-                  type="button"
-                  size="icon"
-                  variant="ghost"
-                  className="pointer-events-auto h-7 w-7"
-                  onClick={async () => {
-                    if (!newAdminKey.trim()) {
-                      toast.error("请先输入或生成 Key 再复制");
-                      return;
-                    }
-                    try {
-                      await navigator.clipboard.writeText(newAdminKey);
-                      toast.success("已复制到剪贴板");
-                    } catch {
-                      toast.error("复制失败，请手动选择文本");
-                    }
-                  }}
-                  disabled={updatingAdminKey}
-                  title="复制"
-                >
-                  <Copy className="h-3.5 w-3.5" />
-                </Button>
-              </div>
-            </div>
-            <div className="flex items-center justify-between gap-2">
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                onClick={() => {
-                  const key = generateApiKey("sk-admin-");
-                  setNewAdminKey(key);
-                  setShowAdminKeyPlain(true);
-                }}
-                disabled={updatingAdminKey}
-              >
-                <Wand2 className="h-3.5 w-3.5" />
-                生成随机 Key
-              </Button>
-              <p className="text-[11px] text-muted-foreground">
-                建议生成后立即复制保存，确认更新后即生效。
-              </p>
-            </div>
-            <DialogFooter>
-              <Button
-                type="button"
-                variant="outline"
-                onClick={() => setAdminKeyDialogOpen(false)}
-                disabled={updatingAdminKey}
-              >
-                取消
-              </Button>
-              <Button
-                type="submit"
-                disabled={updatingAdminKey || !newAdminKey.trim()}
-              >
-                {updatingAdminKey ? "更新中…" : "确认更新"}
-              </Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
-
-      {rectSelection.active && rectSelection.rect && (
-        <div
-          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
-          style={{
-            left: rectSelection.rect.left,
-            top: rectSelection.rect.top,
-            width: rectSelection.rect.width,
-            height: rectSelection.rect.height,
-          }}
+      {/* 弹窗们：按需挂载，彻底消除后台 hooks 与 DOM 驻留开销 */}
+      {addDialogOpen && (
+        <AddCredentialDialog
+          open={addDialogOpen}
+          onOpenChange={setAddDialogOpen}
+          metadataSchema={data?.metadataSchema}
         />
       )}
-      <BatchVerifyDialog
-        open={verifyDialogOpen}
-        onOpenChange={setVerifyDialogOpen}
-        verifying={verifying}
-        progress={verifyProgress}
-        results={verifyResults}
-        onCancel={handleCancelVerify}
-        onDelete={handleDeleteVerifyResult}
-        onDeleteFailed={handleDeleteFailedVerify}
-        deleting={verifyDeleting}
-      />
+      {batchImportDialogOpen && (
+        <BatchImportDialog
+          open={batchImportDialogOpen}
+          onOpenChange={setBatchImportDialogOpen}
+        />
+      )}
+      {batchEditDialogOpen && (
+        <BatchEditCredentialDialog
+          open={batchEditDialogOpen}
+          onOpenChange={setBatchEditDialogOpen}
+          credentials={(data?.credentials ?? []).filter((c) =>
+            selectedIds.has(c.id),
+          )}
+          groupOptions={groupOptions}
+          metadataSchema={data?.metadataSchema}
+          onDone={deselectAll}
+        />
+      )}
+      {socialLoginDialogOpen && (
+        <SocialLoginDialog
+          open={socialLoginDialogOpen}
+          onOpenChange={setSocialLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {idcLoginDialogOpen && (
+        <IdcLoginDialog
+          open={idcLoginDialogOpen}
+          onOpenChange={setIdcLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {enterpriseLoginDialogOpen && (
+        <IdcLoginDialog
+          mode="enterprise"
+          open={enterpriseLoginDialogOpen}
+          onOpenChange={setEnterpriseLoginDialogOpen}
+          onSuccess={() =>
+            queryClient.invalidateQueries({ queryKey: ["credentials"] })
+          }
+        />
+      )}
+      {kamImportDialogOpen && (
+        <KamImportDialog
+          open={kamImportDialogOpen}
+          onOpenChange={setKamImportDialogOpen}
+        />
+      )}
+      {proxyPoolDialogOpen && (
+        <ProxyPoolDialog
+          open={proxyPoolDialogOpen}
+          onOpenChange={setProxyPoolDialogOpen}
+        />
+      )}
+      {imageUpdateDialogOpen && (
+        <ImageUpdateDialog
+          open={imageUpdateDialogOpen}
+          onOpenChange={setImageUpdateDialogOpen}
+        />
+      )}
+
+      {/* 修改登录API密钥对话框（adminApiKey —— 管理面板登录密钥） */}
+      {adminKeyDialogOpen && (
+        <Dialog
+          open={adminKeyDialogOpen}
+          onOpenChange={(open) => {
+            if (!updatingAdminKey) setAdminKeyDialogOpen(open);
+          }}
+        >
+          <DialogContent className="sm:max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="flex items-center gap-2">
+                <Key className="h-4 w-4" />
+                修改登录API密钥
+              </DialogTitle>
+              <DialogDescription>
+                用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
+              </DialogDescription>
+            </DialogHeader>
+            <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
+              <div className="relative">
+                <Input
+                  type={showAdminKeyPlain ? "text" : "password"}
+                  placeholder="输入或生成新的登录API密钥"
+                  value={newAdminKey}
+                  onChange={(e) => setNewAdminKey(e.target.value)}
+                  disabled={updatingAdminKey}
+                  autoFocus
+                  className="pr-20 font-mono text-[13px]"
+                />
+                <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center pr-1.5">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="pointer-events-auto h-7 w-7"
+                    onClick={() => setShowAdminKeyPlain((v) => !v)}
+                    disabled={updatingAdminKey}
+                    title={showAdminKeyPlain ? "隐藏" : "显示"}
+                  >
+                    {showAdminKeyPlain ? (
+                      <EyeOff className="h-3.5 w-3.5" />
+                    ) : (
+                      <Eye className="h-3.5 w-3.5" />
+                    )}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="ghost"
+                    className="pointer-events-auto h-7 w-7"
+                    onClick={async () => {
+                      if (!newAdminKey.trim()) {
+                        toast.error("请先输入或生成 Key 再复制");
+                        return;
+                      }
+                      try {
+                        await navigator.clipboard.writeText(newAdminKey);
+                        toast.success("已复制到剪贴板");
+                      } catch {
+                        toast.error("复制失败，请手动选择文本");
+                      }
+                    }}
+                    disabled={updatingAdminKey}
+                    title="复制"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                  </Button>
+                </div>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => {
+                    const key = generateApiKey("sk-admin-");
+                    setNewAdminKey(key);
+                    setShowAdminKeyPlain(true);
+                  }}
+                  disabled={updatingAdminKey}
+                >
+                  <Wand2 className="h-3.5 w-3.5" />
+                  生成随机 Key
+                </Button>
+                <p className="text-[11px] text-muted-foreground">
+                  建议生成后立即复制保存，确认更新后即生效。
+                </p>
+              </div>
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setAdminKeyDialogOpen(false)}
+                  disabled={updatingAdminKey}
+                >
+                  取消
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={updatingAdminKey || !newAdminKey.trim()}
+                >
+                  {updatingAdminKey ? "更新中…" : "确认更新"}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {verifyDialogOpen && (
+        <BatchVerifyDialog
+          open={verifyDialogOpen}
+          onOpenChange={setVerifyDialogOpen}
+          verifying={verifying}
+          progress={verifyProgress}
+          results={verifyResults}
+          onCancel={handleCancelVerify}
+          onDelete={handleDeleteVerifyResult}
+          onDeleteFailed={handleDeleteFailedVerify}
+          deleting={verifyDeleting}
+        />
+      )}
     </div>
   );
 }

@@ -18,7 +18,6 @@
 
 mod error;
 mod handlers;
-pub mod key_feed;
 mod middleware;
 pub mod proxy_pool;
 mod router;

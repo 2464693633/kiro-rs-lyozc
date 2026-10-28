@@ -1,6 +1,7 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
+use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
 // ============ 凭据状态 ============
@@ -15,6 +16,8 @@ pub struct CredentialsStatusResponse {
     pub available: usize,
     /// 优先级模式下的当前优先凭据 ID；均衡模式固定为 0
     pub current_id: u64,
+    /// 凭据 metadata 的 JSON Schema
+    pub metadata_schema: serde_json::Value,
     /// 各凭据状态列表
     pub credentials: Vec<CredentialStatusItem>,
 }
@@ -44,6 +47,10 @@ pub struct CredentialStatusItem {
     pub provider: Option<String>,
     /// 是否有 Profile ARN
     pub has_profile_arn: bool,
+    /// Profile ARN 原文。上游 prompt cache 按 profile 隔离，同 profile 的账号互相共享缓存；
+    /// 前端据此分组，用于判断「换号是否会丢缓存」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
     /// refreshToken 的 SHA-256 哈希（仅 OAuth 凭据，用于前端去重）
     pub refresh_token_hash: Option<String>,
     /// kiroApiKey 的 SHA-256 哈希（仅 API Key 凭据，用于前端去重）
@@ -52,6 +59,9 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 最近一次查询到的 Kiro 订阅等级；不依赖当前余额缓存。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -74,36 +84,34 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 凭据 metadata；key 为字段名，值包含显示文案、描述和实际值。
+    pub metadata: std::collections::BTreeMap<String, CredentialMetadataDetail>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
     /// 余额缓存的更新时间（Unix 秒，仅在 balance 有值时返回）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance_updated_at: Option<f64>,
-    /// 是否为上游 Anthropic API 凭据
-    #[serde(default)]
-    pub is_upstream: bool,
-    /// 上游 API Base URL（仅上游凭据有值）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upstream_base_url: Option<String>,
-    /// 近 7 天 token 用量统计（有历史数据时才存在）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_usage_7d: Option<CredentialTokenUsage>,
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 }
 
-/// 凭据近 7 天 token 用量统计
-#[derive(Debug, Clone, Serialize, Default)]
+/// 单个凭据 metadata 字段的可展示信息。
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CredentialTokenUsage {
-    pub calls: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub credits: f64,
+pub struct CredentialMetadataDetail {
+    /// 面向用户的字段名称；没有 Schema 定义时回退为 key。
+    pub title: String,
+    /// Schema 字段描述；未定义扩展字段时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 凭据上的实际值；旧凭据缺失时可回退到 Schema 默认值。
+    pub value: serde_json::Value,
+    /// Schema oneOf 中匹配 value 的显示名（如 "normal" → "正常号"）。
+    /// 未命中 oneOf 或该字段无 oneOf 时为 None，前端可回退显示 value。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_label: Option<String>,
 }
 
 // ============ 操作请求 ============
@@ -218,13 +226,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
-
-    /// 上游 Anthropic API Base URL（上游凭据必填）
+    /// 凭据扩展元数据（默认账号类型为 normal）
     #[serde(default)]
-    pub upstream_base_url: Option<String>,
-    /// 上游 Anthropic API Key（上游凭据必填）
-    #[serde(default)]
-    pub upstream_api_key: Option<String>,
+    pub metadata: CredentialMetadata,
 }
 
 fn default_auth_method() -> String {
@@ -263,12 +267,9 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
-    /// 上游 Anthropic API Base URL（仅上游凭据可修改）
+    /// 凭据扩展元数据（None 表示不修改）
     #[serde(default)]
-    pub upstream_base_url: Option<String>,
-    /// 上游 Anthropic API Key；空字符串表示清除（仅上游凭据可修改）
-    #[serde(default)]
-    pub upstream_api_key: Option<String>,
+    pub metadata: Option<CredentialMetadata>,
 }
 
 /// 添加凭据成功响应
@@ -426,9 +427,6 @@ pub struct AvailableModelItem {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelTestRequest {
-    /// 要测试的具体凭据；为空时兼容旧行为，按账号池选择。
-    #[serde(default)]
-    pub credential_id: Option<u64>,
     pub model_id: String,
 }
 
@@ -444,47 +442,6 @@ pub struct ModelTestResponse {
     pub credit_usage: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_unit: Option<String>,
-}
-
-/// 上游 Anthropic API 凭据健康检查请求。
-///
-/// `credentialIds` 省略或为空时检查所有上游凭据；传入后只检查指定 ID。
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpstreamHealthCheckRequest {
-    #[serde(default)]
-    pub credential_ids: Option<Vec<u64>>,
-}
-
-/// 单个上游凭据健康检查结果。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpstreamHealthCheckResponse {
-    pub credential_id: u64,
-    /// `/v1/models` 是否返回 2xx。
-    pub success: bool,
-    /// 上游 HTTP 状态码；网络错误或超时导致未收到响应时为空。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<u16>,
-    /// 从发起请求到收到上游响应头的耗时（毫秒）。
-    pub latency_ms: u64,
-    /// 失败原因。不会包含 API key。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// 检查完成时间（RFC3339）。
-    pub checked_at: String,
-}
-
-/// 批量上游凭据健康检查响应。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpstreamHealthCheckBatchResponse {
-    pub results: Vec<UpstreamHealthCheckResponse>,
-    pub total: usize,
-    pub success_count: usize,
-    pub failure_count: usize,
-    /// 本次批量检查完成时间（RFC3339）。单条结果仍保留各自完成时间。
-    pub checked_at: String,
 }
 
 // ============ 一键超额 ============
@@ -539,21 +496,29 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
-/// 账号级风控故障转移配置响应
+/// 上游域名配置（GET 响应 / PUT 请求共用）
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiDomainConfig {
+    /// "amazonaws" 或 "kiro"
+    pub domain: crate::model::config::ApiDomain,
+}
+
+/// 账号级 429 限流故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountThrottleConfigResponse {
-    /// 是否启用账号级 429 故障转移
+    /// 是否在账号级 429 时冷却并切换凭据
     pub failover: bool,
     /// 冷却时长（秒）
     pub cooldown_secs: u64,
 }
 
-/// 更新账号级风控故障转移配置
+/// 更新账号级 429 限流故障转移配置
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetAccountThrottleConfigRequest {
-    /// 是否启用故障转移；缺省表示不修改
+    /// 是否按需切换凭据；缺省表示不修改
     #[serde(default)]
     pub failover: Option<bool>,
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
@@ -561,29 +526,19 @@ pub struct SetAccountThrottleConfigRequest {
     pub cooldown_secs: Option<u64>,
 }
 
-/// 更新上游直通凭据故障转移检测配置。
-///
-/// 所有字段缺省表示不修改；文案列表传空数组 `[]` 表示清空（= 关闭该类检测）。
-/// 响应直接复用 [`crate::model::config::UpstreamFailoverConfig`]（本身即
-/// camelCase Serialize），避免多一份需要手工同步的镜像结构。
+/// 普通模型 API 429 自动重试配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelApiRetryConfigResponse {
+    /// 是否由中转自动重试无需切换凭据的普通 429
+    pub enabled: bool,
+}
+
+/// 更新普通模型 API 429 自动重试配置
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetUpstreamFailoverConfigRequest {
-    /// 总开关；缺省表示不修改
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    /// 欠费/额度用尽检测文案（子串，大小写不敏感）；缺省表示不修改
-    #[serde(default)]
-    pub quota_patterns: Option<Vec<String>>,
-    /// 封禁/停用检测文案；缺省表示不修改
-    #[serde(default)]
-    pub suspended_patterns: Option<Vec<String>>,
-    /// 429 是否冷却切号；缺省表示不修改
-    #[serde(default)]
-    pub throttle_failover: Option<bool>,
-    /// 429 无 Retry-After 时的冷却秒数；缺省表示不修改，1..=86400
-    #[serde(default)]
-    pub throttle_cooldown_secs: Option<u64>,
+pub struct SetModelApiRetryConfigRequest {
+    pub enabled: bool,
 }
 
 /// 单账号 RPM 限流配置响应
@@ -606,6 +561,22 @@ pub struct SetAccountRpmLimitConfigRequest {
     /// 每分钟上限；缺省表示不修改，1..=100000
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// 月度额度重置后自动恢复配置响应。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaResetRecoveryConfigResponse {
+    /// 到 nextResetAt 后确认余额恢复时，是否自动恢复 QuotaExceeded 凭据。
+    pub enabled: bool,
+}
+
+/// 更新月度额度重置后自动恢复配置。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetQuotaResetRecoveryConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 /// 自愈治理配置响应
@@ -670,24 +641,82 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
-// ============ Token 膨胀倍率 ============
-
-/// Token 膨胀倍率配置响应
-#[derive(Debug, Serialize)]
+/// prompt cache 本地计量模拟的运行计数器（进程累计值）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TokenInflationConfigResponse {
-    pub input_multiplier: f64,
-    pub output_multiplier: f64,
-    pub cache_multiplier: f64,
+pub struct CacheMeteringStatsResponse {
+    /// 当前表内条目数（瞬时值）
+    pub entries_len: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub miss_no_entry: u64,
+    pub miss_expired: u64,
+    pub miss_evicted: u64,
+    pub miss_no_breakpoint: u64,
+    pub miss_no_seed: u64,
+    pub evicted_total: u64,
+    pub expired_total: u64,
+    pub tombstone_clears: u64,
 }
 
-/// 设置 Token 膨胀倍率请求
-#[derive(Debug, Deserialize)]
+/// prompt cache 本地计量模拟配置响应。
+///
+/// 除 `enabled` 外均为**只读**：容量、落盘开关、落盘间隔、miss 诊断开关
+/// 启动时固定，改这些等于改 `config.json` + 重启。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SetTokenInflationConfigRequest {
-    pub input_multiplier: f64,
-    pub output_multiplier: f64,
-    pub cache_multiplier: f64,
+pub struct CacheMeteringConfigResponse {
+    /// 计量模拟是否启用
+    pub enabled: bool,
+    /// 生效条目上限
+    pub capacity: usize,
+    /// 是否落盘快照
+    pub persist_enabled: bool,
+    /// 落盘间隔（秒）
+    pub flush_interval_secs: u64,
+    /// miss 归因是否开启
+    pub miss_diagnostics: bool,
+    /// 运行计数器；运行时句柄缺失时为 `null`
+    pub stats: Option<CacheMeteringStatsResponse>,
+}
+
+/// prompt cache 本地计量模拟配置更新请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCacheMeteringConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+/// 会话粘性路由配置 + 运行时统计响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAffinityConfigResponse {
+    pub enabled: bool,
+    pub ttl_secs: u64,
+    /// 进程启动以来粘性命中次数
+    pub hits: u64,
+    /// 进程启动以来粘性未命中次数（首轮 + 绑定不可用；关闭期间不计）
+    pub misses: u64,
+    /// 当前未过期的会话绑定数
+    pub active_bindings: usize,
+}
+
+/// 会话粘性路由配置更新请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionAffinityConfigRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+/// 凭据 metadata schema 配置响应/更新请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialMetadataSchemaConfig {
+    pub schema: serde_json::Value,
 }
 
 // ============ 代理池 ============
@@ -805,6 +834,10 @@ pub struct AssignProxyRequest {
 pub struct GlobalProxyResponse {
     /// 当前全局代理 URL（null 表示未配置）
     pub proxy_url: Option<String>,
+    /// 代理认证用户名
+    pub proxy_username: Option<String>,
+    /// 是否已配置代理认证密码；不回显密码本身。
+    pub proxy_password_set: bool,
 }
 
 /// 设置全局代理请求
@@ -813,6 +846,13 @@ pub struct GlobalProxyResponse {
 pub struct SetGlobalProxyRequest {
     /// 代理 URL，null 表示清除全局代理
     pub proxy_url: Option<String>,
+    /// 代理认证用户名（仅 proxy_url 不为 null 时有效）
+    #[serde(default)]
+    pub proxy_username: Option<String>,
+    /// 代理认证密码（仅 proxy_url 不为 null 时有效）。省略表示保留现有密码，
+    /// 显式 null 表示清除密码。
+    #[serde(default)]
+    pub proxy_password: Option<Option<String>>,
 }
 
 // ============ 在线更新配置 ============
@@ -848,137 +888,6 @@ pub struct SetUpdateConfigRequest {
     pub auto_apply: Option<bool>,
     /// 自动更新触发时间（HH:MM）；不传则保持原值
     pub auto_apply_time: Option<String>,
-}
-
-/// API Key 订阅源配置（响应）。
-///
-/// 与 [`UpdateConfigResponse`] 的 `github_token_set` 同思路：token 只回布尔，
-/// 不回明文，避免管理面板前端持有可直接换号的凭证。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyFeedConfigResponse {
-    /// 是否启用后台轮询
-    pub enabled: bool,
-    /// 订阅源 URL（已剥离 token 查询参数）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// 是否已配置访问令牌（仅布尔，不回明文）
-    pub token_set: bool,
-    /// 令牌的查询参数名（不同源可能叫 token / key / accessKey）
-    pub token_param: String,
-    /// 生效的轮询间隔（秒，已夹到下限）
-    pub interval_secs: u64,
-    /// 导入时是否验活
-    pub verify: bool,
-    /// 导入凭据的优先级
-    pub priority: u32,
-    /// 导入凭据所属分组
-    pub groups: Vec<String>,
-    /// 导入凭据使用的端点名
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// 是否清理本源导入且已被自动禁用的凭据
-    pub reap_disabled: bool,
-    /// 最近一次拉取结果（进程内存，重启后清空）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_pull: Option<KeyFeedPullResult>,
-}
-
-/// 更新 API Key 订阅源配置（请求）。所有字段可选，未传表示保持原值。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetKeyFeedConfigRequest {
-    /// 是否启用后台轮询
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    /// 订阅源 URL。可直接粘贴含 `?token=` 的完整链接，服务端会自动拆分出 token。
-    /// 空字符串表示清除。
-    #[serde(default)]
-    pub url: Option<String>,
-    /// 访问令牌。空字符串表示清除；未传保持原值。
-    #[serde(default)]
-    pub token: Option<String>,
-    /// 令牌的查询参数名（默认 `token`）。空字符串按默认处理。
-    ///
-    /// 与 `url` 同一请求传入时，会先用这个名字去拆 URL 里的令牌。
-    #[serde(default)]
-    pub token_param: Option<String>,
-    /// 轮询间隔（秒），低于下限会被夹取
-    #[serde(default)]
-    pub interval_secs: Option<u64>,
-    /// 导入时是否验活
-    #[serde(default)]
-    pub verify: Option<bool>,
-    /// 导入凭据的优先级
-    #[serde(default)]
-    pub priority: Option<u32>,
-    /// 导入凭据所属分组
-    #[serde(default)]
-    pub groups: Option<Vec<String>>,
-    /// 导入凭据使用的端点名。空字符串表示清除（回退 defaultEndpoint）。
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    /// 是否清理本源导入且已被自动禁用的凭据
-    #[serde(default)]
-    pub reap_disabled: Option<bool>,
-}
-
-/// 一次订阅源拉取的结果汇总。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyFeedPullResult {
-    /// 拉取时间（RFC3339）
-    pub pulled_at: String,
-    /// 是否成功完成拉取（`false` 时看 `error`）
-    pub success: bool,
-    /// 订阅源返回的号位总数
-    pub total: usize,
-    /// 过滤后可导入的候选数
-    pub candidates: usize,
-    /// 本轮新导入（含验活成功）的数量
-    pub imported: usize,
-    /// 命中去重、已在库中的数量
-    pub duplicate: usize,
-    /// 导入失败的数量
-    pub failed: usize,
-    /// 本轮被 reaper 清理的凭据数
-    pub reaped: usize,
-    /// 本轮所有候选号位中最早的保修截止时间（RFC3339）。
-    ///
-    /// 「下一个号什么时候到期」是运维最常问的问题，单独抽出来免得翻明细。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub earliest_warranty_until: Option<String>,
-    /// 订阅源返回的提示文案（如「暂无可用号，正在补货」）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// 失败原因（token 已脱敏）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// 逐条明细（不含密钥）
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<KeyFeedItemResult>,
-}
-
-/// 单条号位的导入结果（不含密钥）。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyFeedItemResult {
-    /// 号位标识，形如 `渠道名#claimId`
-    pub label: String,
-    /// `imported` / `verified` / `duplicate` / `failed`
-    pub status: String,
-    /// 导入成功后的凭据 ID
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub credential_id: Option<u64>,
-    /// AWS 区域
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_region: Option<String>,
-    /// 保修截止时间（RFC3339）。仅展示，不触发自动删除。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub warranty_until: Option<String>,
-    /// 失败原因
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 /// 在线更新操作结果
@@ -1095,14 +1004,16 @@ pub struct ClientKeyItem {
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
     pub total_cache_read_tokens: u64,
+    /// 累计 credit 使用量（用于与上限比较）
+    pub total_credits: f64,
+    /// 积分使用上限（None 表示不限制）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
-    /// 该 Key 使用的缓存模拟引擎
-    #[serde(default)]
-    pub cache_engine: crate::anthropic::cache_engine::CacheEngineKind,
 }
 
 /// 客户端 Key 列表响应
@@ -1122,12 +1033,12 @@ pub struct CreateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
-    /// 该 Key 使用哪套缓存模拟引擎。省略即 `rust`（引擎 A）。
+    /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
-    pub cache_engine: crate::anthropic::cache_engine::CacheEngineKind,
+    pub max_credits: Option<f64>,
 }
 
-/// 创建客户端 Key 响应（创建/轮换后立刻返回新明文）
+/// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateClientKeyResponse {
@@ -1135,147 +1046,6 @@ pub struct CreateClientKeyResponse {
     pub key: String,
     pub name: String,
     pub created_at: String,
-}
-
-/// 查看既有客户端 Key 明文的响应。
-///
-/// 形状与 `CreateClientKeyResponse` 相同，但**刻意不复用**：两者语义不同
-/// （一个是"刚生成的新值"、一个是"回看旧值"），日后其中一方加字段时不应牵连另一方。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClientKeyPlaintextResponse {
-    pub id: u64,
-    pub key: String,
-    pub name: String,
-    pub created_at: String,
-}
-
-// ============ 双缓存模拟引擎 ============
-
-/// 四套引擎的参数（GET/PUT /config/cache-engines 共用同一形状）。
-///
-/// C / D 与 `global` 用 `Option` 而非 `#[serde(default)]`，是为了让**老前端的 PUT
-/// 不产生副作用**：`admin-ui/dist/` 是提交进仓库并由 rust-embed 嵌入的，后端先上线、
-/// 前端未重新构建的窗口期真实存在。此时老弹窗只会 PUT `{rust, go}` —— 若用
-/// `serde(default)`，缺失字段会被填成默认值 1.0 并落盘，把 C / D 的倍率静默重置。
-/// 用 `Option` 则表示"本次不涉及"，处理端保持原值不动。
-///
-/// GET 与 PUT 的响应恒填满四套，故前端可按必填字段声明类型。
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEnginesConfigPayload {
-    pub rust: crate::model::config::CacheEngineRustConfig,
-    pub go: crate::model::config::CacheEngineGoConfig,
-    #[serde(default)]
-    pub real: Option<crate::model::config::CacheEngineRealConfig>,
-    #[serde(default)]
-    pub nocache: Option<crate::model::config::CacheEngineNoCacheConfig>,
-    /// 引擎 A 使用的全局膨胀倍率。
-    ///
-    /// 纳入本 payload 是为了「一个窗口调完四套引擎 + 全局」，与 `/config/token-inflation`
-    /// 是同一份存储的两个入口（不是两份数据）—— 两条路径都走
-    /// `token_manager.set_token_inflation_config`，校验区间同为 [1.0, 100.0]。
-    ///
-    /// `/config/token-inflation` 端点保持可用（供直接调 API 的使用者），
-    /// 但管理面板已把 UI 入口收敛到本 payload，不再提供两个改同一份数据的按钮。
-    #[serde(default)]
-    pub global: Option<GlobalInflationPayload>,
-}
-
-/// 全局膨胀倍率（引擎 A 专用；B / C / D 各有自己那套）。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GlobalInflationPayload {
-    pub input_multiplier: f64,
-    pub output_multiplier: f64,
-    pub cache_multiplier: f64,
-}
-
-/// 各引擎的运行计数器。
-///
-/// 只有 A / B 有计数器：C / D 无缓存状态（无指纹表、无 TTL、无 LRU），
-/// 命中率 / 淘汰 / 过期这些指标对它们不存在，故不设字段而非填零 ——
-/// 填零会让运维以为"有缓存但一直没命中"。
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CacheEnginesStatsResponse {
-    pub rust: crate::anthropic::cache_metering::CacheMeterStats,
-    pub go: crate::anthropic::cache_metering_go::GoCacheStats,
-}
-
-// ============ 费用对比 ============
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelPricingPayload {
-    pub input_per_million: f64,
-    pub output_per_million: f64,
-    pub cache_creation_per_million: f64,
-    pub cache_read_per_million: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingConfigPayload {
-    pub model_prices: std::collections::HashMap<String, ModelPricingPayload>,
-    pub upstream_multipliers: std::collections::HashMap<u64, f64>,
-    pub rust_multiplier: f64,
-    pub go_multiplier: f64,
-    /// 引擎 C / D 的成本调节系数。
-    ///
-    /// `serde(default)` 而非必填：老前端的 PUT 不带这两个字段，若必填会整个请求 400，
-    /// 连它本来想改的模型价格也一起改不了。默认 1.0 = 不调节。
-    #[serde(default = "default_billing_multiplier")]
-    pub real_multiplier: f64,
-    #[serde(default = "default_billing_multiplier")]
-    pub nocache_multiplier: f64,
-}
-
-fn default_billing_multiplier() -> f64 {
-    1.0
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingUsagePoint {
-    pub ts: String,
-    /// 本桶所有引擎的上游真实成本合计。
-    pub upstream_cost: f64,
-    /// 本桶所有引擎的客户端计费合计。
-    pub client_cost: f64,
-    pub calls: u64,
-    /// 逐引擎明细。同一条目内的两个成本**来自同一批请求**，故可直接相除得加价倍数。
-    pub engines: Vec<EngineBillingPayload>,
-}
-
-/// 单个引擎的「上游真实 ↔ 客户端计费」配对。
-///
-/// v1 的形状是 `upstream_cost` + `rust_cost` + `go_cost` 三个平铺字段：上游只有一个
-/// 槽、模拟值按引擎分列，混合流量下 `upstream_cost` 是全部引擎之和，与任一引擎的
-/// 客户端计费不可比；引擎 C / D 更是无处安放。改为逐引擎配对后，每个引擎自带上游
-/// 口径，一一对应。
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineBillingPayload {
-    /// 引擎标识（`rust` / `go` / `real` / `nocache`；历史数据可能有其它值）。
-    pub engine: String,
-    /// 该引擎流量的上游真实成本。
-    pub upstream_cost: f64,
-    /// 该引擎流量的客户端计费成本。
-    pub client_cost: f64,
-    pub upstream_tokens: u64,
-    pub client_tokens: u64,
-    pub calls: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BillingComparisonResponse {
-    pub points: Vec<BillingUsagePoint>,
-    pub upstream_cost: f64,
-    pub client_cost: f64,
-    pub calls: u64,
-    pub engines: Vec<EngineBillingPayload>,
 }
 
 /// 更新客户端 Key 元数据
@@ -1286,9 +1056,15 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
-    /// 省略 = 不改动该 Key 的引擎选择。
+}
+
+/// 设置客户端 Key 的积分使用上限
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetClientKeyMaxCreditsRequest {
+    /// 积分上限；null 或省略表示取消限制
     #[serde(default)]
-    pub cache_engine: Option<crate::anthropic::cache_engine::CacheEngineKind>,
+    pub max_credits: Option<f64>,
 }
 
 // ============ IdC 设备授权登录 ============
@@ -1581,4 +1357,45 @@ pub struct DeleteGroupQuery {
     /// 强制删除：即使仍有引用也删；同时级联清理凭据 / Key 的引用
     #[serde(default)]
     pub force: bool,
+}
+
+// ============ 自定义模型 ============
+
+/// 自定义模型配置响应（列表）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelsConfigResponse {
+    pub models: Vec<CustomModelItem>,
+}
+
+/// 单条自定义模型条目（与 `config::CustomModel` 字段一一对应，仅用于 Admin API 序列化）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelItem {
+    /// 客户端请求时使用的模型名（别名）。匹配大小写不敏感。
+    pub id: String,
+    /// 映射到的 Kiro 后端模型 ID（实际下发给上游）。
+    pub backend_id: String,
+    /// `/v1/models` 展示名（可选，缺省用 `id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    /// 上下文窗口大小（可选，缺省 200000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i32>,
+    /// 单次响应最大 token 数（可选，缺省 64000）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<i32>,
+    /// 是否支持原生 reasoning（可选，缺省 false）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_reasoning: Option<bool>,
+    /// `/v1/models` 的 `owned_by` 字段（可选，缺省 "custom"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+}
+
+/// 批量设置自定义模型请求（整体替换 `config.json` 中的 `customModels` 数组）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCustomModelsRequest {
+    pub models: Vec<CustomModelItem>,
 }

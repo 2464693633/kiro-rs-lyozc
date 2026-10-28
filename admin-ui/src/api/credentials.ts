@@ -10,6 +10,7 @@ import type {
   SetPriorityRequest,
   AddCredentialRequest,
   AddCredentialResponse,
+  CustomModelItem,
   UpdateCredentialRequest,
   UpdateRefreshTokenRequest,
   ProxyPoolEntry,
@@ -36,6 +37,7 @@ import type {
   UpdateCheckInfo,
   GitHubRateLimitInfo,
   UpdateAdminKeyRequest,
+  CredentialMetadataSchemaConfig,
 } from '@/types/api'
 
 // 创建 axios 实例
@@ -59,6 +61,23 @@ api.interceptors.request.use((config) => {
 // 获取所有凭据状态
 export async function getCredentials(): Promise<CredentialsStatusResponse> {
   const { data } = await api.get<CredentialsStatusResponse>('/credentials')
+  return data
+}
+
+export async function getCredentialMetadataSchema(): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.get<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+  )
+  return data
+}
+
+export async function setCredentialMetadataSchema(
+  config: CredentialMetadataSchemaConfig,
+): Promise<CredentialMetadataSchemaConfig> {
+  const { data } = await api.put<CredentialMetadataSchemaConfig>(
+    '/config/credential-metadata-schema',
+    config,
+  )
   return data
 }
 
@@ -139,7 +158,7 @@ export async function forceRefreshToken(
   return data
 }
 
-// 解除凭据的账号级风控冷却
+// 解除凭据的账号级限流冷却
 export async function clearThrottle(id: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/clear-throttle`)
   return data
@@ -164,13 +183,10 @@ export async function getCurrentCredentialModels(): Promise<AvailableModelsRespo
 }
 
 // 对所选模型发送真实的最小请求；超时时间略长于服务端的 90 秒上限
-export async function testModel(
-  modelId: string,
-  credentialId?: number | null,
-): Promise<ModelTestResponse> {
+export async function testModel(modelId: string): Promise<ModelTestResponse> {
   const { data } = await api.post<ModelTestResponse>(
     '/models/test',
-    { modelId, ...(credentialId != null ? { credentialId } : {}) },
+    { modelId },
     { timeout: 100000 },
   )
   return data
@@ -432,18 +448,32 @@ export async function setLoadBalancingMode(mode: 'priority' | 'balanced'): Promi
   return data
 }
 
+export type ApiDomain = 'amazonaws' | 'kiro'
+
+// 获取上游域名
+export async function getApiDomain(): Promise<{ domain: ApiDomain }> {
+  const { data } = await api.get<{ domain: ApiDomain }>('/config/api-domain')
+  return data
+}
+
+// 设置上游域名
+export async function setApiDomain(domain: ApiDomain): Promise<{ domain: ApiDomain }> {
+  const { data } = await api.put<{ domain: ApiDomain }>('/config/api-domain', { domain })
+  return data
+}
+
 export interface AccountThrottleConfig {
   failover: boolean
   cooldownSecs: number
 }
 
-// 获取账号级风控故障转移配置
+// 获取账号级 429 限流故障转移配置
 export async function getAccountThrottleConfig(): Promise<AccountThrottleConfig> {
   const { data } = await api.get<AccountThrottleConfig>('/config/account-throttle')
   return data
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export async function setAccountThrottleConfig(
   patch: Partial<AccountThrottleConfig>,
 ): Promise<AccountThrottleConfig> {
@@ -451,282 +481,23 @@ export async function setAccountThrottleConfig(
   return data
 }
 
-// ==== 上游直通凭据故障转移（检测规则可配置，热生效 + 落盘）====
-
-export interface UpstreamFailoverConfig {
-  /** 总开关。关闭后上游分支回退旧行为（401/403 攒计数、429 原地退避） */
+export interface ModelApiRetryConfig {
   enabled: boolean
-  /** 欠费/额度用尽检测文案（子串，大小写不敏感），命中即禁用并切号 */
-  quotaPatterns: string[]
-  /** 封禁/停用检测文案，命中即禁用（不参与自愈）并切号 */
-  suspendedPatterns: string[]
-  /** 429 时是否冷却当前凭据并立即切号 */
-  throttleFailover: boolean
-  /** 429 无 Retry-After 时的冷却秒数（1-86400） */
-  throttleCooldownSecs: number
 }
 
-/** 更新上游故障转移配置。未传字段保持原值；文案列表传 [] 表示清空（关闭该类检测）。 */
-export type UpstreamFailoverConfigPatch = Partial<UpstreamFailoverConfig>
-
-// 获取上游直通凭据故障转移配置
-export async function getUpstreamFailoverConfig(): Promise<UpstreamFailoverConfig> {
-  const { data } = await api.get<UpstreamFailoverConfig>('/config/upstream-failover')
+// 获取普通模型 API 429 自动重试配置
+export async function getModelApiRetryConfig(): Promise<ModelApiRetryConfig> {
+  const { data } = await api.get<ModelApiRetryConfig>('/config/model-api-retry')
   return data
 }
 
-// 更新上游直通凭据故障转移配置（热生效 + 持久化）
-export async function setUpstreamFailoverConfig(
-  patch: UpstreamFailoverConfigPatch,
-): Promise<UpstreamFailoverConfig> {
-  const { data } = await api.put<UpstreamFailoverConfig>('/config/upstream-failover', patch)
+// 更新普通模型 API 429 自动重试配置
+export async function setModelApiRetryConfig(
+  config: ModelApiRetryConfig,
+): Promise<ModelApiRetryConfig> {
+  const { data } = await api.put<ModelApiRetryConfig>('/config/model-api-retry', config)
   return data
 }
-
-export interface TokenInflationConfig {
-  inputMultiplier: number
-  outputMultiplier: number
-  cacheMultiplier: number
-}
-
-// 获取 Token 膨胀倍率配置
-export async function getTokenInflationConfig(): Promise<TokenInflationConfig> {
-  const { data } = await api.get<TokenInflationConfig>('/config/token-inflation')
-  return data
-}
-
-// 更新 Token 膨胀倍率配置
-export async function setTokenInflationConfig(
-  config: TokenInflationConfig,
-): Promise<TokenInflationConfig> {
-  const { data } = await api.put<TokenInflationConfig>('/config/token-inflation', config)
-  return data
-}
-
-// ==== 双缓存模拟引擎 ====
-
-/**
- * 全局膨胀倍率（引擎 A 未显式配置时的逐项回退值）。
- *
- * 注意只有三项：`cache` 一项同时作用于 cache_read 与 cache_creation ——
- * 这是加独立倍率之前的历史形状，保留它才能让老部署升级后行为不变。
- */
-export interface GlobalInflationConfig {
-  inputMultiplier: number
-  outputMultiplier: number
-  cacheMultiplier: number
-}
-
-/** 引擎 A（rust，带会话隔离）参数 */
-export interface CacheEngineRustConfig {
-  capacity: number
-  maxTtlSecs: number
-  defaultTtlSecs: number
-  /**
-   * 引擎 A 专属倍率。`null` = 未设置，逐项回退全局膨胀倍率。
-   *
-   * 保留 `null` 语义是为了向后兼容：老部署只配了全局倍率，若这里直接默认 1.0，
-   * 升级后已配的倍率会静默失效。UI 显示时应解析成生效值（见 effectiveRustMultipliers）。
-   */
-  inputMultiplier: number | null
-  outputMultiplier: number | null
-  cacheReadMultiplier: number | null
-  cacheCreationMultiplier: number | null
-}
-
-/** 引擎 B（go，全局共享指纹表）参数 */
-export interface CacheEngineGoConfig {
-  maxRatio: number
-  ttlSeconds: number
-  maxEntries: number
-  minCacheableTokens: number
-  opusMinCacheableTokens: number
-  /** go 引擎专属：下发前对 input_tokens 的缩放倍率（不走全局膨胀倍率） */
-  inputTokenMultiplier: number
-  /**
-   * go 引擎专属：下发前对 output_tokens 的缩放倍率。
-   *
-   * 默认 1.0 = Go 原实现（它没有这个倍率）。开放为可调是为了四引擎对称 ——
-   * B 不该因为移植来源缺一个旋钮就少一个。
-   */
-  outputMultiplier: number
-  /** go 引擎专属：下发前对 cache_read_input_tokens 的缩放倍率 */
-  cacheReadMultiplier: number
-  /** go 引擎专属：下发前对 cache_creation_input_tokens 的缩放倍率（默认 1.0 = Go 原实现） */
-  cacheCreationMultiplier: number
-}
-
-/** 引擎 C（real，真实上游 prompt caching）参数 */
-/** 引擎 C（real，保留上游真实 cache 划分）倍率 */
-export interface CacheEngineRealConfig {
-  inputMultiplier: number
-  outputMultiplier: number
-  cacheReadMultiplier: number
-  cacheCreationMultiplier: number
-}
-
-/** 引擎 D（nocache，禁用 prompt caching）参数 */
-/**
- * 引擎 D（nocache，本地估算 token）倍率。
- *
- * 只有 input / output 两个 —— D 的 cache 恒为 0，cache 倍率乘上去也永远是 0。
- */
-export interface CacheEngineNoCacheConfig {
-  inputMultiplier: number
-  outputMultiplier: number
-}
-
-/** 引擎 A 未显式设置倍率时的回退来源（即配置文件里的 *InflationMultiplier 三项） */
-export interface GlobalInflationConfig {
-  inputMultiplier: number
-  outputMultiplier: number
-  cacheMultiplier: number
-}
-
-export interface CacheEnginesConfig {
-  rust: CacheEngineRustConfig
-  go: CacheEngineGoConfig
-  real?: CacheEngineRealConfig
-  nocache?: CacheEngineNoCacheConfig
-  /**
-   * 全局膨胀倍率。纳入本 payload 是为了「一个窗口调完四套引擎 + 全局」——
-   * 它与 `/config/token-inflation` 是同一份存储的两个入口，不是两份数据
-   * （后端两条路径都走 `token_manager.set_token_inflation_config`）。
-   *
-   * 作用有两处：① 引擎 A 的倍率为 null 时逐项回退到这里；
-   * ② UI 上全局倍率的唯一编辑入口（顶栏原先那个独立按钮已移除）。
-   */
-  global?: GlobalInflationConfig
-}
-
-export interface CacheEngineCounters {
-  entries: number
-  capacity: number
-  hits: number
-  misses: number
-  evictions: number
-  expirations: number
-}
-
-export interface CacheEnginesStats {
-  rust: CacheEngineCounters
-  go: CacheEngineCounters
-  real?: CacheEngineCounters
-  nocache?: CacheEngineCounters
-}
-
-/** 获取两套引擎参数（返回 sanitized 后、运行时真正生效的值） */
-export async function getCacheEnginesConfig(): Promise<CacheEnginesConfig> {
-  const { data } = await api.get<CacheEnginesConfig>('/config/cache-engines')
-  return data
-}
-
-/** 更新两套引擎参数（落盘 + 热生效，无需重启） */
-export async function setCacheEnginesConfig(
-  config: CacheEnginesConfig,
-): Promise<CacheEnginesConfig> {
-  const { data } = await api.put<CacheEnginesConfig>('/config/cache-engines', config)
-  return data
-}
-
-/** 获取两套引擎的运行计数器 */
-export async function getCacheEnginesStats(): Promise<CacheEnginesStats> {
-  const { data } = await api.get<CacheEnginesStats>('/cache-engines/stats')
-  return data
-}
-
-// ==== API Key 订阅源（拼车链接）自动导入 ====
-
-/** 单个号位的导入结果（后端已剥离密钥） */
-export interface KeyFeedItemResult {
-  /** 号位标识，形如 `渠道名#claimId seatN [zone]` */
-  label: string
-  status: 'imported' | 'verified' | 'duplicate' | 'failed'
-  credentialId?: number
-  apiRegion?: string
-  /** 保修截止（RFC3339）；仅展示，不触发自动删除 */
-  warrantyUntil?: string
-  error?: string
-}
-
-/** 一次拉取的汇总结果 */
-export interface KeyFeedPullResult {
-  pulledAt: string
-  success: boolean
-  total: number
-  candidates: number
-  imported: number
-  duplicate: number
-  failed: number
-  reaped: number
-  earliestWarrantyUntil?: string
-  /** 订阅源返回的提示文案（如「暂无可用号，正在补货」） */
-  message?: string
-  error?: string
-  /** 明细。去重条目不入列表，避免存量号位每轮刷屏 */
-  items?: KeyFeedItemResult[]
-}
-
-export interface KeyFeedConfig {
-  enabled: boolean
-  /** 已剥离令牌查询参数的 URL */
-  url?: string
-  /** 是否已配置访问令牌。后端从不回显明文 */
-  tokenSet: boolean
-  /** 令牌的查询参数名（不同源可能叫 token / key / accessKey） */
-  tokenParam: string
-  intervalSecs: number
-  verify: boolean
-  priority: number
-  groups: string[]
-  endpoint?: string
-  reapDisabled: boolean
-  /** 最近一次拉取结果（进程内存，重启后清空） */
-  lastPull?: KeyFeedPullResult
-}
-
-/** 更新订阅源配置。未传的字段保持原值；空串表示清除。 */
-export interface KeyFeedConfigPatch {
-  enabled?: boolean
-  /** 可直接粘贴完整链接，后端按 tokenParam 自动拆出令牌 */
-  url?: string
-  token?: string
-  /** 令牌参数名，默认 token */
-  tokenParam?: string
-  intervalSecs?: number
-  verify?: boolean
-  priority?: number
-  groups?: string[]
-  endpoint?: string
-  reapDisabled?: boolean
-}
-
-/** 获取订阅源配置（token 只回布尔） */
-export async function getKeyFeedConfig(): Promise<KeyFeedConfig> {
-  const { data } = await api.get<KeyFeedConfig>('/config/key-feed')
-  return data
-}
-
-/** 更新订阅源配置（落盘 + 热生效，无需重启） */
-export async function setKeyFeedConfig(patch: KeyFeedConfigPatch): Promise<KeyFeedConfig> {
-  const { data } = await api.put<KeyFeedConfig>('/config/key-feed', patch)
-  return data
-}
-
-/**
- * 立即拉取一次订阅源。
- *
- * 与后台轮询共用同一把服务端互斥锁，不会并发导入同一批 key。
- * 验活开启时每个新 key 要走一次上游往返，故超时给得比常规请求宽。
- */
-export async function pullKeyFeed(): Promise<KeyFeedPullResult> {
-  const { data } = await api.post<KeyFeedPullResult>('/key-feed/pull', undefined, {
-    timeout: 180_000,
-  })
-  return data
-}
-
-// ==== 单账号 RPM 限流（上游 0.7.5）====
 
 export interface AccountRpmLimitConfig {
   enabled: boolean
@@ -744,6 +515,22 @@ export async function setAccountRpmLimitConfig(
   patch: Partial<AccountRpmLimitConfig>,
 ): Promise<AccountRpmLimitConfig> {
   const { data } = await api.put<AccountRpmLimitConfig>('/config/account-rpm-limit', patch)
+  return data
+}
+
+export interface QuotaResetRecoveryConfig {
+  enabled: boolean
+}
+
+export async function getQuotaResetRecoveryConfig(): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.get<QuotaResetRecoveryConfig>('/config/quota-reset-recovery')
+  return data
+}
+
+export async function setQuotaResetRecoveryConfig(
+  patch: Partial<QuotaResetRecoveryConfig>,
+): Promise<QuotaResetRecoveryConfig> {
+  const { data } = await api.put<QuotaResetRecoveryConfig>('/config/quota-reset-recovery', patch)
   return data
 }
 
@@ -800,6 +587,47 @@ export async function setLogGovernanceConfig(
   return data
 }
 
+export interface CacheMeteringConfig {
+  enabled: boolean
+}
+
+/** 会话粘性路由配置 + 运行时统计 */
+export interface SessionAffinityConfig {
+  enabled: boolean
+  ttlSecs: number
+  /** 进程启动以来的粘性命中 / 未命中次数（关闭期间不计） */
+  hits: number
+  misses: number
+  /** 当前未过期的会话绑定数 */
+  activeBindings: number
+}
+
+export async function getSessionAffinityConfig(): Promise<SessionAffinityConfig> {
+  const { data } = await api.get<SessionAffinityConfig>('/config/session-affinity')
+  return data
+}
+
+export async function setSessionAffinityConfig(
+  patch: Partial<Pick<SessionAffinityConfig, 'enabled' | 'ttlSecs'>>,
+): Promise<SessionAffinityConfig> {
+  const { data } = await api.put<SessionAffinityConfig>('/config/session-affinity', patch)
+  return data
+}
+
+// 获取 prompt cache 计量模拟开关
+export async function getCacheMeteringConfig(): Promise<CacheMeteringConfig> {
+  const { data } = await api.get<CacheMeteringConfig>('/config/cache-metering')
+  return data
+}
+
+// 切换 prompt cache 计量模拟开关
+export async function setCacheMeteringConfig(
+  patch: Partial<CacheMeteringConfig>,
+): Promise<CacheMeteringConfig> {
+  const { data } = await api.put<CacheMeteringConfig>('/config/cache-metering', patch)
+  return data
+}
+
 // 发起 IdC 设备授权登录
 export async function startIdcLogin(
   req: StartIdcLoginRequest
@@ -823,6 +651,23 @@ export async function getGlobalProxy(): Promise<GlobalProxyResponse> {
 // 设置全局代理配置
 export async function setGlobalProxy(req: SetGlobalProxyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/global-proxy', req)
+  return data
+}
+
+// 获取自定义模型配置
+export async function getCustomModels(): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.get<{ models: CustomModelItem[] }>('/config/custom-models')
+  return data
+}
+
+// 批量替换自定义模型配置
+export async function setCustomModels(
+  req: { models: CustomModelItem[] },
+): Promise<{ models: CustomModelItem[] }> {
+  const { data } = await api.put<{ models: CustomModelItem[] }>(
+    '/config/custom-models',
+    req,
+  )
   return data
 }
 

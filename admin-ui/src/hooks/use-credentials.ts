@@ -16,22 +16,44 @@ import {
   updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getApiDomain,
+  setApiDomain,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
-  getUpstreamFailoverConfig,
-  setUpstreamFailoverConfig,
-  getTokenInflationConfig,
-  setTokenInflationConfig,
+  getModelApiRetryConfig,
+  setModelApiRetryConfig,
   getAccountRpmLimitConfig,
   setAccountRpmLimitConfig,
+  getQuotaResetRecoveryConfig,
+  setQuotaResetRecoveryConfig,
   getSelfHealConfig,
   setSelfHealConfig,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
+  getCacheMeteringConfig,
+  setCacheMeteringConfig,
+  getSessionAffinityConfig,
+  setSessionAffinityConfig,
+  getGlobalProxy,
+  setGlobalProxy,
+  getCustomModels,
+  setCustomModels,
+  getUpdateConfig,
+  setUpdateConfig,
   resetSuccessCount,
   resetAllSuccessCount,
+  getCredentialMetadataSchema,
+  setCredentialMetadataSchema,
 } from '@/api/credentials'
-import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
+import type {
+  AddCredentialRequest,
+  CustomModelItem,
+  SetGlobalProxyRequest,
+  SetUpdateConfigRequest,
+  UpdateCredentialRequest,
+  UpdateRefreshTokenRequest,
+  CredentialMetadataSchemaConfig,
+} from '@/types/api'
 
 // 查询凭据列表
 export function useCredentials() {
@@ -39,6 +61,25 @@ export function useCredentials() {
     queryKey: ['credentials'],
     queryFn: getCredentials,
     refetchInterval: 30000, // 每 30 秒刷新一次
+  })
+}
+
+export function useCredentialMetadataSchema() {
+  return useQuery({
+    queryKey: ['credential-metadata-schema'],
+    queryFn: getCredentialMetadataSchema,
+  })
+}
+
+export function useSetCredentialMetadataSchema() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (config: CredentialMetadataSchemaConfig) =>
+      setCredentialMetadataSchema(config),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credential-metadata-schema'] })
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
   })
 }
 
@@ -58,6 +99,7 @@ export function useCredentialModels(id: number | null) {
     queryKey: ['credential-models', id],
     queryFn: () => getCredentialModels(id!),
     enabled: id !== null,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
   })
 }
@@ -68,6 +110,7 @@ export function useCurrentCredentialModels(enabled: boolean) {
     queryKey: ['current-credential-models'],
     queryFn: getCurrentCredentialModels,
     enabled,
+    staleTime: 0, // 始终视为过期，每次打开对话框都实时查上游
     retry: false,
   })
 }
@@ -75,8 +118,7 @@ export function useCurrentCredentialModels(enabled: boolean) {
 // 对模型发送真实请求
 export function useTestModel() {
   return useMutation({
-    mutationFn: ({ modelId, credentialId }: { modelId: string; credentialId?: number | null }) =>
-      testModel(modelId, credentialId),
+    mutationFn: testModel,
   })
 }
 
@@ -126,7 +168,7 @@ export function useForceRefreshToken() {
   })
 }
 
-// 解除账号级风控冷却
+// 解除账号级限流冷却
 export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -226,7 +268,26 @@ export function useSetLoadBalancingMode() {
   })
 }
 
-// 获取账号级风控故障转移配置
+// 获取上游域名
+export function useApiDomain() {
+  return useQuery({
+    queryKey: ['apiDomain'],
+    queryFn: getApiDomain,
+  })
+}
+
+// 设置上游域名
+export function useSetApiDomain() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setApiDomain,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['apiDomain'] })
+    },
+  })
+}
+
+// 获取账号级 429 限流故障转移配置
 export function useAccountThrottleConfig() {
   return useQuery({
     queryKey: ['accountThrottleConfig'],
@@ -234,7 +295,7 @@ export function useAccountThrottleConfig() {
   })
 }
 
-// 更新账号级风控故障转移配置
+// 更新账号级 429 限流故障转移配置
 export function useSetAccountThrottleConfig() {
   const queryClient = useQueryClient()
   return useMutation({
@@ -245,51 +306,21 @@ export function useSetAccountThrottleConfig() {
   })
 }
 
-/** 上游直通凭据故障转移配置。仅在弹窗打开时拉取，避免常驻请求。 */
-export function useUpstreamFailoverConfig(enabled = true) {
+// 获取普通模型 API 429 自动重试配置
+export function useModelApiRetryConfig() {
   return useQuery({
-    queryKey: ['upstreamFailoverConfig'],
-    queryFn: getUpstreamFailoverConfig,
-    enabled,
+    queryKey: ['modelApiRetryConfig'],
+    queryFn: getModelApiRetryConfig,
   })
 }
 
-// 更新上游直通凭据故障转移配置（热生效 + 落盘）
-export function useSetUpstreamFailoverConfig() {
+// 更新普通模型 API 429 自动重试配置
+export function useSetModelApiRetryConfig() {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: setUpstreamFailoverConfig,
+    mutationFn: setModelApiRetryConfig,
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['upstreamFailoverConfig'] })
-    },
-  })
-}
-
-// 读取全局倍率（顶栏用它判断「是否非默认」，编辑入口在缓存引擎弹窗）
-export function useTokenInflationConfig() {
-  return useQuery({
-    queryKey: ['tokenInflationConfig'],
-    queryFn: getTokenInflationConfig,
-  })
-}
-
-/**
- * 写全局倍率。**当前前端无调用方** —— 编辑入口已并入「缓存引擎」弹窗，
- * 那里通过 `setCacheEnginesConfig` 的 `global` 段写同一份存储
- * （后端两条路径都走 `token_manager.set_token_inflation_config`）。
- *
- * 保留是为了与仍然存在的 `PUT /api/admin/config/token-inflation` 端点保持
- * 接口层对等，供直接调 API 的使用者参照；不要因为「没人用」就当死代码删掉后
- * 又在别处重写一遍。
- */
-export function useSetTokenInflationConfig() {
-  const queryClient = useQueryClient()
-  return useMutation({
-    mutationFn: setTokenInflationConfig,
-    onSuccess: () => {
-      // 缓存引擎弹窗与本 hook 写的是同一份数据，故两个 key 一起失效
-      queryClient.invalidateQueries({ queryKey: ['tokenInflationConfig'] })
-      queryClient.invalidateQueries({ queryKey: ['cacheEnginesConfig'] })
+      queryClient.invalidateQueries({ queryKey: ['modelApiRetryConfig'] })
     },
   })
 }
@@ -309,6 +340,23 @@ export function useSetAccountRpmLimitConfig() {
     mutationFn: setAccountRpmLimitConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountRpmLimitConfig'] })
+    },
+  })
+}
+
+export function useQuotaResetRecoveryConfig() {
+  return useQuery({
+    queryKey: ['quotaResetRecoveryConfig'],
+    queryFn: getQuotaResetRecoveryConfig,
+  })
+}
+
+export function useSetQuotaResetRecoveryConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setQuotaResetRecoveryConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['quotaResetRecoveryConfig'] })
     },
   })
 }
@@ -348,6 +396,100 @@ export function useSetLogGovernanceConfig() {
     mutationFn: setLogGovernanceConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
+    },
+  })
+}
+
+// 获取 prompt cache 计量模拟开关
+export function useCacheMeteringConfig() {
+  return useQuery({
+    queryKey: ['cacheMeteringConfig'],
+    queryFn: getCacheMeteringConfig,
+  })
+}
+
+// 切换 prompt cache 计量模拟开关
+export function useSetCacheMeteringConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setCacheMeteringConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['cacheMeteringConfig'] })
+    },
+  })
+}
+
+// 会话粘性路由配置 + 命中统计（统计随请求变化，30s 刷一次）
+export function useSessionAffinityConfig() {
+  return useQuery({
+    queryKey: ['sessionAffinityConfig'],
+    queryFn: getSessionAffinityConfig,
+    refetchInterval: 30_000,
+  })
+}
+
+export function useSetSessionAffinityConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setSessionAffinityConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['sessionAffinityConfig'] })
+    },
+  })
+}
+
+// 全局出站代理。此前只在代理池弹窗里内联查询，设置页需要独立入口，
+// 抽成 hook 后两处共用同一份缓存（queryKey 与弹窗保持一致：'global-proxy'）。
+export function useGlobalProxy() {
+  return useQuery({
+    queryKey: ['global-proxy'],
+    queryFn: getGlobalProxy,
+  })
+}
+
+export function useSetGlobalProxy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetGlobalProxyRequest) => setGlobalProxy(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['global-proxy'] })
+    },
+  })
+}
+
+// 自定义模型配置
+export function useCustomModels() {
+  return useQuery({
+    queryKey: ['custom-models'],
+    queryFn: getCustomModels,
+  })
+}
+
+export function useSetCustomModels() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: { models: CustomModelItem[] }) =>
+      setCustomModels(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['custom-models'] })
+    },
+  })
+}
+
+// 镜像在线更新配置（GitHub Token / 无人值守自动更新）
+export function useUpdateConfig() {
+  return useQuery({
+    queryKey: ['update-config'],
+    queryFn: getUpdateConfig,
+  })
+}
+
+export function useSetUpdateConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (req: SetUpdateConfigRequest) => setUpdateConfig(req),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['update-config'] })
     },
   })
 }

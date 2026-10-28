@@ -11,7 +11,9 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
-use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
+use crate::kiro::model::requests::kiro::{
+    AdditionalModelRequestFields, KiroOutputConfig, KiroReasoningConfig,
+};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
@@ -284,7 +286,7 @@ pub fn map_model(model: &str) -> Option<String> {
 
     // 自定义模型表优先（大小写不敏感精确匹配），可新增或覆盖内置映射。
     if let Some(custom) = crate::model::custom_models::lookup(model) {
-        return Some(custom.backend_id.clone());
+        return Some(custom.backend_id);
     }
 
     normalize_claude_model(model).or_else(|| Some(model.to_string()))
@@ -294,7 +296,7 @@ pub fn map_model(model: &str) -> Option<String> {
 ///
 /// 复用 `map_model` 的映射逻辑，确保窗口大小判断与模型映射一致。
 /// Kiro 于 2026-03-24 将 Opus 4.6 和 Sonnet 4.6 升级至 1M 上下文。
-/// Sonnet 5 / Opus 4.7 / 4.8 / Opus 5 同 1M
+/// Sonnet 5 / Sonnet 5.5 / Opus 4.7 / 4.8 / Opus 5 / 5.5 / Haiku 5.5 同 1M
 ///
 /// 注意：本函数的返回值会在 `Event::ContextUsage` 处被用来把上游只回报的
 /// 百分比换算成 token 数（`pct × window / 100`）。漏配某个 1M 模型不会影响
@@ -309,16 +311,28 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 
     match map_model(model) {
-        // GPT-5.6 family on Kiro ships a 272K context window.
+        // Kiro exposes the GPT-5.6 family with a 1M context window.
+        Some(mapped)
+            if matches!(
+                mapped.as_str(),
+                "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+            ) =>
+        {
+            1_000_000
+        }
+        // Keep the existing fallback for other GPT models until their limits are confirmed.
         Some(mapped) if mapped.starts_with("gpt") => 272_000,
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-sonnet-5"
+                || mapped == "claude-sonnet-5.5"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
                 || mapped == "claude-opus-4.8"
                 || mapped == "claude-opus-5"
+                || mapped == "claude-opus-5.5"
+                || mapped == "claude-haiku-5.5"
                 || mapped == "claude-fable-5" =>
         {
             1_000_000
@@ -327,14 +341,18 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
-/// 是否为已确认接受 `additionalModelRequestFields.output_config` 的模型。
-///
-/// Kiro `ListAvailableModels`（2026-06）确认：Opus 4.6/4.7/4.8、Sonnet 4.6 接受
-/// `output_config`。Claude 5 系（fable-5 / mythos-5 / sonnet-5 / opus-5 / claude-5）
-/// 与 xhigh 能力一致，一并视为支持。其余（4.5 系、haiku、sonnet-4.8 等）保守视为
-/// 不支持——向它们下发会触发上游 400（`additionalModelRequestFields is not supported`）。
-/// 若后续实测某模型 400，从这里去除即可。
+fn model_uses_gpt_reasoning_effort(model_id: &str) -> bool {
+    matches!(
+        model_id.to_ascii_lowercase().as_str(),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
+    )
+}
+
+/// 是否为已确认接受原生 reasoning effort 字段的模型。
 fn model_supports_native_reasoning(model_id: &str) -> bool {
+    if model_uses_gpt_reasoning_effort(model_id) {
+        return true;
+    }
     // 自定义模型可按 backend_id 声明支持 reasoning。
     if crate::model::custom_models::backend_supports_reasoning(model_id) {
         return true;
@@ -347,6 +365,7 @@ fn model_supports_native_reasoning(model_id: &str) -> bool {
         || m.contains("mythos-5")
         || m.contains("sonnet-5")
         || m.contains("opus-5")
+        || m.contains("haiku-5")
         || m.contains("claude-5")
 }
 
@@ -403,6 +422,7 @@ fn select_native_reasoning_effort(req: &MessagesRequest, model_id: &str) -> Stri
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EffortTier {
+    None,
     Low,
     Medium,
     High,
@@ -413,6 +433,7 @@ enum EffortTier {
 impl EffortTier {
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(Self::None),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
@@ -424,6 +445,7 @@ impl EffortTier {
 
     fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -456,7 +478,11 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
     // it with `Invalid additionalModelRequestFields`, so map to the nearest
     // lower tier instead of failing the request. Unknown/future models keep
     // recognized values intact to avoid maintaining a brittle full allow-list.
-    let normalized = if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
+    let normalized = if requested == EffortTier::None
+        && !model_uses_gpt_reasoning_effort(model_id)
+    {
+        EffortTier::High
+    } else if requested == EffortTier::XHigh && !model_supports_xhigh_effort(model_id) {
         EffortTier::High
     } else {
         requested
@@ -511,14 +537,14 @@ fn build_additional_model_request_fields(
         return None;
     }
 
-    // 仅对确认接受 output_config 的模型下发，避免上游 400。
+    // 仅对确认支持 effort 的模型下发，避免上游 schema 校验 400。
     if !model_supports_native_reasoning(model_id) {
         if let Some(oc) = &req.output_config
             && !oc.effort.trim().is_empty()
         {
             tracing::debug!(
                 model_id = %model_id,
-                "skipping unsupported additionalModelRequestFields.output_config for model"
+                "skipping unsupported reasoning effort for model"
             );
         }
         return None;
@@ -530,9 +556,17 @@ fn build_additional_model_request_fields(
     }
 
     let effort = select_native_reasoning_effort(req, model_id);
-    Some(AdditionalModelRequestFields {
-        output_config: Some(KiroOutputConfig { effort }),
-    })
+    if model_uses_gpt_reasoning_effort(model_id) {
+        Some(AdditionalModelRequestFields {
+            output_config: None,
+            reasoning: Some(KiroReasoningConfig { effort }),
+        })
+    } else {
+        Some(AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig { effort }),
+            reasoning: None,
+        })
+    }
 }
 
 /// 转换结果
@@ -551,12 +585,25 @@ pub struct ConversionResult {
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
+/// Internal conversion purpose. Clients cannot select this directly; the
+/// Responses adapter uses compact modes only after validating a terminal
+/// `compaction_trigger` item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConversionPurpose {
+    Generate,
+    Compact,
+    CompactFallback,
+}
+
+const COMPACTION_HISTORY_TOOL_NAME: &str = "kiro_compaction_history_tool";
+
 /// 转换错误
 #[derive(Debug)]
 pub enum ConversionError {
     InvalidModel(String),
     EmptyMessages,
-    /// Claude Code 工具无法映射到 Kiro 内置工具（如 Read.pages 无对应、内置缺 schema）。
+    InvalidMessageSequence(String),
+    /// Claude Code 工具无法映射到 Kiro 内置工具（如内置缺 schema）。
     UnsupportedToolMapping(String),
 }
 
@@ -565,6 +612,9 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::InvalidModel(reason) => write!(f, "无效模型 ID: {}", reason),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
+            ConversionError::InvalidMessageSequence(reason) => {
+                write!(f, "消息序列无效: {}", reason)
+            }
             ConversionError::UnsupportedToolMapping(reason) => {
                 write!(f, "工具映射不支持: {}", reason)
             }
@@ -609,6 +659,13 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 由 conversationId 确定性派生 agentContinuationId（UUID v5，命名空间固定）。
+/// 同一会话在进程重启、多副本之间都得到同一个值。
+fn derive_agent_continuation_id(conversation_id: &str) -> String {
+    let name = format!("agent-continuation:{conversation_id}");
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()).to_string()
+}
+
 /// 收集历史消息中使用的所有工具名称
 fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
     let mut tool_names = Vec::new();
@@ -646,6 +703,20 @@ fn create_placeholder_tool(name: &str) -> Tool {
     }
 }
 
+fn create_compaction_history_tool() -> Tool {
+    let mut tool = create_placeholder_tool(COMPACTION_HISTORY_TOOL_NAME);
+    tool.tool_specification.description =
+        "Inert placeholder for structured tool calls in compacted history. Do not call it."
+            .to_string();
+    tool
+}
+
+fn sorted_ids(ids: &std::collections::HashSet<String>) -> Vec<String> {
+    let mut ids = ids.iter().cloned().collect::<Vec<_>>();
+    ids.sort();
+    ids
+}
+
 /// 将 Anthropic 请求转换为 Kiro 请求
 /// 便捷入口（测试用）：默认按 ClaudeCode 模式转换。
 #[cfg(test)]
@@ -656,6 +727,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
 pub fn convert_request_with_mode(
     req: &MessagesRequest,
     tool_compatibility_mode: ToolCompatibilityMode,
+) -> Result<ConversionResult, ConversionError> {
+    convert_request_with_purpose(
+        req,
+        tool_compatibility_mode,
+        ConversionPurpose::Generate,
+    )
+}
+
+pub(crate) fn convert_request_with_purpose(
+    req: &MessagesRequest,
+    tool_compatibility_mode: ToolCompatibilityMode,
+    purpose: ConversionPurpose,
 ) -> Result<ConversionResult, ConversionError> {
     // 1. 映射模型
     let model_id = map_model(&req.model).ok_or_else(|| {
@@ -693,7 +776,11 @@ pub fn convert_request_with_mode(
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+    // agentContinuationId 从 conversationId 确定性派生，让同一会话的请求体在会话 id 之外
+    // 完全一致。实测上游 prompt cache 按内容前缀匹配、与会话 id 无关，所以这一步对缓存
+    // 没有直接收益；保留确定性只是为了请求可复现、便于排查。
+    // UUID v5 保持与此前随机 v4 相同的 36 字符格式。
+    let agent_continuation_id = derive_agent_continuation_id(&conversation_id);
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -704,14 +791,22 @@ pub fn convert_request_with_mode(
 
     // 6. 转换工具定义（超长名称自动缩短并记录映射；ClaudeCode 模式做内置工具适配）
     let mut tool_name_map = HashMap::new();
-    let mut tools = convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?;
+    let fallback = purpose == ConversionPurpose::CompactFallback;
+    let mut tools = if fallback {
+        Vec::new()
+    } else {
+        convert_tools(&req.tools, &mut tool_name_map, tool_compatibility_mode)?
+    };
 
     // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
-    let mut known_tool_names: std::collections::HashSet<String> = req
-        .tools
-        .as_ref()
-        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
-        .unwrap_or_default();
+    let mut known_tool_names: std::collections::HashSet<String> = if fallback {
+        std::collections::HashSet::new()
+    } else {
+        req.tools
+            .as_ref()
+            .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default()
+    };
     // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
     // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
     for short in tool_name_map.keys() {
@@ -725,24 +820,22 @@ pub fn convert_request_with_mode(
         &model_id,
         &mut tool_name_map,
         tool_compatibility_mode,
+        purpose,
     )?;
-
-    // 7.5. 历史内按 tool_use_id 去重 tool_result（同 id 只保留首次出现）
-    //
-    // 必须在 build_history 之后、且独立于下一步：validate_tool_pairing 只校验当前消息
-    // 那一份 tool_results，历史里的 result 由 merge_user_messages 无条件累加，此前无人
-    // 去重 —— 同 id 出现两次会让上游以 TOOL_USE_RESULT_MISMATCH 拒掉整个请求，且该
-    // reason 被判为不可重试。见 `dedup_history_tool_results`。
-    dedup_history_tool_results(&mut history);
 
     // 8. 验证并过滤 tool_use/tool_result 配对
     // 移除孤立的 tool_result（没有对应的 tool_use）
     // 同时返回孤立的 tool_use_id 集合，用于后续清理
-    let (validated_tool_results, orphaned_tool_use_ids) =
-        validate_tool_pairing(&history, &tool_results);
-
-    // 9. 从历史中移除孤立的 tool_use（Kiro API 要求 tool_use 必须有对应的 tool_result）
-    remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+    let validated_tool_results = if purpose != ConversionPurpose::Generate {
+        validate_compaction_tool_sequence(&history, &tool_results)?;
+        tool_results.clone()
+    } else {
+        let (validated_tool_results, orphaned_tool_use_ids) =
+            validate_tool_pairing(&history, &tool_results);
+        // Generate keeps its existing compatibility behavior.
+        remove_orphaned_tool_uses(&mut history, &orphaned_tool_use_ids);
+        validated_tool_results
+    };
 
     // 10. 收集历史中使用的工具名称，为缺失的工具生成占位符定义
     // Kiro API 要求：历史消息中引用的工具必须在 tools 列表中有定义
@@ -753,9 +846,16 @@ pub fn convert_request_with_mode(
         .map(|t| t.tool_specification.name.to_lowercase())
         .collect();
 
-    for tool_name in history_tool_names {
-        if !existing_tool_names.contains(&tool_name.to_lowercase()) {
-            tools.push(create_placeholder_tool(&tool_name));
+    if fallback {
+        if !history_tool_names.is_empty() {
+            tools.push(create_compaction_history_tool());
+            known_tool_names.insert(COMPACTION_HISTORY_TOOL_NAME.to_string());
+        }
+    } else {
+        for tool_name in history_tool_names {
+            if !existing_tool_names.contains(&tool_name.to_lowercase()) {
+                tools.push(create_placeholder_tool(&tool_name));
+            }
         }
     }
 
@@ -804,6 +904,21 @@ pub fn convert_request_with_mode(
     // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
     // by upstream model capability rather than by the mere presence of client output_config.
     let additional_model_request_fields = build_additional_model_request_fields(req, &model_id);
+
+    let upstream_effort = additional_model_request_fields.as_ref().and_then(|f| {
+        f.output_config
+            .as_ref()
+            .map(|c| c.effort.as_str())
+            .or_else(|| f.reasoning.as_ref().map(|r| r.effort.as_str()))
+    });
+    tracing::info!(
+        model_id = %model_id,
+        thinking_type = req.thinking.as_ref().map(|t| t.thinking_type.as_str()).unwrap_or("-"),
+        budget_tokens = req.thinking.as_ref().map(|t| t.budget_tokens).unwrap_or(0),
+        client_effort = req.output_config.as_ref().map(|c| c.effort.as_str()).unwrap_or("-"),
+        upstream_effort = upstream_effort.unwrap_or("-"),
+        "thinking 配置"
+    );
 
     Ok(ConversionResult {
         conversation_state,
@@ -1049,59 +1164,64 @@ fn validate_tool_pairing(
     (filtered_results, unpaired_tool_use_ids)
 }
 
-/// 跨整条历史按 `tool_use_id` 去重 `tool_result`，只保留首次出现的那一个。
-///
-/// **为什么必须单独做这一步**：[`validate_tool_pairing`] 只校验**当前消息**那一份
-/// tool_results（`convert_request` 传给它的是 `last_message` 解析出来的），而历史里的
-/// tool_results 由 [`merge_user_messages`] 的 `all_tool_results.extend(...)` 无条件累加，
-/// 从组装到发出中间不经过任何去重。于是同一个 `tool_use_id` 在历史里出现两次时，上游
-/// 收到两个 result，以 `each tool_use must have a single result`
-/// （`TOOL_USE_RESULT_MISMATCH`）拒掉**整个请求** —— 且该 reason 已被判为不可重试，
-/// 请求直接失败。
-///
-/// 重复有两种来源，都由这里覆盖：
-/// 1. **单条消息内** —— 客户端在一个 content 数组里放了两个同 id 的 tool_result 块。
-///    `process_message_content_dedup` 的 `tool_result` 分支是无条件 push 的
-/// 2. **跨消息** —— 两条连续 user 消息各带一个同 id 的 result，被 `merge_user_messages`
-///    合并进同一条历史消息
-///
-/// 不在上述两处各修一遍，是为了让"一个 tool_use_id 在发给上游的报文里只能出现一次"
-/// 这条不变量收敛在一处。分散去重的话，将来任何新增的历史组装路径都得记得再去重一次。
-///
-/// **保留第一个**：重复通常来自上一轮响应在 tool_use 中途被截断（超时 / 断线 / 客户端
-/// 重连）后重发，第一个才是与当时那次 tool_use 真正配对的结果。
-///
-/// 日志用 `debug` 而非 `warn`：长会话里一次重发会让**后续每一轮**都命中同一批重复，
-/// warn 会持续刷屏；而这里是成功兜住了问题，不是需要运维介入的异常。
-fn dedup_history_tool_results(history: &mut [Message]) {
-    use std::collections::HashSet;
+fn validate_compaction_tool_sequence(
+    history: &[Message],
+    current_tool_results: &[ToolResult],
+) -> Result<(), ConversionError> {
+    let mut pending = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut removed = 0usize;
-
-    for msg in history.iter_mut() {
-        if let Message::User(user_msg) = msg {
-            let results = &mut user_msg
-                .user_input_message
-                .user_input_message_context
-                .tool_results;
-            results.retain(|r| {
-                if seen.insert(r.tool_use_id.clone()) {
-                    true
-                } else {
-                    removed += 1;
-                    false
+    for message in history {
+        match message {
+            Message::Assistant(assistant) => {
+                for tool_use in assistant
+                    .assistant_response_message
+                    .tool_uses
+                    .iter()
+                    .flatten()
+                {
+                    if !seen.insert(tool_use.tool_use_id.clone()) {
+                        return Err(ConversionError::InvalidMessageSequence(format!(
+                            "duplicate tool_use id in compaction history: {}",
+                            tool_use.tool_use_id
+                        )));
+                    }
+                    pending.insert(tool_use.tool_use_id.clone());
                 }
-            });
+            }
+            Message::User(user) => {
+                for result in &user
+                    .user_input_message
+                    .user_input_message_context
+                    .tool_results
+                {
+                    if !pending.remove(&result.tool_use_id) {
+                        return Err(ConversionError::InvalidMessageSequence(format!(
+                            "tool_result has no pending tool_use in compaction history: {}",
+                            result.tool_use_id
+                        )));
+                    }
+                }
+            }
         }
     }
 
-    if removed > 0 {
-        tracing::debug!(
-            "历史中移除了 {} 个重复的 tool_result（同一 tool_use_id 出现多次，保留首次出现）",
-            removed
-        );
+    for result in current_tool_results {
+        if !pending.remove(&result.tool_use_id) {
+            return Err(ConversionError::InvalidMessageSequence(format!(
+                "current tool_result has no pending tool_use in compaction history: {}",
+                result.tool_use_id
+            )));
+        }
     }
+
+    if !pending.is_empty() {
+        return Err(ConversionError::InvalidMessageSequence(format!(
+            "compaction history contains tool_use without tool_result: {}",
+            sorted_ids(&pending).join(", ")
+        )));
+    }
+    Ok(())
 }
 
 /// 从历史消息中移除孤立的 tool_use
@@ -1265,11 +1385,9 @@ fn map_tool_input_to_kiro(
             maybe_insert(&mut out, "timeout", take_first(&obj, &["timeout"]));
         }
         ("Read", "read_file") => {
-            if obj.contains_key("pages") && !obj.get("pages").is_some_and(|v| v.is_null()) {
-                return Err(ConversionError::UnsupportedToolMapping(
-                    "Claude Code Read.pages has no Kiro read_file equivalent".to_string(),
-                ));
-            }
+            // Claude Code 的 `pages`（PDF 页范围）在 Kiro read_file 中无对应字段。本函数只处理
+            // 回放的历史 tool_use，客户端无法修正，拒绝会让整个会话永久 400；这里随白名单
+            // 构造自然丢弃，Kiro 看到的只是一次普通读取历史。
             maybe_insert(&mut out, "path", take_first(&obj, &["file_path", "path"]));
             let offset = obj.get("offset").and_then(optional_number);
             let limit = obj.get("limit").and_then(optional_number);
@@ -1654,7 +1772,14 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>, mode: ToolCompatibilityMode) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+    mode: ToolCompatibilityMode,
+    purpose: ConversionPurpose,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1716,7 +1841,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         if msg.role == "user" {
             // 先处理累积的 assistant 消息
             if !assistant_buffer.is_empty() {
-                let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode)?;
+                let merged =
+                    merge_assistant_messages(&assistant_buffer, tool_name_map, mode, purpose)?;
                 history.push(Message::Assistant(merged));
                 assistant_buffer.clear();
             }
@@ -1735,7 +1861,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理末尾累积的 assistant 消息
     if !assistant_buffer.is_empty() {
-        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode)?;
+        let merged = merge_assistant_messages(&assistant_buffer, tool_name_map, mode, purpose)?;
         history.push(Message::Assistant(merged));
     }
 
@@ -1744,9 +1870,14 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
 
-        // 自动配对一个 "OK" 的 assistant 响应
-        let auto_assistant = HistoryAssistantMessage::new("OK");
-        history.push(Message::Assistant(auto_assistant));
+        if purpose != ConversionPurpose::Generate {
+            return Err(ConversionError::InvalidMessageSequence(
+                "compaction would move an unanswered user message into history".to_string(),
+            ));
+        }
+
+        // Generate preserves the legacy compatibility pair.
+        history.push(Message::Assistant(HistoryAssistantMessage::new("OK")));
     }
 
     Ok(history)
@@ -1796,6 +1927,7 @@ fn convert_assistant_message(
     msg: &super::types::Message,
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
+    purpose: ConversionPurpose,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
@@ -1822,9 +1954,20 @@ fn convert_assistant_message(
                         "tool_use" => {
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                let mapped_name =
-                                    map_client_tool_name_to_kiro(&name, tool_name_map, mode);
-                                let input = map_tool_input_to_kiro(&name, input, mode)?;
+                                let (mapped_name, input) = if purpose
+                                    == ConversionPurpose::CompactFallback
+                                {
+                                    (COMPACTION_HISTORY_TOOL_NAME.to_string(), input)
+                                } else {
+                                    (
+                                        map_client_tool_name_to_kiro(
+                                            &name,
+                                            tool_name_map,
+                                            mode,
+                                        ),
+                                        map_tool_input_to_kiro(&name, input, mode)?,
+                                    )
+                                };
                                 tool_uses
                                     .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
@@ -1871,17 +2014,18 @@ fn merge_assistant_messages(
     messages: &[&super::types::Message],
     tool_name_map: &mut HashMap<String, String>,
     mode: ToolCompatibilityMode,
+    purpose: ConversionPurpose,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     assert!(!messages.is_empty());
     if messages.len() == 1 {
-        return convert_assistant_message(messages[0], tool_name_map, mode);
+        return convert_assistant_message(messages[0], tool_name_map, mode, purpose);
     }
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
 
     for msg in messages {
-        let converted = convert_assistant_message(msg, tool_name_map, mode)?;
+        let converted = convert_assistant_message(msg, tool_name_map, mode, purpose)?;
         let am = converted.assistant_response_message;
         if !am.content.trim().is_empty() {
             content_parts.push(am.content);
@@ -1993,6 +2137,11 @@ mod tests {
         );
         assert_eq!(get_context_window_size("claude-sonnet-5"), 1_000_000);
         assert_eq!(
+            map_model("claude-sonnet-5-5"),
+            Some("claude-sonnet-5.5".to_string())
+        );
+        assert_eq!(get_context_window_size("claude-sonnet-5-5"), 1_000_000);
+        assert_eq!(
             map_model("claude-3-5-sonnet-20241022"),
             Some("claude-sonnet-3.5".to_string())
         );
@@ -2051,6 +2200,20 @@ mod tests {
             map_model("claude-sonnet-5-2"),
             Some("claude-sonnet-5.2".to_string())
         );
+        for model in [
+            "claude-opus-5-5",
+            "claude-opus-5.5",
+            "claude-opus-5-5-thinking",
+            "claude-opus-5.5-latest",
+            "claude-opus-5-5-20270101",
+            "CLAUDE-OPUS-5-5",
+        ] {
+            assert_eq!(
+                map_model(model),
+                Some("claude-opus-5.5".to_string()),
+                "{model} 应映射到 claude-opus-5.5"
+            );
+        }
         assert_eq!(
             map_model("claude-opus-5-beta"),
             Some("claude-opus-5-beta".to_string())
@@ -2086,6 +2249,10 @@ mod tests {
             "claude-opus-4-7",
             "claude-opus-4-8",
             "claude-opus-5",
+            "claude-opus-5-5",
+            "claude-opus-5.5-thinking",
+            "claude-haiku-5-5",
+            "claude-haiku-5.5-20270101",
             "claude-fable-5",
         ] {
             assert_eq!(
@@ -2115,10 +2282,17 @@ mod tests {
     #[test]
     fn test_map_model_gpt_5_6_family() {
         // Kiro serves the GPT-5.6 family; ids pass through verbatim.
-        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
-        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
-        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
-        assert_eq!(get_context_window_size("gpt-5.6-sol"), 272_000);
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(map_model(model), Some(model.to_string()));
+            assert_eq!(
+                get_context_window_size(model),
+                1_000_000,
+                "{model} should use the 1M context window"
+            );
+        }
+
+        // Do not silently expand unconfirmed GPT model windows.
+        assert_eq!(get_context_window_size("gpt-5.5"), 272_000);
     }
 
     #[test]
@@ -2172,6 +2346,7 @@ mod tests {
                 effort: effort.to_string(),
             }),
             metadata: None,
+            cache_control: None,
         }
     }
 
@@ -2234,6 +2409,51 @@ mod tests {
                 .model_id,
             "glm-5"
         );
+    }
+
+    #[test]
+    fn test_opus_5_5_maps_upstream_id_and_keeps_xhigh() {
+        let req =
+            minimal_adaptive_thinking_request_with_effort("claude-opus-5-5-thinking", "xhigh");
+        let result = convert_request(&req).unwrap();
+
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id,
+            "claude-opus-5.5"
+        );
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 5.5 adaptive thinking should keep output_config");
+        assert_eq!(fields.output_config.unwrap().effort, "xhigh");
+    }
+
+    #[test]
+    fn test_haiku_5_5_maps_upstream_id_and_keeps_effort() {
+        // Kiro 为 Haiku 5.5 提供 low / medium / high / xhigh / max 全部档位
+        for effort in ["low", "medium", "high", "xhigh", "max"] {
+            let req = minimal_adaptive_thinking_request_with_effort("claude-haiku-5-5", effort);
+            let result = convert_request(&req).unwrap();
+
+            assert_eq!(
+                result
+                    .conversation_state
+                    .current_message
+                    .user_input_message
+                    .model_id,
+                "claude-haiku-5.5"
+            );
+            let fields = result
+                .additional_model_request_fields
+                .expect("haiku 5.5 adaptive thinking should keep output_config");
+            assert_eq!(fields.output_config.unwrap().effort, effort);
+        }
+
+        // haiku-4.5 不得被误判为支持原生 reasoning
+        assert!(!model_supports_native_reasoning("claude-haiku-4.5"));
     }
 
     #[test]
@@ -2395,12 +2615,16 @@ mod tests {
     #[test]
     fn model_supports_native_reasoning_allows_confirmed_and_5_family() {
         for m in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "claude-opus-4.6",
             "claude-opus-4.7",
             "claude-opus-4.8",
             "claude-sonnet-4.6",
             "claude-fable-5",
             "claude-sonnet-5",
+            "claude-opus-5.5",
         ] {
             assert!(model_supports_native_reasoning(m), "{m} 应支持原生 reasoning");
         }
@@ -2415,6 +2639,29 @@ mod tests {
                 "{m} 未确认支持，不应下发 output_config"
             );
         }
+    }
+
+    #[test]
+    fn gpt_5_6_effort_uses_reasoning_wire_field() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            for effort in ["none", "low", "medium", "high", "xhigh", "max"] {
+                let req = minimal_request_with_effort(model, effort);
+                let fields = convert_request(&req)
+                    .unwrap()
+                    .additional_model_request_fields
+                    .expect("GPT-5.6 effort should be forwarded");
+                assert!(fields.output_config.is_none());
+                assert_eq!(fields.reasoning.unwrap().effort, effort);
+            }
+        }
+    }
+
+    #[test]
+    fn none_effort_falls_back_for_claude() {
+        assert_eq!(
+            normalize_effort_for_model("claude-opus-4.7", "none").as_deref(),
+            Some("high")
+        );
     }
 
     #[test]
@@ -2534,6 +2781,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
         assert_eq!(determine_chat_trigger_type(&req), "MANUAL");
     }
@@ -2739,14 +2987,52 @@ mod tests {
     }
 
     #[test]
-    fn cc_outbound_read_pages_errors() {
-        let err = map_tool_input_to_kiro(
+    fn cc_outbound_read_pages_is_dropped() {
+        let out = map_tool_input_to_kiro(
             "Read",
-            serde_json::json!({"file_path": "/a", "pages": "1-3"}),
+            serde_json::json!({"file_path": "/a", "offset": 3, "pages": "1-3"}),
             ToolCompatibilityMode::ClaudeCode,
         )
-        .unwrap_err();
-        assert!(matches!(err, ConversionError::UnsupportedToolMapping(_)));
+        .unwrap();
+        assert!(out.get("pages").is_none());
+        assert_eq!(out["path"], serde_json::json!("/a"));
+        assert_eq!(out["start_line"], serde_json::json!(3));
+    }
+
+    /// 回归：历史 assistant 消息里的 Read.pages（含空串）不应让整个请求 400。
+    /// 该入参只会出现在回放历史中，客户端无法修正，报错会让该会话此后每次请求都失败。
+    #[test]
+    fn cc_history_read_with_pages_converts_without_error() {
+        use super::super::types::Message as AnthropicMessage;
+
+        for pages in [serde_json::json!("1-3"), serde_json::json!("")] {
+            let msg = AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {"type": "tool_use", "id": "toolu_01PDF", "name": "Read",
+                     "input": {"file_path": "/a.pdf", "pages": pages}}
+                ]),
+            };
+            let mut map = HashMap::new();
+            let result = convert_assistant_message(
+                &msg,
+                &mut map,
+                ToolCompatibilityMode::ClaudeCode,
+                ConversionPurpose::Generate,
+            )
+            .unwrap_or_else(|e| panic!("pages={pages} 的历史 Read 应能转换: {e}"));
+
+            let tool_uses = result
+                .assistant_response_message
+                .tool_uses
+                .expect("应保留 tool_use");
+            assert_eq!(tool_uses[0].name, "read_file");
+            assert_eq!(tool_uses[0].input["path"], serde_json::json!("/a.pdf"));
+            assert!(
+                tool_uses[0].input.get("pages").is_none(),
+                "Kiro read_file schema 为 additionalProperties:false，不能带 pages"
+            );
+        }
     }
 
     #[test]
@@ -2816,6 +3102,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
         // convert_request 测试垫片默认 ClaudeCode 模式。
         let result = convert_request(&req).unwrap();
@@ -2857,6 +3144,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2921,6 +3209,7 @@ mod tests {
             tool_choice: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -2978,6 +3267,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -3066,6 +3356,7 @@ mod tests {
                     "user_0dede55c6dcc4a11a30bbb5e7f22e6fdf86cdeba3820019cc27612af4e1243cd_account__session_a0662283-7fd3-4399-a7eb-52b9a717ae88".to_string(),
                 ),
             }),
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -3073,6 +3364,24 @@ mod tests {
             result.conversation_state.conversation_id,
             "a0662283-7fd3-4399-a7eb-52b9a717ae88"
         );
+
+        // agentContinuationId 由 conversationId 确定性派生：同一会话两次转换必须相同，
+        // 且保持 UUID 格式（上游按 36 字符 UUID 接受）。
+        let again = convert_request(&req).unwrap();
+        let first_acid = result.conversation_state.agent_continuation_id.clone().unwrap();
+        let second_acid = again.conversation_state.agent_continuation_id.clone().unwrap();
+        assert_eq!(first_acid, second_acid, "同一会话的 agentContinuationId 必须稳定");
+        assert!(is_valid_uuid(&first_acid));
+        assert_ne!(
+            first_acid, result.conversation_state.conversation_id,
+            "派生值不应与 conversationId 相同"
+        );
+        assert_eq!(
+            first_acid,
+            derive_agent_continuation_id("a0662283-7fd3-4399-a7eb-52b9a717ae88")
+        );
+        // 不同会话派生出不同值
+        assert_ne!(first_acid, derive_agent_continuation_id("other-session"));
     }
 
     #[test]
@@ -3094,6 +3403,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -3323,7 +3633,13 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
+        let result = convert_assistant_message(
+            &msg,
+            &mut HashMap::new(),
+            ToolCompatibilityMode::Raw,
+            ConversionPurpose::Generate,
+        )
+        .expect("应该成功转换");
 
         // 验证 content 不为空（使用占位符）
         assert!(
@@ -3358,7 +3674,13 @@ mod tests {
             ]),
         };
 
-        let result = convert_assistant_message(&msg, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("应该成功转换");
+        let result = convert_assistant_message(
+            &msg,
+            &mut HashMap::new(),
+            ToolCompatibilityMode::Raw,
+            ConversionPurpose::Generate,
+        )
+        .expect("应该成功转换");
 
         // 验证 content 使用原始文本（不是占位符）
         assert_eq!(
@@ -3471,7 +3793,13 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new(), ToolCompatibilityMode::Raw).expect("合并应成功");
+        let result = merge_assistant_messages(
+            &messages,
+            &mut HashMap::new(),
+            ToolCompatibilityMode::Raw,
+            ConversionPurpose::Generate,
+        )
+        .expect("合并应成功");
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
@@ -3524,6 +3852,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req);
@@ -3583,6 +3912,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -3636,6 +3966,7 @@ mod tests {
             thinking: None,
             output_config: None,
             metadata: None,
+            cache_control: None,
         };
 
         let result = convert_request(&req).unwrap();
@@ -3648,231 +3979,6 @@ mod tests {
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
-        );
-    }
-
-    /// 历史里的同 id `tool_result` 必须去重，否则上游 `TOOL_USE_RESULT_MISMATCH` 拒整个请求。
-    ///
-    /// 回归的是一条**不可重试**的失败：`each tool_use must have a single result`。该 reason
-    /// 在 [`crate::kiro::endpoint`] 的 `CLIENT_VALIDATION_REASONS` 里，命中即终止，不重试。
-    ///
-    /// 形状取自实际故障（`messages.24.content.1`）：重复必须落在**历史**里才能复现 ——
-    /// 落在最后一条消息时 `validate_tool_pairing` 会兜住（那条路径本来就有防护）。所以
-    /// 这里刻意再追加两轮把带重复的 user 消息推进 history，删掉这两轮测试就失效了。
-    #[test]
-    fn history_duplicate_tool_result_is_deduped_before_upstream() {
-        use super::super::types::Message as AnthropicMessage;
-
-        // 一轮完整的工具调用：assistant 发 tool_use，user 回两个同 id 的 tool_result。
-        // 这正是 message.24 那种长会话里断线重发会产生的形状。
-        let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            max_tokens: 64,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("读一下文件"),
-                },
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!([
-                        {"type": "tool_use", "id": "tool-1", "name": "read",
-                         "input": {"path": "/a.txt"}}
-                    ]),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"},
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"},
-                    ]),
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: Some(vec![super::super::types::Tool {
-                tool_type: None,
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: [("type".to_string(), serde_json::json!("object"))]
-                    .into_iter()
-                    .collect(),
-                max_uses: None,
-                cache_control: None,
-            }]),
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
-
-        // 再追加两轮，把带重复的那条 user 消息推进 history。
-        let mut req = req;
-        req.messages.push(AnthropicMessage {
-            role: "assistant".to_string(),
-            content: serde_json::json!("读完了"),
-        });
-        req.messages.push(AnthropicMessage {
-            role: "user".to_string(),
-            content: serde_json::json!("继续"),
-        });
-
-        let result = convert_request(&req).unwrap();
-
-        // 统计整个报文（current + history）里每个 tool_use_id 出现几次。
-        // 上游校验的是这个口径，不是单条消息内的。
-        let mut per_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut kept_content: Option<String> = None;
-        for r in &result
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results
-        {
-            *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
-        }
-        for m in &result.conversation_state.history {
-            if let Message::User(u) = m {
-                for r in &u.user_input_message.user_input_message_context.tool_results {
-                    *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
-                    if r.tool_use_id == "tool-1" && kept_content.is_none() {
-                        kept_content = r.content
-                            .first()
-                            .and_then(|v| v.get("text"))
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string);
-                    }
-                }
-            }
-        }
-
-        assert_eq!(
-            per_id.get("tool-1").copied(),
-            Some(1),
-            "同一 tool_use_id 在发给上游的报文里只能出现一次，实际分布：{per_id:?}"
-        );
-        assert_eq!(
-            kept_content.as_deref(),
-            Some("first"),
-            "重复时必须保留首次出现的 result —— 后来的那个来自断线重发"
-        );
-    }
-
-    /// 重复的第二种来源：同 id 分散在**两条连续 user 消息**里，被合并进同一条历史消息。
-    ///
-    /// 与 [`history_duplicate_tool_result_is_deduped_before_upstream`] 是不同形状：那条是
-    /// 单个 content 数组内的重复，这条是 `merge_user_messages` 的
-    /// `all_tool_results.extend(...)` 把两条消息的 result 累加到一起。两条都得钉住 ——
-    /// 只修一种的话另一种照样能把请求打成不可重试的 400。
-    ///
-    /// 底层的 `merge_user_messages` **刻意不去重**，去重统一在
-    /// [`dedup_history_tool_results`] 做一次。所以这条测试必须走完整 `convert_request`，
-    /// 直接调 `merge_user_messages` 断言 1 个会是错的。
-    #[test]
-    fn cross_message_duplicate_tool_result_is_deduped_before_upstream() {
-        use super::super::types::Message as AnthropicMessage;
-
-        let req = MessagesRequest {
-            model: "claude-sonnet-4-5-20250929".to_string(),
-            max_tokens: 64,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("读一下文件"),
-                },
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!([
-                        {"type": "tool_use", "id": "tool-1", "name": "read",
-                         "input": {"path": "/a.txt"}}
-                    ]),
-                },
-                // 两条连续 user 消息各带一个同 id 的 result —— 会被合并成一条历史消息。
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"}
-                    ]),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!([
-                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"}
-                    ]),
-                },
-                // 再追加两轮，把上面那两条推进 history。
-                AnthropicMessage {
-                    role: "assistant".to_string(),
-                    content: serde_json::json!("读完了"),
-                },
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("继续"),
-                },
-            ],
-            stream: false,
-            system: None,
-            tools: Some(vec![super::super::types::Tool {
-                tool_type: None,
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: [("type".to_string(), serde_json::json!("object"))]
-                    .into_iter()
-                    .collect(),
-                max_uses: None,
-                cache_control: None,
-            }]),
-            tool_choice: None,
-            thinking: None,
-            output_config: None,
-            metadata: None,
-        };
-
-        let result = convert_request(&req).unwrap();
-
-        let mut per_id: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for r in &result
-            .conversation_state
-            .current_message
-            .user_input_message
-            .user_input_message_context
-            .tool_results
-        {
-            *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
-        }
-        for m in &result.conversation_state.history {
-            if let Message::User(u) = m {
-                for r in &u.user_input_message.user_input_message_context.tool_results {
-                    *per_id.entry(r.tool_use_id.clone()).or_default() += 1;
-                }
-            }
-        }
-
-        assert_eq!(
-            per_id.get("tool-1").copied(),
-            Some(1),
-            "跨消息合并产生的重复也必须去掉，实际分布：{per_id:?}"
-        );
-    }
-
-    /// 单条消息内的重复在**解析层**是原样保留的 —— 去重不在这一层。
-    ///
-    /// 钉住这个分工：`process_message_content` 只做协议解析，不承担去重职责；
-    /// 「一个 tool_use_id 只能出现一次」由 [`dedup_history_tool_results`] 统一保证。
-    /// 若将来有人为了"就近修复"把去重塞进解析层，这条会失败并提示去看那个函数 ——
-    /// 两层都去重不是错，但会让不变量的归属重新变得模糊，那正是本次故障的成因。
-    #[test]
-    fn parsing_layer_keeps_duplicates_dedup_is_a_separate_step() {
-        let content = serde_json::json!([
-            {"type": "tool_result", "tool_use_id": "tool-1", "content": "first"},
-            {"type": "tool_result", "tool_use_id": "tool-1", "content": "second"},
-        ]);
-        let (_, _, results) = process_message_content(&content).unwrap();
-        assert_eq!(
-            results.len(),
-            2,
-            "解析层不去重（去重在 dedup_history_tool_results）"
         );
     }
 }

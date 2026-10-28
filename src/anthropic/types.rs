@@ -48,6 +48,8 @@ pub struct Model {
     pub display_name: String,
     #[serde(rename = "type")]
     pub model_type: String,
+    /// 上下文窗口（输入 token 上限），对应上游 `maxInputTokens`。
+    pub context_window: i32,
     pub max_tokens: i32,
 }
 
@@ -64,7 +66,7 @@ pub struct ModelsResponse {
 const MAX_BUDGET_TOKENS: i32 = 24576;
 
 /// Thinking 配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Thinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
@@ -94,7 +96,7 @@ where
 }
 
 /// OutputConfig 配置
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
@@ -105,14 +107,14 @@ fn default_effort() -> String {
 }
 
 /// Claude Code 请求中的 metadata
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Metadata {
     /// 用户 ID，格式如: user_xxx_account__session_0b4445e1-f5be-49e1-87ce-62bbc28ad705
     pub user_id: Option<String>,
 }
 
 /// Messages 请求体
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct MessagesRequest {
     pub model: String,
@@ -129,6 +131,9 @@ pub struct MessagesRequest {
     pub output_config: Option<OutputConfig>,
     /// Claude Code 请求中的 metadata，包含 session 信息
     pub metadata: Option<Metadata>,
+    /// 顶层 cache_control（开启自动提示词缓存）
+    #[serde(default)]
+    pub cache_control: Option<CacheControl>,
 }
 
 fn default_max_tokens() -> i32 {
@@ -337,33 +342,17 @@ mod tests {
         assert_eq!(request.max_tokens, 4096);
     }
 
-    /// 记录「往返序列化会实体化 serde 默认值」这一事实 —— 它是
-    /// [`super::middleware::RawBody`] 存在的理由。
-    ///
-    /// 客户端发 `thinking:{"type":"disabled"}`，往返后凭空多出
-    /// `budget_tokens:20000`，而 Anthropic 对 `disabled` 不接受该字段，直接 400
-    /// `thinking.budget_tokens is not supported when thinking.type is disabled`。
-    /// 同理还会多出 `max_tokens` 与一串显式 `null`。
-    ///
-    /// **本测试断言注入确实发生**，不是在断言"这样是对的"。它是一道守卫：若有人
-    /// 把 `budget_tokens` 改成 `Option` + `skip_serializing_if`，本测试会失败并把人
-    /// 引到这段注释 —— 那时才该重新评估上游直通是否仍需转发原始字节。在此之前，
-    /// 直通路径**不得**使用 `serde_json::to_string(&payload)`。
     #[test]
-    fn roundtrip_materializes_serde_defaults() {
-        let mut value = request_json(None);
-        value["thinking"] = serde_json::json!({"type": "disabled"});
-        let request: MessagesRequest = serde_json::from_value(value).unwrap();
-        let out = serde_json::to_string(&request).unwrap();
-
-        assert!(
-            out.contains(r#""budget_tokens":20000"#),
-            "往返应实体化 budget_tokens 默认值（若已不再注入，见本测试文档）: {out}"
-        );
-        assert!(
-            out.contains(r#""max_tokens":32000"#),
-            "往返应实体化 max_tokens 默认值: {out}"
-        );
-        assert!(out.contains(r#""system":null"#), "往返应写出显式 null: {out}");
+    fn messages_request_deserializes_top_level_cache_control() {
+        let json = serde_json::json!({
+            "model": "claude-sonnet-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "cache_control": {"type": "ephemeral", "ttl": "1h"}
+        });
+        let request: MessagesRequest = serde_json::from_value(json).unwrap();
+        assert!(request.cache_control.is_some());
+        let cc = request.cache_control.unwrap();
+        assert_eq!(cc.cache_type, "ephemeral");
+        assert_eq!(cc.ttl.as_deref(), Some("1h"));
     }
 }

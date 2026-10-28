@@ -6,56 +6,26 @@
 //! 支持按凭据级 endpoint 切换不同 Kiro API 端点
 
 use reqwest::Client;
-use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
-use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::admin::trace_db::{TraceAttempt, TraceRoute, TraceSink, outcome, truncate_snippet};
+use crate::http_client::{ProxyConfig, build_client_with_timeouts};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
-use crate::kiro::error::UpstreamRateLimitError;
+use crate::kiro::error::{
+    UpstreamContextOverflowError, UpstreamModelUnavailableError, UpstreamRateLimitError,
+    UpstreamTimeoutError,
+};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
-use anyhow::anyhow;
 use parking_lot::Mutex;
 
-/// 将 Kiro 协议请求体转换为 Anthropic Messages API 格式。
-///
-/// 仅提取核心字段（model / messages / max_tokens / stream），用于上游直通凭据在无
-/// anthropic_body 时的降级转换（如 admin 模型测试）。
-fn convert_kiro_to_anthropic_body(kiro_body: &str, is_stream: bool) -> anyhow::Result<String> {
-    let v: Value = serde_json::from_str(kiro_body)
-        .map_err(|e| anyhow!("kiro_body 解析失败: {}", e))?;
-
-    let model_id = v["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
-        .as_str()
-        .ok_or_else(|| anyhow!("kiro_body 缺少 modelId"))?;
-
-    // content 可能是字符串（纯文本）或数组（多模态），两种情况都要正确保留。
-    // 以前用 .as_str().unwrap_or("test")，当 content 为数组时 as_str() 返回 None，
-    // 导致多模态内容被静默替换为字面量 "test"。
-    let raw_content = &v["conversationState"]["currentMessage"]["userInputMessage"]["content"];
-    let content: Value = if raw_content.is_string() || raw_content.is_array() {
-        raw_content.clone()
-    } else {
-        // 解析到 Null / Object 等意外类型：降级为空字符串，至少不发送错误内容
-        Value::String(String::new())
-    };
-
-    let anthropic_req = json!({
-        "model": model_id,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 1024,
-        "stream": is_stream,
-    });
-
-    serde_json::to_string(&anthropic_req)
-        .map_err(|e| anyhow!("Anthropic body 序列化失败: {}", e))
-}
+#[cfg(test)]
+mod proxy_tests;
 
 /// 每个凭据的最大重试次数
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
@@ -67,6 +37,13 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelApi429Action {
+    Failover,
+    RetryCurrent,
+    Return,
+}
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -74,7 +51,7 @@ const CLIENT_CACHE_CAP: usize = 64;
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
-/// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
+/// - 受保护 key 始终跟随当前全局代理，旧全局代理切换后释放缓存引用
 /// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
 struct ClientCache {
     map: HashMap<Option<ProxyConfig>, Client>,
@@ -101,6 +78,16 @@ impl ClientCache {
         self.map.get(key).cloned()
     }
 
+    /// 切换全局代理时释放旧连接池；在途请求持有的 Client 克隆仍可完成响应。
+    fn set_global_proxy(&mut self, proxy: Option<ProxyConfig>) {
+        if self.protected != proxy {
+            self.map.remove(&self.protected);
+            // 新全局代理可能原本是凭据专属代理，升级为常驻条目后不再参与淘汰。
+            self.order.retain(|key| key != &proxy);
+            self.protected = proxy;
+        }
+    }
+
     /// 插入新条目，必要时淘汰最旧的非受保护条目
     fn insert(&mut self, key: Option<ProxyConfig>, client: Client) {
         if key == self.protected || self.map.contains_key(&key) {
@@ -123,8 +110,15 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
-    /// 是否由上游 Anthropic API 凭据直通返回（响应为 Anthropic JSON 格式）
-    pub is_upstream: bool,
+}
+
+/// A successful MCP HTTP response whose trace attempt is finalized after body validation.
+struct McpCallResult {
+    response: reqwest::Response,
+    credential_id: u64,
+    endpoint: &'static str,
+    attempt: usize,
+    started_at: Instant,
 }
 
 /// Kiro API Provider
@@ -134,8 +128,6 @@ pub struct KiroCallResult {
 /// 按凭据 `endpoint` 字段选择 [`KiroEndpoint`] 实现
 pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
-    /// 全局代理配置（用于凭据无自定义代理时的回退）
-    global_proxy: Option<ProxyConfig>,
     /// Client 缓存：key = effective proxy config, value = reqwest::Client
     /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
@@ -160,16 +152,14 @@ impl KiroProvider {
         &self.token_manager
     }
 
-    /// 创建带代理配置和端点注册表的 KiroProvider 实例
+    /// 创建 KiroProvider；全局代理始终从共享凭据管理器读取。
     ///
     /// # Arguments
     /// * `token_manager` - 多凭据 Token 管理器
-    /// * `proxy` - 全局代理配置
     /// * `endpoints` - 端点名 → 实现的注册表（至少包含 `default_endpoint` 对应条目）
     /// * `default_endpoint` - 凭据未显式指定 endpoint 时使用的名称
-    pub fn with_proxy(
+    pub fn new(
         token_manager: Arc<MultiTokenManager>,
-        proxy: Option<ProxyConfig>,
         endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
         default_endpoint: String,
     ) -> Self {
@@ -179,14 +169,21 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
+        let proxy = token_manager.proxy();
         // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
-            .expect("创建 HTTP 客户端失败");
+        let config = token_manager.config();
+        let initial_client = build_client_with_timeouts(
+            proxy.as_ref(),
+            config.upstream_total_timeout_secs,
+            tls_backend,
+            config.upstream_connect_timeout_secs,
+            config.upstream_read_timeout_secs,
+        )
+        .expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
-            global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
@@ -197,23 +194,24 @@ impl KiroProvider {
 
     /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
-        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
+        // 在缓存锁内读取最新代理，避免并发请求用旧快照将缓存切回旧全局代理。
+        let global_proxy = self.token_manager.proxy();
+        cache.set_global_proxy(global_proxy.clone());
+        let effective = credentials.effective_proxy(global_proxy.as_ref());
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
+        let config = self.token_manager.config();
+        let client = build_client_with_timeouts(
+            effective.as_ref(),
+            config.upstream_total_timeout_secs,
+            self.tls_backend,
+            config.upstream_connect_timeout_secs,
+            config.upstream_read_timeout_secs,
+        )?;
         cache.insert(effective, client.clone());
         Ok(client)
-    }
-
-    /// 获取当前 token 膨胀倍率 (input, output, cache)
-    pub fn get_inflation_multipliers(&self) -> (f64, f64, f64) {
-        (
-            self.token_manager.get_input_inflation_multiplier(),
-            self.token_manager.get_output_inflation_multiplier(),
-            self.token_manager.get_cache_inflation_multiplier(),
-        )
     }
 
     /// 根据凭据选择 endpoint 实现
@@ -247,9 +245,7 @@ impl KiroProvider {
     ) -> anyhow::Result<()> {
         use crate::kiro::model::credentials::is_placeholder_profile_arn;
 
-        if ctx.credentials.is_api_key_credential()
-            || ctx.credentials.is_upstream_credential()
-        {
+        if ctx.credentials.is_api_key_credential() {
             return Ok(());
         }
         let needs = match ctx.credentials.profile_arn.as_deref() {
@@ -293,71 +289,23 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
     /// `sink` 可选，用于逐跳上报链路追踪。
-    #[allow(dead_code)]
     pub async fn call_api(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, None, None, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, group).await
     }
 
     /// 发送流式 API 请求
-    #[allow(dead_code)]
     pub async fn call_api_stream(
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, None, None, true, sink, group).await
-    }
-
-    /// 发送非流式双路径 API 请求（支持上游凭据直通）
-    ///
-    /// `anthropic_body` 为 Anthropic 格式的请求体原文，当命中上游凭据时直接转发。
-    /// `upstream_beta` 为客户端携带的 `anthropic-beta` 头值，透传给上游。
-    pub async fn call_api_dual(
-        &self,
-        request_body: &str,
-        anthropic_body: Option<&str>,
-        upstream_beta: Option<&str>,
-        sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
-    ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, anthropic_body, upstream_beta, false, sink, group).await
-    }
-
-    /// 发送指定凭据的双协议测试请求，不参与账号池切换。
-    pub async fn call_api_dual_for_credential(
-        &self,
-        credential_id: u64,
-        request_body: &str,
-        anthropic_body: &str,
-    ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry_for_credential(
-            request_body,
-            Some(anthropic_body),
-            None,
-            false,
-            None,
-            None,
-            Some(credential_id),
-        )
-        .await
-    }
-
-    /// 发送流式双路径 API 请求（支持上游凭据直通）
-    pub async fn call_api_stream_dual(
-        &self,
-        request_body: &str,
-        anthropic_body: Option<&str>,
-        upstream_beta: Option<&str>,
-        sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
-    ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, anthropic_body, upstream_beta, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, group).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -366,31 +314,123 @@ impl KiroProvider {
         request_body: &str,
         group: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body, group).await
+        let result = self.call_mcp_with_retry(request_body, None, group).await?;
+        self.token_manager
+            .report_success_for_request(result.credential_id, None);
+        Ok(result.response)
+    }
+
+    /// 发送 MCP API 请求，并在响应正文通过调用方校验后提交最终 trace attempt。
+    pub(crate) async fn call_mcp_with_trace<T>(
+        &self,
+        request_body: &str,
+        sink: &dyn TraceSink,
+        group: Option<&str>,
+        validate: fn(&str) -> anyhow::Result<T>,
+        is_benign_error: fn(&anyhow::Error) -> bool,
+    ) -> anyhow::Result<T> {
+        let result = self
+            .call_mcp_with_retry(request_body, Some(sink), group)
+            .await?;
+        let status = result.response.status().as_u16();
+        let body = match result.response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                Self::emit_attempt(
+                    Some(sink),
+                    result.attempt,
+                    result.credential_id,
+                    result.endpoint,
+                    Some(status),
+                    outcome::NETWORK_ERROR,
+                    Some(&e.to_string()),
+                    result.started_at,
+                );
+                return Err(e.into());
+            }
+        };
+
+        let validation = validate(&body);
+        let validation_outcome = Self::mcp_validation_outcome(&validation, is_benign_error);
+        let error = validation
+            .as_ref()
+            .err()
+            .filter(|_| validation_outcome != outcome::SUCCESS)
+            .map(|e| format!("{}: {}", e, body));
+        Self::emit_attempt(
+            Some(sink),
+            result.attempt,
+            result.credential_id,
+            result.endpoint,
+            Some(status),
+            validation_outcome,
+            error.as_deref(),
+            result.started_at,
+        );
+        if validation_outcome == outcome::SUCCESS {
+            self.token_manager
+                .report_success_for_request(result.credential_id, None);
+        }
+        validation
+    }
+
+    fn mcp_validation_outcome<T>(
+        validation: &anyhow::Result<T>,
+        is_benign_error: fn(&anyhow::Error) -> bool,
+    ) -> &'static str {
+        match validation {
+            Ok(_) => outcome::SUCCESS,
+            Err(error) if is_benign_error(error) => outcome::SUCCESS,
+            Err(_) => outcome::UNKNOWN,
+        }
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(
         &self,
         request_body: &str,
+        sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
+    ) -> anyhow::Result<McpCallResult> {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
+            let attempt_start = Instant::now();
             // MCP 调用不涉及模型选择，但必须遵守客户端 Key 的凭据分组隔离。
             let mut ctx = match self.token_manager.acquire_context(None, group).await {
                 Ok(c) => c,
                 Err(e) => {
                     if is_rate_limit_error(&e) {
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            0,
+                            "",
+                            None,
+                            outcome::TRANSIENT,
+                            Some(&e.to_string()),
+                            attempt_start,
+                        );
                         return Err(e);
                     }
+                    // Preserve the prior upstream 429 as the terminal trace attempt. A
+                    // concurrent selection failure has no credential to attribute.
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        0,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     continue;
                 }
@@ -398,7 +438,19 @@ impl KiroProvider {
 
             // Pure MCP routes (including Web Search) require the same Enterprise / IdC
             // profileArn resolution as regular model calls.
-            self.ensure_profile_arn(&mut ctx).await?;
+            if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    "",
+                    None,
+                    outcome::TRANSIENT,
+                    Some(&e.to_string()),
+                    attempt_start,
+                );
+                return Err(e);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -406,6 +458,16 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        "",
+                        None,
+                        outcome::UNKNOWN,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
                     last_error = Some(e);
                     // endpoint 解析失败：记为失败，换下一张凭据
                     self.token_manager
@@ -413,23 +475,39 @@ impl KiroProvider {
                     continue;
                 }
             };
+            let endpoint_name = endpoint.name();
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let client = match self.client_for(&ctx.credentials) {
+                Ok(client) => client,
+                Err(e) => {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
+                    return Err(e);
+                }
+            };
+            let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -441,6 +519,27 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        None,
+                        outcome::NETWORK_ERROR,
+                        Some(&e.to_string()),
+                        attempt_start,
+                    );
+                    // 凭据专属代理故障时，跳过该凭据换下一个。
+                    let has_own_proxy = ctx
+                        .credentials
+                        .proxy_url
+                        .as_deref()
+                        .is_some_and(|u| !u.trim().is_empty());
+                    if has_own_proxy {
+                        tracing::warn!("凭据 #{} 有专属代理且 MCP 请求失败，跳过该凭据", ctx.id);
+                        self.token_manager
+                            .report_failure_for_request(ctx.id, None, group);
+                    }
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -455,8 +554,13 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
-                self.token_manager.report_success_for_request(ctx.id, None);
-                return Ok(response);
+                return Ok(McpCallResult {
+                    response,
+                    credential_id: ctx.id,
+                    endpoint: endpoint_name,
+                    attempt,
+                    started_at: attempt_start,
+                });
             }
 
             // 失败响应
@@ -464,6 +568,16 @@ impl KiroProvider {
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::QUOTA_EXHAUSTED,
+                    Some(&body),
+                    attempt_start,
+                );
                 let has_available = self
                     .token_manager
                     .report_quota_exhausted_for_request(ctx.id, None, group);
@@ -476,6 +590,16 @@ impl KiroProvider {
 
             // 400 Bad Request
             if status.as_u16() == 400 {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
@@ -486,6 +610,16 @@ impl KiroProvider {
                     && self.token_manager.get_suspended_detection_enabled()
                     && endpoint.is_account_suspended(&body)
                 {
+                    Self::emit_attempt(
+                        sink,
+                        attempt,
+                        ctx.id,
+                        endpoint_name,
+                        Some(status.as_u16()),
+                        outcome::ACCOUNT_SUSPENDED,
+                        Some(&body),
+                        attempt_start,
+                    );
                     let has_available = self
                         .token_manager
                         .report_suspended_for_request(ctx.id, None, group);
@@ -495,6 +629,17 @@ impl KiroProvider {
                     last_error = Some(anyhow::anyhow!("MCP 请求失败（账号封禁）: {} {}", status, body));
                     continue;
                 }
+
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::AUTH_FAILED,
+                    Some(&body),
+                    attempt_start,
+                );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
                 if endpoint.is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
@@ -528,6 +673,16 @@ impl KiroProvider {
                     status,
                     body
                 );
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
+                );
                 last_error = if let Some(rate_limit) = rate_limit_error {
                     if !rate_limit.should_retry_locally() {
                         return Err(rate_limit.into());
@@ -550,10 +705,30 @@ impl KiroProvider {
 
             // 其他 4xx
             if status.is_client_error() {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::BAD_REQUEST,
+                    Some(&body),
+                    attempt_start,
+                );
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
             // 兜底
+            Self::emit_attempt(
+                sink,
+                attempt,
+                ctx.id,
+                endpoint_name,
+                Some(status.as_u16()),
+                outcome::UNKNOWN,
+                Some(&body),
+                attempt_start,
+            );
             last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
@@ -574,27 +749,9 @@ impl KiroProvider {
     async fn call_api_with_retry(
         &self,
         request_body: &str,
-        anthropic_body: Option<&str>,
-        upstream_beta: Option<&str>,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
-    ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry_for_credential(
-            request_body, anthropic_body, upstream_beta, is_stream, sink, group, None,
-        )
-        .await
-    }
-
-    async fn call_api_with_retry_for_credential(
-        &self,
-        request_body: &str,
-        anthropic_body: Option<&str>,
-        upstream_beta: Option<&str>,
-        is_stream: bool,
-        sink: Option<&dyn TraceSink>,
-        group: Option<&str>,
-        forced_credential_id: Option<u64>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -603,36 +760,66 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
-        // 尝试从请求体中提取模型信息
-        let model = Self::extract_model_from_request(request_body);
+        // 尝试从请求体中提取模型与会话标识
+        let (model, session_id) = Self::extract_routing_hints(request_body);
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
-            // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match if let Some(id) = forced_credential_id {
-                self.token_manager.acquire_context_for(id).await
-            } else {
-                self.token_manager.acquire_context(model.as_deref(), group).await
-            } {
-                Ok(c) => c,
+            // 获取调用上下文（绑定 index、credentials、token）；同一会话优先沿用上一轮凭据
+            let mut ctx = match self
+                .token_manager
+                .acquire_context_routed(model.as_deref(), group, session_id.as_deref())
+                .await
+            {
+                Ok((c, route)) => {
+                    // 只在首次选号时计入命中率并上报 trace；重试轮次的判定受本请求内
+                    // 刚发生的失败影响，不代表会话层面的粘性效果。
+                    if attempt == 0 {
+                        self.token_manager.record_route(&route);
+                        if let Some(sink) = sink {
+                            sink.on_route(TraceRoute {
+                                session_id: session_id.clone(),
+                                sticky_outcome: route.sticky_outcome.as_str(),
+                                previous_credential_id: route.previous_credential_id,
+                            });
+                        }
+                    }
+                    c
+                }
                 Err(e) => {
-                    Self::emit_attempt(
-                        sink, attempt, 0, "", None, outcome::UNKNOWN,
-                        Some(&e.to_string()), attempt_start,
-                    );
                     if is_rate_limit_error(&e) {
+                        Self::emit_attempt(
+                            sink, attempt, 0, "", None, outcome::TRANSIENT,
+                            Some(&e.to_string()), attempt_start,
+                        );
                         return Err(e);
                     }
                     if let Some(rate_limit) = take_rate_limit_error(&mut last_error) {
                         return Err(rate_limit);
                     }
+                    Self::emit_attempt(
+                        sink, attempt, 0, "", None, outcome::UNKNOWN,
+                        Some(&e.to_string()), attempt_start,
+                    );
                     last_error = Some(e);
                     continue;
                 }
             };
 
             // 确保 Enterprise / IdC 账号的真实 profileArn 已解析（流式端点强制要求）
-            self.ensure_profile_arn(&mut ctx).await?;
+            if let Err(e) = self.ensure_profile_arn(&mut ctx).await {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    "",
+                    None,
+                    outcome::TRANSIENT,
+                    Some(&e.to_string()),
+                    attempt_start,
+                );
+                return Err(e);
+            }
 
             let config = self.token_manager.config();
             let machine_id = machine_id::generate_from_credentials(&ctx.credentials, config);
@@ -652,246 +839,12 @@ impl KiroProvider {
             };
             let endpoint_name = endpoint.name();
 
-            // ===== 上游凭据直通路径 =====
-            if ctx.credentials.is_upstream_credential() {
-                let base_url = match ctx.credentials.upstream_base_url.as_deref() {
-                    Some(u) => u,
-                    None => {
-                        tracing::error!(
-                            "上游凭据 #{} is_upstream_credential()=true 但 upstream_base_url 为空，跳过",
-                            ctx.id
-                        );
-                        self.token_manager
-                            .report_failure_for_request(ctx.id, model.as_deref(), group);
-                        last_error = Some(anyhow::anyhow!("凭据 #{} 缺少 upstream_base_url", ctx.id));
-                        continue;
-                    }
-                };
-                let upstream_url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
-
-                let body = match anthropic_body {
-                    Some(b) => b.to_string(),
-                    None => {
-                        // 没有 anthropic_body 时尝试从 kiro_body 转换（admin测试等场景）
-                        match convert_kiro_to_anthropic_body(request_body, is_stream) {
-                            Ok(converted) => converted,
-                            Err(e) => {
-                                tracing::warn!(
-                                    "上游凭据 #{} 无 anthropic_body 且 kiro_body 转换失败: {}",
-                                    ctx.id, e
-                                );
-                                self.token_manager
-                                    .report_failure_for_request(ctx.id, model.as_deref(), group);
-                                last_error = Some(e);
-                                continue;
-                            }
-                        }
-                    }
-                };
-
-                tracing::debug!("上游直通 POST {} (credential #{})", upstream_url, ctx.id);
-
-                let mut req_builder = self
-                    .client_for(&ctx.credentials)?
-                    .post(&upstream_url)
-                    .body(body)
-                    .header("content-type", "application/json")
-                    .header("x-api-key", &ctx.token)
-                    .header("anthropic-version", "2023-06-01");
-
-                // 透传客户端的 anthropic-beta 头（kiro.rs 需要它来启用扩展思考等功能）
-                if let Some(beta) = upstream_beta {
-                    req_builder = req_builder.header("anthropic-beta", beta);
-                }
-
-                let request = req_builder
-                    .build()
-                    .map_err(|e| anyhow::anyhow!("构建上游请求失败: {}", e))?;
-
-                let response = match self.client_for(&ctx.credentials)?.execute(request).await {
-                    Ok(resp) => resp,
-                    Err(e) => {
-                        tracing::warn!(
-                            "上游 API 请求发送失败（尝试 {}/{}）: {}",
-                            attempt + 1, max_retries, e
-                        );
-                        Self::emit_attempt(
-                            sink, attempt, ctx.id, "upstream", None,
-                            outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
-                        );
-                        last_error = Some(e.into());
-                        if attempt + 1 < max_retries {
-                            sleep(Self::retry_delay(attempt)).await;
-                        }
-                        continue;
-                    }
-                };
-
-                let status = response.status();
-
-                if status.is_success() {
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
-                        outcome::SUCCESS, None, attempt_start,
-                    );
-                    self.token_manager
-                        .report_success_for_request(ctx.id, model.as_deref());
-                    return Ok(KiroCallResult {
-                        response,
-                        credential_id: ctx.id,
-                        is_upstream: true,
-                    });
-                }
-
-                // 必须在 response.text()（消耗 response）之前提取 Retry-After，
-                // 否则 headers 随 response 一起消耗，只能拿到空 HeaderMap。
-                let rate_limit_429 = (status.as_u16() == 429)
-                    .then(|| UpstreamRateLimitError::from_headers(response.headers()));
-
-                let body_text = response.text().await.unwrap_or_default();
-                // 从 token_manager 取运行时副本而非启动时 config 快照：
-                // Admin API 热更新检测规则后必须立即生效，无需重启。
-                let failover_cfg = self.token_manager.get_upstream_failover_config();
-
-                // 封禁文案检测：立即禁用（Suspended，不参与自愈）并切号。
-                // 必须先于欠费与通用 401/403 —— 封禁文案里常同时出现额度字样，
-                // 后判会把「封号」降级成「欠费」，禁用原因和面板提示都会错。
-                if matches!(status.as_u16(), 401 | 403)
-                    && failover_cfg.matches_suspended(&body_text)
-                {
-                    tracing::error!(
-                        "上游 API 请求失败（命中封禁文案，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
-                        ctx.id, attempt + 1, max_retries, status, body_text
-                    );
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
-                        outcome::ACCOUNT_SUSPENDED, Some(&body_text), attempt_start,
-                    );
-                    let has_available = self.token_manager.report_suspended_for_request(
-                        ctx.id, model.as_deref(), group,
-                    );
-                    if !has_available {
-                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
-                    }
-                    last_error = Some(anyhow::anyhow!(
-                        "上游 API 请求失败（账号封禁）: {} {}", status, body_text
-                    ));
-                    continue;
-                }
-
-                // 欠费/额度用尽文案检测：立即禁用（QuotaExceeded）并切号。
-                // 覆盖 400/401/402/403 —— 中转站表达"没钱了"的状态码五花八门：
-                // Anthropic 官方走 400，OpenAI 风格网关多用 403，也有网关用 402。
-                // 未命中的 400 仍走下方"请求问题直接终止"，不影响原语义。
-                if matches!(status.as_u16(), 400 | 401 | 402 | 403)
-                    && failover_cfg.matches_quota(&body_text)
-                {
-                    tracing::warn!(
-                        "上游 API 请求失败（命中欠费文案，禁用凭据 #{} 并切换，尝试 {}/{}）: {} {}",
-                        ctx.id, attempt + 1, max_retries, status, body_text
-                    );
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
-                        outcome::QUOTA_EXHAUSTED, Some(&body_text), attempt_start,
-                    );
-                    let has_available = self.token_manager.report_quota_exhausted_for_request(
-                        ctx.id, model.as_deref(), group,
-                    );
-                    if !has_available {
-                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
-                    }
-                    last_error = Some(anyhow::anyhow!(
-                        "上游 API 请求失败（额度用尽）: {} {}", status, body_text
-                    ));
-                    continue;
-                }
-
-                if matches!(status.as_u16(), 401 | 403) {
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
-                        outcome::AUTH_FAILED, Some(&body_text), attempt_start,
-                    );
-                    let has_available = self
-                        .token_manager
-                        .report_failure_for_request(ctx.id, model.as_deref(), group);
-                    if !has_available {
-                        anyhow::bail!("上游 API 请求失败（所有凭据已用尽）: {} {}", status, body_text);
-                    }
-                    last_error = Some(anyhow::anyhow!("上游 API 请求失败: {} {}", status, body_text));
-                    continue;
-                }
-
-                if status.as_u16() == 429 {
-                    let rate_limit_error = rate_limit_429
-                        .unwrap_or_else(|| UpstreamRateLimitError::new(None));
-
-                    // 冷却切号：把当前凭据按 Retry-After（缺省用配置值）冷却，
-                    // 立即换下一个可用凭据，而不是在被限流的 key 上原地退避。
-                    if failover_cfg.throttle_failover_enabled() {
-                        let cooldown_secs = retry_after_secs(&rate_limit_error)
-                            .unwrap_or(failover_cfg.throttle_cooldown_secs)
-                            .max(1);
-                        tracing::warn!(
-                            "上游 API 请求失败（429 限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
-                            ctx.id, cooldown_secs, attempt + 1, max_retries, body_text
-                        );
-                        Self::emit_attempt(
-                            sink, attempt, ctx.id, "upstream", Some(429),
-                            outcome::ACCOUNT_THROTTLED, Some(&body_text), attempt_start,
-                        );
-                        let remaining = self.token_manager.report_account_throttled_for_request(
-                            ctx.id,
-                            std::time::Duration::from_secs(cooldown_secs),
-                            model.as_deref(),
-                            group,
-                        );
-                        // 没有其它可用凭据：把限流错误（含 Retry-After）交给客户端遵守。
-                        if remaining == 0 {
-                            return Err(rate_limit_error.into());
-                        }
-                        last_error = Some(rate_limit_error.into());
-                        continue;
-                    }
-
-                    // 旧行为（throttle_failover 关闭时）：原地退避重试。
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(429),
-                        outcome::TRANSIENT, Some(&body_text), attempt_start,
-                    );
-                    last_error = Some(rate_limit_error.into());
-                    if attempt + 1 < max_retries {
-                        sleep(Self::retry_delay(attempt)).await;
-                    }
-                    continue;
-                }
-
-                if status.as_u16() == 400 {
-                    Self::emit_attempt(
-                        sink, attempt, ctx.id, "upstream", Some(400),
-                        outcome::BAD_REQUEST, Some(&body_text), attempt_start,
-                    );
-                    anyhow::bail!("上游 API 请求失败: {} {}", status, body_text);
-                }
-
-                // 其它错误：瞬态重试
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, "upstream", Some(status.as_u16()),
-                    outcome::TRANSIENT, Some(&body_text), attempt_start,
-                );
-                last_error = Some(anyhow::anyhow!("上游 API 请求失败: {} {}", status, body_text));
-                if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
-                }
-                continue;
-            }
-
-            // ===== 正常 Kiro 协议路径 =====
-
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
                 machine_id: &machine_id,
                 config,
+                api_domain: self.token_manager.api_domain(),
             };
 
             let url = endpoint.api_url(&rctx);
@@ -900,12 +853,12 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            // 一次尝试使用同一个 Client；热更新在下一次请求或重试时生效。
+            let client = self.client_for(&ctx.credentials)?;
+            let base = client
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_api(base, &rctx);
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -915,7 +868,7 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let response = match client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -928,8 +881,22 @@ impl KiroProvider {
                         sink, attempt, ctx.id, endpoint_name, None,
                         outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
                     );
-                    // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
-                    // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
+                    if e.is_timeout() {
+                        return Err(UpstreamTimeoutError { source: e }.into());
+                    }
+                    // 凭据专属代理故障时，重试同一凭据无意义，应跳过该凭据换下一个。
+                    // 没有专属代理时（直连或仅全局代理），切换凭据不解决问题，保持重试。
+                    let has_own_proxy = ctx.credentials.proxy_url.as_deref()
+                        .map_or(false, |u| !u.trim().is_empty());
+                    if has_own_proxy {
+                        tracing::warn!(
+                            "凭据 #{} 有专属代理且网络请求失败，跳过该凭据",
+                            ctx.id
+                        );
+                        self.token_manager
+                            .report_failure_for_request(ctx.id, model.as_deref(), group);
+                    }
+
                     last_error = Some(e.into());
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
@@ -950,15 +917,59 @@ impl KiroProvider {
                 );
                 self.token_manager
                     .report_success_for_request(ctx.id, model.as_deref());
+                // 上游接受了请求才把会话钉到这个凭据，失败的凭据不会被绑定
+                if let Some(session) = session_id.as_deref() {
+                    self.token_manager.bind_session(session, ctx.id);
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
-                    is_upstream: false,
                 });
             }
 
+            let retry_after = UpstreamRateLimitError::from_headers(response.headers());
             // 失败响应：读取 body 用于日志/错误信息
-            let body = response.text().await.unwrap_or_default();
+            let body = match response.text().await {
+                Ok(body) => body,
+                Err(error) => {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                        outcome::NETWORK_ERROR, Some(&error.to_string()), attempt_start,
+                    );
+                    if error.is_timeout() {
+                        return Err(UpstreamTimeoutError { source: error }.into());
+                    }
+                    return Err(error.into());
+                }
+            };
+
+            if status.is_server_error()
+                && serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("reason")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("MODEL_TEMPORARILY_UNAVAILABLE")
+            {
+                Self::emit_attempt(
+                    sink,
+                    attempt,
+                    ctx.id,
+                    endpoint_name,
+                    Some(status.as_u16()),
+                    outcome::TRANSIENT,
+                    Some(&body),
+                    attempt_start,
+                );
+                // 只让本次请求失败，不做模型级全局冷却：过载通常只落在个别账号/节点上，
+                // 全局冷却会把一次过载放大成冷却期内该模型的所有请求都直接 503。
+                let delay = retry_after.retry_after().unwrap_or("5").to_string();
+                return Err(UpstreamModelUnavailableError { retry_after: delay }.into());
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -1003,6 +1014,9 @@ impl KiroProvider {
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,
                 );
+                if body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+                    return Err(UpstreamContextOverflowError.into());
+                }
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -1094,54 +1108,78 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429 + suspicious activity = 账号级临时风控
-            // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
-            if status.as_u16() == 429
-                && self.token_manager.get_account_throttle_failover()
-                && endpoint.is_account_throttled(&body)
-            {
-                let cooldown_secs = self
-                    .token_manager
-                    .get_account_throttle_cooldown_secs()
-                    .max(1);
-                let cooldown = std::time::Duration::from_secs(cooldown_secs);
-                tracing::warn!(
-                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
-                    ctx.id,
-                    cooldown_secs,
-                    attempt + 1,
-                    max_retries,
-                    body
-                );
+            if status.as_u16() == 429 {
+                let account_rate_limited = endpoint.is_account_rate_limited(&body);
+                match model_api_429_action(
+                    account_rate_limited,
+                    self.token_manager.get_account_throttle_failover(),
+                    self.token_manager.get_model_api_429_retry_enabled(),
+                ) {
+                    ModelApi429Action::Failover => {
+                        let cooldown_secs = self
+                            .token_manager
+                            .get_account_throttle_cooldown_secs()
+                            .max(1);
+                        let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                        tracing::warn!(
+                            "API 请求失败（账号级限流，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                            ctx.id,
+                            cooldown_secs,
+                            attempt + 1,
+                            max_retries,
+                            body
+                        );
 
-                let remaining = self
-                    .token_manager
-                    .report_account_throttled_for_request(
-                        ctx.id,
-                        cooldown,
-                        model.as_deref(),
-                        group,
-                    );
-                Self::emit_attempt(
-                    sink, attempt, ctx.id, endpoint_name, Some(429),
-                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
-                );
-                // 账号级风控通常不返回 Retry-After；此时使用本地实际冷却时间，
-                // 让下游网关在同一时段内也停止调度该虚拟账号。
-                let (rate_limit_error, must_wait_for_upstream) =
-                    account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
-
-                // 上游给出明确等待时间时必须立即交给客户端遵守，不能在同一请求中
-                // 提前换号重试。无有效 Retry-After 时仍允许按既有策略故障转移。
-                if must_wait_for_upstream {
-                    return Err(rate_limit_error.into());
+                        let remaining = self
+                            .token_manager
+                            .report_account_throttled_for_request(
+                                ctx.id,
+                                cooldown,
+                                model.as_deref(),
+                                group,
+                            );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(429),
+                            outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                        );
+                        // Retry-After 约束的是刚被限流的账号；故障转移开启时仍可立即
+                        // 尝试其它账号。若最终无账号可用，则把上游值或本地冷却时间
+                        // 返回客户端。
+                        let rate_limit_error =
+                            account_rate_limit_with_fallback(rate_limit_error, cooldown_secs);
+                        if remaining == 0 {
+                            return Err(rate_limit_error.into());
+                        }
+                        last_error = Some(rate_limit_error.into());
+                        continue;
+                    }
+                    ModelApi429Action::Return => {
+                        let outcome = if account_rate_limited {
+                            outcome::ACCOUNT_THROTTLED
+                        } else {
+                            outcome::TRANSIENT
+                        };
+                        let reason = if account_rate_limited {
+                            "账号级限流但故障转移已关闭"
+                        } else {
+                            "普通 429 自动重试已关闭"
+                        };
+                        tracing::warn!(
+                            "API 请求失败（{}，直接返回客户端）: {} {}",
+                            reason,
+                            status,
+                            body
+                        );
+                        Self::emit_attempt(
+                            sink, attempt, ctx.id, endpoint_name, Some(429),
+                            outcome, Some(&body), attempt_start,
+                        );
+                        return Err(rate_limit_error
+                            .unwrap_or_else(|| UpstreamRateLimitError::new(None))
+                            .into());
+                    }
+                    ModelApi429Action::RetryCurrent => {}
                 }
-
-                if remaining == 0 {
-                    return Err(rate_limit_error.into());
-                }
-                last_error = Some(rate_limit_error.into());
-                continue;
             }
 
             // 客户端请求格式错误（messages 数组违反协议）：根因在调用方，重试无意义
@@ -1183,8 +1221,8 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
+            // 走到这里的 429 是已允许自动重试的容量类错误；不禁用或切换凭据。
+            // 408/5xx 同样维持既有的当前凭据重试行为。
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
@@ -1288,20 +1326,31 @@ impl KiroProvider {
         });
     }
 
-    /// 从请求体中提取模型信息
-    ///
-    /// 尝试解析 JSON 请求体，提取 conversationState.currentMessage.userInputMessage.modelId
-    fn extract_model_from_request(request_body: &str) -> Option<String> {
+    /// 一次解析同时取出调度需要的两个提示：
+    /// - 模型 id（`conversationState.currentMessage.userInputMessage.modelId`），用于按模型过滤凭据
+    /// - 会话 id（`conversationState.conversationId`），用于会话粘性路由
+    fn extract_routing_hints(request_body: &str) -> (Option<String>, Option<String>) {
         use serde_json::Value;
 
-        let json: Value = serde_json::from_str(request_body).ok()?;
-
-        json.get("conversationState")?
-            .get("currentMessage")?
-            .get("userInputMessage")?
-            .get("modelId")?
-            .as_str()
-            .map(|s| s.to_string())
+        let Ok(json) = serde_json::from_str::<Value>(request_body) else {
+            return (None, None);
+        };
+        let Some(state) = json.get("conversationState") else {
+            return (None, None);
+        };
+        let model = state
+            .get("currentMessage")
+            .and_then(|m| m.get("userInputMessage"))
+            .and_then(|m| m.get("modelId"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let session = state
+            .get("conversationId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        (model, session)
     }
 
     fn retry_delay(attempt: usize) -> Duration {
@@ -1355,41 +1404,62 @@ fn take_rate_limit_error(last_error: &mut Option<anyhow::Error>) -> Option<anyho
     }
 }
 
-/// 把 `Retry-After`（delta 秒或 HTTP 日期，`UpstreamRateLimitError` 已归一化为
-/// 两者之一）换算成秒数，作为上游 429 冷却切号的冷却时长。
-///
-/// HTTP 日期在过去（时钟偏差 / 上游给了陈旧时间）时返回 `None`，交由调用方
-/// 回退配置的默认冷却 —— 冷却 0 秒等于没冷却，下一轮还会选中同一个 key。
-fn retry_after_secs(rate_limit: &UpstreamRateLimitError) -> Option<u64> {
-    let value = rate_limit.retry_after()?;
-    if let Ok(secs) = value.parse::<u64>() {
-        return Some(secs);
+fn model_api_429_action(
+    account_rate_limited: bool,
+    failover_enabled: bool,
+    ordinary_retry_enabled: bool,
+) -> ModelApi429Action {
+    if account_rate_limited {
+        if failover_enabled {
+            ModelApi429Action::Failover
+        } else {
+            ModelApi429Action::Return
+        }
+    } else if ordinary_retry_enabled {
+        ModelApi429Action::RetryCurrent
+    } else {
+        ModelApi429Action::Return
     }
-    let when = httpdate::parse_http_date(value).ok()?;
-    when.duration_since(std::time::SystemTime::now())
-        .ok()
-        .map(|d| d.as_secs())
-        .filter(|s| *s > 0)
 }
 
-/// 为账号风控 429 补齐本地冷却时间，并区分上游是否明确要求等待。
+/// 账号级 429 最终返回客户端时，缺少上游 Retry-After 则补上本地冷却时间。
 fn account_rate_limit_with_fallback(
     rate_limit: Option<UpstreamRateLimitError>,
     cooldown_secs: u64,
-) -> (UpstreamRateLimitError, bool) {
-    let must_wait_for_upstream = rate_limit
-        .as_ref()
-        .is_some_and(|error| !error.should_retry_locally());
-    let error = match rate_limit {
+) -> UpstreamRateLimitError {
+    match rate_limit {
         Some(error) if error.retry_after().is_some() => error,
         _ => UpstreamRateLimitError::new(Some(cooldown_secs.to_string())),
-    };
-    (error, must_wait_for_upstream)
+    }
 }
 
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
+
+    #[test]
+    fn mcp_validation_treats_caller_accepted_errors_as_success() {
+        fn is_no_results(error: &anyhow::Error) -> bool {
+            error.to_string().contains("Tool returned no results")
+        }
+
+        let valid: anyhow::Result<()> = Ok(());
+        let no_results: anyhow::Result<()> = Err(anyhow::anyhow!("Tool returned no results"));
+        let malformed: anyhow::Result<()> = Err(anyhow::anyhow!("invalid JSON"));
+
+        assert_eq!(
+            KiroProvider::mcp_validation_outcome(&valid, is_no_results),
+            outcome::SUCCESS
+        );
+        assert_eq!(
+            KiroProvider::mcp_validation_outcome(&no_results, is_no_results),
+            outcome::SUCCESS
+        );
+        assert_eq!(
+            KiroProvider::mcp_validation_outcome(&malformed, is_no_results),
+            outcome::UNKNOWN
+        );
+    }
 
     #[test]
     fn preserves_typed_rate_limit_when_later_credential_selection_fails() {
@@ -1417,41 +1487,47 @@ mod rate_limit_tests {
     }
 
     #[test]
-    fn retry_after_secs_parses_delta_seconds() {
-        let err = UpstreamRateLimitError::new(Some("42".to_string()));
-        assert_eq!(retry_after_secs(&err), Some(42));
-    }
-
-    #[test]
-    fn retry_after_secs_none_when_missing_or_stale() {
-        assert_eq!(retry_after_secs(&UpstreamRateLimitError::new(None)), None);
-        // 过去的 HTTP 日期：冷却 0 秒等于没冷却，必须回退配置默认值。
-        let stale = UpstreamRateLimitError::new(Some(
-            "Wed, 21 Oct 2015 07:28:00 GMT".to_string(),
-        ));
-        assert_eq!(retry_after_secs(&stale), None);
-    }
-
-    #[test]
     fn account_rate_limit_uses_cooldown_when_retry_after_is_missing() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
+        let error = account_rate_limit_with_fallback(
             Some(UpstreamRateLimitError::new(None)),
             300,
         );
 
         assert_eq!(error.retry_after(), Some("300"));
-        assert!(!must_wait, "无上游等待值时仍可按账号冷却策略故障转移");
     }
 
     #[test]
-    fn account_rate_limit_honors_explicit_upstream_retry_after() {
-        let (error, must_wait) = account_rate_limit_with_fallback(
+    fn account_rate_limit_preserves_explicit_upstream_retry_after() {
+        let error = account_rate_limit_with_fallback(
             Some(UpstreamRateLimitError::new(Some("90".to_string()))),
             300,
         );
 
         assert_eq!(error.retry_after(), Some("90"));
-        assert!(must_wait, "上游明确要求等待时不得在内部提前重试");
+    }
+
+    #[test]
+    fn account_rate_limit_only_uses_failover_switch() {
+        assert_eq!(
+            model_api_429_action(true, true, false),
+            ModelApi429Action::Failover
+        );
+        assert_eq!(
+            model_api_429_action(true, false, true),
+            ModelApi429Action::Return
+        );
+    }
+
+    #[test]
+    fn ordinary_rate_limit_only_uses_retry_switch() {
+        assert_eq!(
+            model_api_429_action(false, false, true),
+            ModelApi429Action::RetryCurrent
+        );
+        assert_eq!(
+            model_api_429_action(false, true, false),
+            ModelApi429Action::Return
+        );
     }
 
     #[test]
@@ -1479,411 +1555,5 @@ mod rate_limit_tests {
     fn current_acquire_rate_limit_is_detected_before_outer_retry() {
         let error = anyhow::Error::new(UpstreamRateLimitError::new(Some("30".to_string())));
         assert!(is_rate_limit_error(&error));
-    }
-}
-
-/// 上游凭据直通路径的实测：起一个 mock 上游，断言线上真正发出的字节与请求头。
-///
-/// 这些测试存在的理由是一次真实故障：直通路径曾转发
-/// `serde_json::to_string(&payload)` 的产物而非客户端原文，把 serde 默认值实体化进
-/// body（`thinking.budget_tokens` 被补成 20000），上游以
-/// `thinking.budget_tokens is not supported when thinking.type is disabled` 拒收。
-/// 光靠读代码看不出这种偏差 —— 必须把字节收下来比对。
-#[cfg(test)]
-mod upstream_passthrough_tests {
-    use super::*;
-    use crate::kiro::endpoint::{CliEndpoint, IdeEndpoint};
-    use crate::model::config::Config;
-
-    /// 起一个只服务一次请求的 mock 上游，返回 `(base_url, 收到的原始请求)`。
-    async fn spawn_mock_upstream() -> (String, tokio::sync::oneshot::Receiver<String>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-
-            // 先读到 header 结束，再按 content-length 精确读完 body ——
-            // 不能读到 EOF：reqwest 保持连接打开，读到 EOF 会挂死。
-            let body_start = loop {
-                let n = socket.read(&mut chunk).await.unwrap();
-                if n == 0 {
-                    break None;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break Some(p + 4);
-                }
-            };
-
-            if let Some(body_start) = body_start {
-                let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
-                let content_len = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.trim().eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                while buf.len() < body_start + content_len {
-                    let n = socket.read(&mut chunk).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-            }
-
-            let body = serde_json::json!({
-                "id": "msg_1",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-sonnet-4.6",
-                "content": [{"type": "text", "text": "ok"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 2}
-            })
-            .to_string();
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            socket.write_all(resp.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
-
-            let _ = tx.send(String::from_utf8_lossy(&buf).to_string());
-        });
-
-        (format!("http://{}", addr), rx)
-    }
-
-    fn provider_with_upstream(base_url: String) -> KiroProvider {
-        let mut cred = KiroCredentials::default();
-        cred.upstream_base_url = Some(base_url);
-        cred.upstream_api_key = Some("sk-upstream-test".to_string());
-
-        let manager =
-            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
-
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
-
-        KiroProvider::with_proxy(
-            Arc::new(manager),
-            None,
-            endpoints,
-            Config::default().default_endpoint,
-        )
-    }
-
-    /// 客户端原文逐字节到达上游：`thinking:{type:disabled}` 不得被补上
-    /// `budget_tokens`，也不得多出一串显式 `null`。
-    #[tokio::test]
-    async fn forwards_client_bytes_verbatim() {
-        let (base_url, rx) = spawn_mock_upstream().await;
-        let provider = provider_with_upstream(base_url);
-
-        // 客户端原文：thinking 只给 type，不给 budget_tokens。
-        let client_body = r#"{"model":"claude-sonnet-4.6","max_tokens":1024,"messages":[{"role":"user","content":"hi"}],"thinking":{"type":"disabled"}}"#;
-
-        let result = provider
-            .call_api_dual("{}", Some(client_body), Some("test-beta-flag"), None, None)
-            .await
-            .expect("上游直通应成功");
-        assert!(result.is_upstream, "应走上游直通路径");
-
-        let received = rx.await.expect("mock 上游应收到请求");
-        let (head, body) = received.split_once("\r\n\r\n").expect("应有完整 header");
-
-        assert_eq!(body, client_body, "转发的 body 必须与客户端原文逐字节相同");
-        assert!(
-            !body.contains("budget_tokens"),
-            "disabled 时不得注入 budget_tokens，实际 body: {body}"
-        );
-        assert!(
-            !body.contains("null"),
-            "不得把缺省字段写成显式 null，实际 body: {body}"
-        );
-
-        let head_lower = head.to_lowercase();
-        assert!(head_lower.contains("post /v1/messages"), "应 POST /v1/messages，实际: {head}");
-        assert!(
-            head_lower.contains("x-api-key: sk-upstream-test"),
-            "x-api-key 应换成上游凭据的 key，实际: {head}"
-        );
-        assert!(
-            head_lower.contains("anthropic-version: 2023-06-01"),
-            "应带 anthropic-version，实际: {head}"
-        );
-        assert!(
-            head_lower.contains("anthropic-beta: test-beta-flag"),
-            "anthropic-beta 应透传，实际: {head}"
-        );
-    }
-
-    /// 起一个只服务一次请求的 mock 上游，返回指定状态码/额外头/响应体。
-    /// 用于模拟中转站的错误响应（欠费 400、封禁 403、限流 429 等）。
-    async fn spawn_mock_upstream_error(
-        status_line: &'static str,
-        extra_headers: &'static str,
-        body: &'static str,
-    ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 4096];
-
-            // 与 spawn_mock_upstream 相同：必须按 content-length 读完整个请求体
-            // 再响应。若带着未读数据直接关 socket，会触发 RST 把已写的响应一并
-            // 冲掉（客户端 / 代理侧表现为 502），而不是干净的 FIN。
-            let body_start = loop {
-                let n = socket.read(&mut chunk).await.unwrap();
-                if n == 0 {
-                    break None;
-                }
-                buf.extend_from_slice(&chunk[..n]);
-                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break Some(p + 4);
-                }
-            };
-            if let Some(body_start) = body_start {
-                let head = String::from_utf8_lossy(&buf[..body_start]).to_string();
-                let content_len = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.trim().eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                    .unwrap_or(0);
-                while buf.len() < body_start + content_len {
-                    let n = socket.read(&mut chunk).await.unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                }
-            }
-
-            let resp = format!(
-                "HTTP/1.1 {}\r\ncontent-type: application/json\r\n{}content-length: {}\r\n\r\n{}",
-                status_line,
-                extra_headers,
-                body.len(),
-                body
-            );
-            socket.write_all(resp.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
-        });
-
-        format!("http://{}", addr)
-    }
-
-    /// 两个上游凭据（priority 0 / 1），返回 (provider, manager)。
-    fn provider_with_two_upstreams(
-        first_url: String,
-        second_url: String,
-    ) -> (KiroProvider, Arc<MultiTokenManager>) {
-        let mut cred1 = KiroCredentials::default();
-        cred1.upstream_base_url = Some(first_url);
-        cred1.upstream_api_key = Some("sk-up-1".to_string());
-        cred1.priority = 0;
-
-        let mut cred2 = KiroCredentials::default();
-        cred2.upstream_base_url = Some(second_url);
-        cred2.upstream_api_key = Some("sk-up-2".to_string());
-        cred2.priority = 1;
-
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![cred1, cred2], None, None, false)
-                .unwrap(),
-        );
-
-        let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
-        let ide = IdeEndpoint::new();
-        endpoints.insert(ide.name().to_string(), Arc::new(ide));
-        let cli = CliEndpoint::new();
-        endpoints.insert(cli.name().to_string(), Arc::new(cli));
-
-        let provider = KiroProvider::with_proxy(
-            manager.clone(),
-            None,
-            endpoints,
-            Config::default().default_endpoint,
-        );
-        (provider, manager)
-    }
-
-    /// 按 base_url 在快照里找到对应凭据条目。
-    fn snapshot_entry_by_url(
-        manager: &MultiTokenManager,
-        url: &str,
-    ) -> crate::kiro::token_manager::CredentialEntrySnapshot {
-        manager
-            .snapshot()
-            .entries
-            .into_iter()
-            .find(|e| e.upstream_base_url.as_deref() == Some(url))
-            .expect("快照中应有该上游凭据")
-    }
-
-    const CLIENT_BODY: &str = r#"{"model":"claude-sonnet-4.6","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}"#;
-
-    /// 上游返回欠费文案（Anthropic 官方 400 形状）：凭据应被立即禁用
-    /// （QuotaExceeded）并切到下一个凭据成功。旧行为是 400 直接 bail，
-    /// 欠费 key 永远留在池子里打死后续请求。
-    #[tokio::test]
-    async fn upstream_quota_body_disables_credential_and_fails_over() {
-        let err_url = spawn_mock_upstream_error(
-            "400 Bad Request",
-            "",
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#,
-        )
-        .await;
-        let (ok_url, _rx) = spawn_mock_upstream().await;
-        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
-
-        let result = provider
-            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
-            .await
-            .expect("应切到第二个凭据成功");
-        assert!(result.is_upstream);
-
-        let entry = snapshot_entry_by_url(&manager, &err_url);
-        assert!(entry.disabled, "欠费凭据应被禁用");
-        assert_eq!(
-            entry.disabled_reason.as_deref(),
-            Some("QuotaExceeded"),
-            "禁用原因应为额度用尽"
-        );
-    }
-
-    /// 上游返回封禁文案（403）：凭据应被立即禁用（Suspended，不参与自愈）
-    /// 并切号，而不是按普通 401/403 攒 3 次失败计数。
-    #[tokio::test]
-    async fn upstream_suspended_body_disables_credential_immediately() {
-        let err_url = spawn_mock_upstream_error(
-            "403 Forbidden",
-            "",
-            r#"{"error":{"message":"Your account has been disabled due to a violation of our terms."}}"#,
-        )
-        .await;
-        let (ok_url, _rx) = spawn_mock_upstream().await;
-        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
-
-        let result = provider
-            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
-            .await
-            .expect("应切到第二个凭据成功");
-        assert!(result.is_upstream);
-
-        let entry = snapshot_entry_by_url(&manager, &err_url);
-        assert!(entry.disabled, "封禁凭据应被立即禁用");
-        assert_eq!(
-            entry.disabled_reason.as_deref(),
-            Some("Suspended"),
-            "禁用原因应为封禁（不参与自愈）"
-        );
-    }
-
-    /// 上游 429：当前凭据应进入冷却（取 Retry-After）并立即切号成功，
-    /// 而不是在被限流的 key 上原地退避到耗尽重试次数。
-    #[tokio::test]
-    async fn upstream_429_cools_down_and_fails_over() {
-        let err_url = spawn_mock_upstream_error(
-            "429 Too Many Requests",
-            "retry-after: 45\r\n",
-            r#"{"error":{"message":"rate limit exceeded"}}"#,
-        )
-        .await;
-        let (ok_url, _rx) = spawn_mock_upstream().await;
-        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
-
-        let result = provider
-            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
-            .await
-            .expect("应切到第二个凭据成功");
-        assert!(result.is_upstream);
-
-        let entry = snapshot_entry_by_url(&manager, &err_url);
-        assert!(!entry.disabled, "429 是临时限流，不应禁用凭据");
-        let remaining = entry
-            .throttled_remaining_secs
-            .expect("被限流的凭据应处于冷却中");
-        assert!(
-            remaining > 0 && remaining <= 45,
-            "冷却时长应来自 Retry-After（45s），实际 {remaining}s"
-        );
-    }
-
-    /// 未命中任何文案的普通 400：保持旧语义 —— 请求问题直接终止，
-    /// 不禁用凭据、不切号（切号重试一个坏请求毫无意义）。
-    #[tokio::test]
-    async fn upstream_plain_400_still_bails_without_failover() {
-        let err_url = spawn_mock_upstream_error(
-            "400 Bad Request",
-            "",
-            r#"{"type":"error","error":{"type":"invalid_request_error","message":"messages: at least one message is required"}}"#,
-        )
-        .await;
-        let (ok_url, _rx) = spawn_mock_upstream().await;
-        let (provider, manager) = provider_with_two_upstreams(err_url.clone(), ok_url);
-
-        let err = match provider
-            .call_api_dual("{}", Some(CLIENT_BODY), None, None, None)
-            .await
-        {
-            Ok(_) => panic!("普通 400 应直接失败，不应切号成功"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("400"), "错误应携带原始状态码");
-
-        let entry = snapshot_entry_by_url(&manager, &err_url);
-        assert!(!entry.disabled, "普通 400 不应禁用凭据");
-        assert!(entry.disabled_reason.is_none());
-    }
-
-    /// 缺 `max_tokens` 时补上该字段（API 必填），且**只**补这一个。
-    #[tokio::test]
-    async fn injects_only_max_tokens_when_client_omits_it() {
-        let (base_url, rx) = spawn_mock_upstream().await;
-        let provider = provider_with_upstream(base_url);
-
-        // handler 的 ensure_max_tokens 已补过 max_tokens，这里模拟它的产物。
-        let body_with_injected = r#"{"max_tokens":32000,"messages":[{"role":"user","content":"hi"}],"model":"claude-sonnet-4.6","thinking":{"type":"disabled"}}"#;
-
-        provider
-            .call_api_dual("{}", Some(body_with_injected), None, None, None)
-            .await
-            .expect("上游直通应成功");
-
-        let received = rx.await.expect("mock 上游应收到请求");
-        let (_, body) = received.split_once("\r\n\r\n").unwrap();
-        let parsed: Value = serde_json::from_str(body).expect("body 应是合法 JSON");
-
-        assert_eq!(parsed["max_tokens"], 32000, "max_tokens 应存在");
-        assert!(
-            parsed["thinking"].get("budget_tokens").is_none(),
-            "仍不得注入 budget_tokens，实际: {body}"
-        );
-        assert!(
-            parsed.get("system").is_none() && parsed.get("tools").is_none(),
-            "不得实体化其余缺省字段，实际: {body}"
-        );
     }
 }

@@ -17,8 +17,6 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
-use crate::anthropic::cache_engine::CacheEngineKind;
-
 /// 单条客户端 Key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -26,24 +24,6 @@ pub struct ClientKey {
     pub id: u64,
     /// 明文 Key（中转站场景，校验需原值，不做 hash）
     pub key: String,
-    /// 历史遗留字段：曾用于轮换后的 7 天宽限期，现已废弃。
-    ///
-    /// **不再参与鉴权。** 轮换后旧明文立即失效 —— 宽限期的问题是它与应急撤销直接冲突：
-    /// 泄露的那把在窗口内仍然有效，而当时并没有实现任何提前掐断的手段
-    /// （代码里三处注释都在引用一个不存在的 `revoke_prev_key`）。
-    ///
-    /// 字段保留是为了兼容已落盘的 `client_api_keys.json`：老文件里带着这三个键，
-    /// 直接删字段会让反序列化把它们当未知键（`serde` 默认忽略，尚可），但更要紧的是
-    /// **读取时必须主动清零**，否则旧值会一直躺在文件里，让人误以为还有宽限逻辑。
-    /// 见 [`ClientKeyManager::load_from`] 中的清理。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_key: Option<String>,
-    /// 历史遗留字段，见 [`Self::prev_key`]。不再参与鉴权。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_key_expires_at: Option<String>,
-    /// 历史遗留字段，见 [`Self::prev_key`]。不再参与鉴权。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prev_key_last_used_at: Option<String>,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -65,6 +45,12 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 累计积分（credit）使用上限。None 表示不限制。
+    ///
+    /// 达到上限后该 Key 的后续请求会被鉴权层拒绝（HTTP 429）。上限基于累计
+    /// `total_credits`，通过「重置统计」清零后可重新计费。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_credits: Option<f64>,
     /// 绑定的账号分组名（可选）
     ///
     /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
@@ -75,10 +61,17 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
-    /// 该 Key 使用哪套缓存模拟引擎。
-    /// 老数据无此字段，默认 `rust`（引擎 A），使既有 Key 行为完全不变。
-    #[serde(default, skip_serializing_if = "CacheEngineKind::is_default")]
-    pub cache_engine: CacheEngineKind,
+}
+
+/// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyAuth {
+    /// 命中且未超额，携带 Key id
+    Ok(u64),
+    /// 命中但已达积分上限
+    OverLimit { id: u64, used: f64, limit: f64 },
+    /// 未匹配到任何启用的 Key
+    NotFound,
 }
 
 /// `by_key` 仅用于判重；鉴权扫描 `entries` 并做常量时间比较。
@@ -122,30 +115,10 @@ impl ClientKeyManager {
         let mut by_key = HashMap::with_capacity(entries.len());
         let mut by_id = HashMap::with_capacity(entries.len());
         let mut max_id = 0u64;
-        let mut stale_grace = 0usize;
-        for mut ck in entries {
+        for ck in entries {
             max_id = max_id.max(ck.id);
-            // 清掉宽限期时代残留的字段。宽限逻辑已移除（轮换即失效），这些值不再参与
-            // 鉴权；但留在内存里会随下次落盘再写回 client_api_keys.json，让人误以为
-            // 宽限还在生效。加载时一次性归零，落盘后文件自然变干净。
-            if ck.prev_key.is_some()
-                || ck.prev_key_expires_at.is_some()
-                || ck.prev_key_last_used_at.is_some()
-            {
-                stale_grace += 1;
-                ck.prev_key = None;
-                ck.prev_key_expires_at = None;
-                ck.prev_key_last_used_at = None;
-            }
-            // 只索引当前明文。`prev_key` 从未进过 by_key，鉴权也不再看它。
             by_key.insert(ck.key.clone(), ck.id);
             by_id.insert(ck.id, ck);
-        }
-        if stale_grace > 0 {
-            tracing::info!(
-                count = stale_grace,
-                "已清理客户端 Key 的历史宽限期字段（轮换后旧明文现在立即失效）"
-            );
         }
 
         Ok(Self {
@@ -189,22 +162,8 @@ impl ClientKeyManager {
         name: String,
         description: Option<String>,
         group: Option<String>,
-        cache_engine: CacheEngineKind,
     ) -> ClientKey {
-        let entry = self.create_with_key(name, description, group, generate_client_key());
-        // 引擎选择在创建后单独落一次，避免改动 create_with_key 的既有签名
-        // （sync_system_key 也走它，那条路径必须保持默认引擎）。
-        if cache_engine != CacheEngineKind::default() {
-            self.update_meta(entry.id, None, None, None, Some(cache_engine));
-            return self
-                .inner
-                .read()
-                .entries
-                .get(&entry.id)
-                .cloned()
-                .unwrap_or(entry);
-        }
-        entry
+        self.create_with_key(name, description, group, generate_client_key())
     }
 
     /// 使用指定明文创建 Key；明文已存在时返回原条目。
@@ -235,12 +194,9 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
-            cache_engine: CacheEngineKind::default(),
-            prev_key: None,
-            prev_key_expires_at: None,
-            prev_key_last_used_at: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -282,12 +238,9 @@ impl ClientKeyManager {
                     total_cache_creation_tokens: 0,
                     total_cache_read_tokens: 0,
                     total_credits: 0.0,
+                    max_credits: None,
                     group: None,
                     is_system: true,
-                    cache_engine: CacheEngineKind::default(),
-                    prev_key: None,
-                    prev_key_expires_at: None,
-                    prev_key_last_used_at: None,
                 },
             );
             changed = true;
@@ -364,7 +317,6 @@ impl ClientKeyManager {
         name: Option<String>,
         description: Option<Option<String>>,
         group: Option<Option<String>>,
-        cache_engine: Option<CacheEngineKind>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -377,10 +329,6 @@ impl ClientKeyManager {
                 }
                 if let Some(g) = group {
                     e.group = g.filter(|s| !s.trim().is_empty());
-                }
-                // None = 不变，与其余字段的可选语义一致
-                if let Some(engine) = cache_engine {
-                    e.cache_engine = engine;
                 }
                 true
             }
@@ -395,24 +343,6 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
-    }
-
-    /// 按 id 取整条快照（**含明文 `key` 字段**）。
-    ///
-    /// 供管理端「查看 Key 明文」使用：列表接口只回脱敏值，明文按需单独取，
-    /// 避免每 30s 的列表轮询把所有明文反复送上网络。
-    pub fn get(&self, id: u64) -> Option<ClientKey> {
-        self.inner.read().entries.get(&id).cloned()
-    }
-
-    /// 返回指定 Key 选择的缓存模拟引擎；Key 不存在时回落默认（引擎 A）。
-    pub fn cache_engine_of(&self, id: u64) -> CacheEngineKind {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .map(|e| e.cache_engine)
-            .unwrap_or_default()
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
@@ -483,34 +413,16 @@ impl ClientKeyManager {
         affected
     }
 
-    /// 生成新明文并保留 id、元数据、分组、统计及状态；**旧明文立即失效**。
-    ///
-    /// 曾经有过 7 天宽限期（旧明文在窗口内仍可鉴权），已移除：它与应急撤销直接冲突 ——
-    /// 明文一旦泄露，轮换之后那把还能再用 7 天，而当时并没有实现任何提前掐断的手段。
-    /// 「轮换即失效」也才与界面上一直写着的说法一致。
-    ///
-    /// 代价是下游必须在轮换后立刻换上新明文，否则马上 401。这是有意的取舍：
-    /// 需要平滑迁移就新建一把 Key、逐个下游切过去，再删掉旧的那条 —— 全程可控，
-    /// 不依赖一个所有人都看不见的隐式时间窗。
-    ///
+    /// 生成新明文并保留 id、元数据、分组、统计及状态；旧明文立即失效。
     /// 系统 Key 的调用方必须同步 `config.apiKey`，否则重启时配置值会覆盖轮换结果。
     pub fn rotate(&self, id: u64) -> Option<ClientKey> {
         let new_key = generate_client_key();
         let mut inner = self.inner.write();
-
         let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
+        inner.by_key.remove(&old_key);
         let entry = inner.entries.get_mut(&id)?;
         entry.key = new_key.clone();
-        // 清掉历史遗留的宽限字段：老数据里可能还带着值，留着会让它继续显示在
-        // client_api_keys.json 里，看起来像是宽限逻辑还在生效。
-        entry.prev_key = None;
-        entry.prev_key_expires_at = None;
-        entry.prev_key_last_used_at = None;
         let snapshot = entry.clone();
-
-        // 旧明文从 by_key 摘除 —— 它已彻底失效，不该再命中鉴权。
-        // 与宽限期版本的关键差别就在这一行：那时刻意保留它以对判重可见。
-        inner.by_key.remove(&old_key);
         inner.by_key.insert(new_key, id);
         self.save_locked(&inner);
         Some(snapshot)
@@ -539,30 +451,73 @@ impl ClientKeyManager {
 
     /// 不校验前缀，常量时间匹配所有启用 Key；命中后更新使用记录。
     ///
-    /// 只比 `key` 这一把。`prev_key` 及其时间戳是历史遗留字段，**不再参与鉴权** ——
-    /// 轮换后旧明文立即失效。
+    /// 仅返回命中的 Key id（不含额度判定）。需要额度拦截时用 [`Self::verify_and_touch_ex`]。
+    #[allow(dead_code)] // 保留的兼容接口，生产路径已切换到 verify_and_touch_ex
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        let now = Utc::now();
-        let mut inner = self.inner.write();
-        let mut hit: Option<u64> = None;
+        match self.verify_and_touch_ex(presented) {
+            KeyAuth::Ok(id) => Some(id),
+            // 兼容旧语义：超额与未命中都视为 None
+            KeyAuth::OverLimit { .. } | KeyAuth::NotFound => None,
+        }
+    }
 
+    /// 常量时间匹配所有启用 Key；命中后若已达积分上限则返回 [`KeyAuth::OverLimit`]，
+    /// 否则累加调用次数并返回 [`KeyAuth::Ok`]。
+    pub fn verify_and_touch_ex(&self, presented: &str) -> KeyAuth {
+        let mut inner = self.inner.write();
+        let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
             if ck.disabled {
                 continue;
             }
             if ck.key.as_bytes().ct_eq(presented.as_bytes()).into() {
-                hit = Some(*id);
+                hit_id = Some(*id);
                 // 不 break，继续完整扫描以保持常量时间
             }
         }
-
-        let id = hit?;
+        let Some(id) = hit_id else {
+            return KeyAuth::NotFound;
+        };
         if let Some(entry) = inner.entries.get_mut(&id) {
+            // 达到积分上限：拒绝，不累加调用次数
+            if let Some(limit) = entry.max_credits {
+                if entry.total_credits >= limit {
+                    return KeyAuth::OverLimit {
+                        id,
+                        used: entry.total_credits,
+                        limit,
+                    };
+                }
+            }
             entry.total_calls += 1;
-            entry.last_used_at = Some(now.to_rfc3339());
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
         }
         // 不在每次请求都落盘（高频写入），由 record_usage / 定期 flush 持久化
-        Some(id)
+        KeyAuth::Ok(id)
+    }
+
+    /// 设置或清除单个 Key 的积分使用上限。`None` 表示取消限制。
+    ///
+    /// 传入 `Some(v)` 时会归一为非负有限值；小于 0 或非有限值一律拒绝为无效。
+    /// 返回 `false` 表示 Key 不存在或入参非法。
+    pub fn set_max_credits(&self, id: u64, max_credits: Option<f64>) -> bool {
+        if let Some(v) = max_credits {
+            if !v.is_finite() || v < 0.0 {
+                return false;
+            }
+        }
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.max_credits = max_credits;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
     }
 
     /// 在请求结束时累计 Token 用量并落盘
@@ -642,148 +597,16 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
+        let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with("sk-"));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         assert_eq!(mgr.verify_and_touch("nope"), None);
     }
 
-    /// 按 Key 选引擎：创建时可指定，`cache_engine_of` 能读回，`update_meta` 可改，
-    /// 传 None 表示不变。未知 id 回落默认（引擎 A）。
-    #[test]
-    fn per_key_cache_engine_selection() {
-        let mgr = ClientKeyManager::new();
-
-        // 默认创建 → 引擎 A
-        let a = mgr.create("a".into(), None, None, CacheEngineKind::default());
-        assert_eq!(mgr.cache_engine_of(a.id), CacheEngineKind::Rust);
-
-        // 创建时指定引擎 B
-        let b = mgr.create("b".into(), None, None, CacheEngineKind::Go);
-        assert_eq!(b.cache_engine, CacheEngineKind::Go, "返回的条目应带所选引擎");
-        assert_eq!(mgr.cache_engine_of(b.id), CacheEngineKind::Go);
-
-        // update_meta 传 Some 改引擎、传 None 不动
-        assert!(mgr.update_meta(a.id, None, None, None, Some(CacheEngineKind::Go)));
-        assert_eq!(mgr.cache_engine_of(a.id), CacheEngineKind::Go);
-        assert!(mgr.update_meta(a.id, Some("改名".into()), None, None, None));
-        assert_eq!(
-            mgr.cache_engine_of(a.id),
-            CacheEngineKind::Go,
-            "cache_engine 传 None 时不应被重置"
-        );
-
-        // 未知 id → 默认
-        assert_eq!(mgr.cache_engine_of(9999), CacheEngineKind::Rust);
-    }
-
-    /// 老数据缺 `cacheEngine` 字段时必须反序列化成引擎 A，且默认值不写回 JSON
-    /// （保持既有文件形状不变）。
-    #[test]
-    fn legacy_keys_default_to_rust_engine_and_field_is_omitted() {
-        let legacy = r#"[{
-            "id": 1, "key": "sk-legacy", "name": "老 Key",
-            "createdAt": "2026-01-01T00:00:00Z"
-        }]"#;
-        let keys: Vec<ClientKey> = serde_json::from_str(legacy).unwrap();
-        assert_eq!(keys[0].cache_engine, CacheEngineKind::Rust);
-
-        // 默认值不序列化
-        let json = serde_json::to_string(&keys[0]).unwrap();
-        assert!(
-            !json.contains("cacheEngine"),
-            "默认引擎不应写进 JSON，实际: {json}"
-        );
-
-        // 非默认值必须序列化
-        let mut go_key = keys[0].clone();
-        go_key.cache_engine = CacheEngineKind::Go;
-        let json = serde_json::to_string(&go_key).unwrap();
-        assert!(json.contains("\"cacheEngine\":\"go\""), "实际: {json}");
-    }
-
-    /// 经**磁盘**往返后每个 Key 的引擎选择必须原样存活，且互不串味。
-    ///
-    /// 与 `legacy_keys_default_to_rust_engine_and_field_is_omitted` 的区别：那条只测
-    /// serde 层的单条序列化，本条驱动真实 `save_locked` → 新 manager `load`。
-    /// `cache_engine` 带 `skip_serializing_if`，默认值不落盘、靠 `serde(default)` 读回 ——
-    /// 若谁去掉 `default`，非默认 Key 仍能存活，只有本条会失败。
-    #[test]
-    fn cache_engine_survives_disk_round_trip() {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-ck-{}-{:?}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&path);
-
-        // load 于不存在的路径 → 空 manager 但带 path，后续 create 会真实写盘
-        let mgr = ClientKeyManager::load(&path).expect("空路径应可加载");
-        let rust_key = mgr.create("走引擎A".into(), None, None, CacheEngineKind::Rust);
-        let go_key = mgr.create("走引擎B".into(), None, None, CacheEngineKind::Go);
-        // 第三条：建成默认再改成 Go，覆盖 update_meta 的写盘路径
-        let flipped = mgr.create("后改B".into(), None, None, CacheEngineKind::default());
-        assert!(mgr.update_meta(flipped.id, None, None, None, Some(CacheEngineKind::Go)));
-
-        // 磁盘形状：只有非默认引擎的 Key 才写出 cacheEngine（此处 2 条）
-        let on_disk = std::fs::read_to_string(&path).expect("应已写盘");
-        assert_eq!(
-            on_disk.matches("\"cacheEngine\"").count(),
-            2,
-            "只应有 2 条非默认引擎落盘，实际文件: {on_disk}"
-        );
-
-        // 换一个 manager 重新加载，模拟重启
-        let reloaded = ClientKeyManager::load(&path).expect("应可重新加载");
-        assert_eq!(
-            reloaded.cache_engine_of(rust_key.id),
-            CacheEngineKind::Rust,
-            "引擎 A 的 Key 重启后应仍为 A"
-        );
-        assert_eq!(
-            reloaded.cache_engine_of(go_key.id),
-            CacheEngineKind::Go,
-            "引擎 B 的 Key 重启后应仍为 B（字段真的落盘了）"
-        );
-        assert_eq!(
-            reloaded.cache_engine_of(flipped.id),
-            CacheEngineKind::Go,
-            "经 update_meta 改过的 Key 重启后应保持 B"
-        );
-        // Key 本身也要能继续鉴权，确认加载的是同一批条目而非空表
-        assert_eq!(reloaded.verify_and_touch(&go_key.key), Some(go_key.id));
-        assert_eq!(reloaded.list().len(), 3);
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// 系统 Key（id=0）经 `sync_system_key` 反复同步后，引擎选择必须存活。
-    #[test]
-    fn system_key_retains_cache_engine_across_sync() {
-        let mgr = ClientKeyManager::new();
-        mgr.sync_system_key("系统".into(), None, "key-v1".into());
-        assert_eq!(mgr.cache_engine_of(0), CacheEngineKind::Rust, "初始为默认");
-
-        assert!(mgr.update_meta(0, None, None, None, Some(CacheEngineKind::Go)));
-        assert_eq!(mgr.cache_engine_of(0), CacheEngineKind::Go);
-
-        // 轮换 apiKey：既有条目路径只改 key/disabled/is_system，引擎选择应保留。
-        mgr.sync_system_key("系统".into(), None, "key-v2".into());
-        assert_eq!(
-            mgr.cache_engine_of(0),
-            CacheEngineKind::Go,
-            "轮换系统 Key 不应重置引擎选择"
-        );
-        assert_eq!(mgr.verify_and_touch("key-v2"), Some(0));
-    }
-
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -793,7 +616,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None, None, CacheEngineKind::default());
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -802,6 +625,48 @@ mod tests {
         assert_eq!(e.total_output_tokens, 80);
         assert_eq!(e.total_cache_creation_tokens, 5);
         assert_eq!(e.total_cache_read_tokens, 10);
+    }
+
+    #[test]
+    fn max_credits_blocks_when_exceeded() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(mgr.set_max_credits(entry.id, Some(2.0)));
+
+        // 未超额：正常放行
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+
+        // 累计到达上限后拒绝
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 2.5);
+        match mgr.verify_and_touch_ex(&entry.key) {
+            KeyAuth::OverLimit { id, used, limit } => {
+                assert_eq!(id, entry.id);
+                assert!((used - 2.5).abs() < 1e-9);
+                assert!((limit - 2.0).abs() < 1e-9);
+            }
+            other => panic!("expected OverLimit, got {other:?}"),
+        }
+        // 旧接口兼容：超额返回 None
+        assert_eq!(mgr.verify_and_touch(&entry.key), None);
+
+        // 重置统计后恢复放行
+        assert!(mgr.reset_stats(entry.id));
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+
+        // 清除上限：不再拦截
+        mgr.record_usage(entry.id, 0, 0, 0, 0, 999.0);
+        assert!(mgr.set_max_credits(entry.id, None));
+        assert_eq!(mgr.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+    }
+
+    #[test]
+    fn set_max_credits_rejects_invalid() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("test".to_string(), None, None);
+        assert!(!mgr.set_max_credits(entry.id, Some(-1.0)));
+        assert!(!mgr.set_max_credits(entry.id, Some(f64::NAN)));
+        assert!(!mgr.set_max_credits(999, Some(5.0)));
+        assert!(mgr.set_max_credits(entry.id, Some(0.0)));
     }
 
     #[test]
@@ -814,7 +679,7 @@ mod tests {
     #[test]
     fn rotate_replaces_key_but_keeps_metadata_and_stats() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()), CacheEngineKind::default());
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
         mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
         let old_key = entry.key.clone();
         let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
@@ -826,133 +691,14 @@ mod tests {
         assert_eq!(rotated.group.as_deref(), Some("groupA"));
         assert_eq!(rotated.total_input_tokens, 100);
         assert_eq!(rotated.total_output_tokens, 50);
-        // 旧明文立即失效（曾有 7 天宽限期，已移除）。
-        assert_eq!(
-            mgr.verify_and_touch(&old_key),
-            None,
-            "轮换后旧明文必须立即失效"
-        );
+        assert_eq!(mgr.verify_and_touch(&old_key), None);
         assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
-        // 宽限字段是历史遗留，轮换不得再写入
-        assert!(rotated.prev_key.is_none(), "不该再记录 prev_key");
-        assert!(rotated.prev_key_expires_at.is_none(), "不该再有宽限到期时刻");
-        assert!(rotated.prev_key_last_used_at.is_none());
     }
 
     #[test]
     fn rotate_unknown_id_returns_none() {
         let mgr = ClientKeyManager::new();
         assert!(mgr.rotate(999).is_none());
-    }
-
-    /// 老数据里残留的 `prevKey`（宽限期时代留下的）必须被拒绝，且加载时就清零。
-    ///
-    /// 这是升级路径上唯一有风险的地方：若加载后仍保留这些值，一把本应失效的旧明文
-    /// 会继续能进门 —— 而用户以为轮换过就安全了。
-    #[test]
-    fn legacy_grace_fields_are_rejected_and_cleared_on_load() {
-        let path = std::env::temp_dir().join(format!(
-            "kiro-legacy-grace-{}-{:?}.json",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos(),
-            std::thread::current().id()
-        ));
-        // 到期时刻刻意设在未来 —— 按旧逻辑这把 sk-old 正处于宽限期内、完全有效
-        let future = (Utc::now() + chrono::Duration::days(3)).to_rfc3339();
-        let json = format!(
-            r#"[{{
-                "id": 1, "key": "sk-new", "name": "遗留宽限",
-                "createdAt": "2026-01-01T00:00:00Z",
-                "prevKey": "sk-old", "prevKeyExpiresAt": "{future}",
-                "prevKeyLastUsedAt": "2026-01-02T00:00:00Z"
-            }}]"#
-        );
-        std::fs::write(&path, json).unwrap();
-
-        let mgr = ClientKeyManager::load(&path).unwrap();
-        assert_eq!(
-            mgr.verify_and_touch("sk-old"),
-            None,
-            "遗留的宽限明文必须失效，即便到期时刻还在未来"
-        );
-        assert_eq!(mgr.verify_and_touch("sk-new"), Some(1), "当前明文不受影响");
-
-        let entry = mgr.get(1).expect("条目应存在");
-        assert!(entry.prev_key.is_none(), "加载时就该清掉 prev_key");
-        assert!(entry.prev_key_expires_at.is_none());
-        assert!(entry.prev_key_last_used_at.is_none());
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// 连续轮换两次：每一把旧明文都立即失效，只有最新的能进门。
-    ///
-    /// 宽限期时代这里要验「只保留一把、更早的被丢弃」；现在一把都不留，断言更强。
-    #[test]
-    fn every_rotation_invalidates_all_previous_keys() {
-        let mgr = ClientKeyManager::new();
-        let v1 = mgr.create("k".into(), None, None, CacheEngineKind::default());
-        let k1 = v1.key.clone();
-
-        let v2 = mgr.rotate(v1.id).expect("第一次轮换应成功");
-        let k2 = v2.key.clone();
-        assert_eq!(mgr.verify_and_touch(&k1), None, "k1 应立即失效");
-        assert_eq!(mgr.verify_and_touch(&k2), Some(v1.id), "k2 是当前明文");
-
-        let v3 = mgr.rotate(v1.id).expect("第二次轮换应成功");
-        assert_eq!(mgr.verify_and_touch(&k1), None, "k1 仍然失效");
-        assert_eq!(mgr.verify_and_touch(&k2), None, "k2 也立即失效");
-        assert_eq!(mgr.verify_and_touch(&v3.key), Some(v1.id), "只有 v3 能进门");
-        assert!(v3.prev_key.is_none(), "不该再记录任何宽限 Key");
-    }
-
-    /// 轮换后旧明文要从 `by_key` 摘除，否则判重表会一直留着一个已失效的条目。
-    #[test]
-    fn rotation_removes_old_key_from_dedup_index() {
-        let mgr = ClientKeyManager::new();
-        let v1 = mgr.create("k".into(), None, None, CacheEngineKind::default());
-        let old = v1.key.clone();
-        let v2 = mgr.rotate(v1.id).expect("轮换应成功");
-
-        // create_with_key 命中判重时会返回既有条目而非新建；旧明文已摘除，
-        // 所以用它来建应当得到一个**新** id。
-        let recreated = mgr.create_with_key("复用旧明文".into(), None, None, old.clone());
-        assert_ne!(
-            recreated.id, v1.id,
-            "旧明文应已从判重表摘除，不再指向原条目"
-        );
-        assert_eq!(mgr.verify_and_touch(&v2.key), Some(v1.id), "当前明文不受影响");
-    }
-
-
-    /// `get` 供「查看 Key 明文」用：必须回完整明文，且轮换后只能回**新**值。
-    ///
-    /// 后半段是关键 —— 若 `get` 读到的是过期快照，管理端回看到旧明文，
-    /// 用户拿去配下游会得到 401，而界面看起来完全正常。
-    #[test]
-    fn get_returns_plaintext_and_follows_rotation() {
-        let mgr = ClientKeyManager::new();
-        let entry = mgr.create(
-            "回看".into(),
-            Some("desc".into()),
-            None,
-            CacheEngineKind::default(),
-        );
-
-        let fetched = mgr.get(entry.id).expect("已存在的 id 应能取到");
-        assert_eq!(fetched.key, entry.key, "应回完整明文而非脱敏值");
-        assert_eq!(fetched.name, "回看");
-        assert_eq!(fetched.description.as_deref(), Some("desc"));
-
-        assert!(mgr.get(9999).is_none(), "未知 id 应回 None（端点回 404）");
-
-        let old_key = entry.key.clone();
-        let rotated = mgr.rotate(entry.id).expect("rotate 应成功");
-        let after = mgr.get(entry.id).expect("轮换后仍应取到");
-        assert_eq!(after.key, rotated.key, "轮换后必须回新明文");
-        assert_ne!(after.key, old_key, "绝不能回已失效的旧明文");
     }
 
     #[test]
@@ -975,7 +721,6 @@ mod tests {
             Some("保留名称".into()),
             Some(Some("保留描述".into())),
             Some(Some("group-a".into())),
-            None,
         );
         mgr.record_usage(0, 100, 50, 5, 10, 1.5);
         assert_eq!(mgr.verify_and_touch("custom-a"), Some(0));

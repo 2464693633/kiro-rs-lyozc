@@ -23,13 +23,14 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
   if (query.failedAttemptCredentialId != null)
     params.failedAttemptCredentialId = String(query.failedAttemptCredentialId)
   if (query.model) params.model = query.model
-  if (query.source) params.source = query.source
-  if (query.fromTs != null) params.fromTs = String(query.fromTs)
-  if (query.toTs != null) params.toTs = String(query.toTs)
-  if (query.billingStatus) params.billingStatus = query.billingStatus
-  if (query.sort) params.sort = query.sort
   if (query.group) params.group = query.group
   if (query.onlyFailed) params.onlyFailed = 'true'
+  if (query.sessionId) params.sessionId = query.sessionId
+  if (query.onlySwitched) params.onlySwitched = 'true'
+  if (query.clientIp) params.clientIp = query.clientIp
+  if (query.startTime != null) params.startTime = String(query.startTime)
+  if (query.endTime != null) params.endTime = String(query.endTime)
+  if (query.q) params.q = query.q
   if (query.limit != null) params.limit = String(query.limit)
   if (query.offset != null) params.offset = String(query.offset)
   const { data } = await api.get<TracePage>('/traces', { params })

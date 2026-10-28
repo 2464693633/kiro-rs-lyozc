@@ -1,22 +1,25 @@
 //! Admin API 业务逻辑服务
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Timelike, Utc};
-use futures::StreamExt;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::http_client::{build_client, ProxyConfig};
+use crate::admin::types::GlobalProxyResponse;
+use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
 use crate::kiro::auth::social;
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::{
-    KiroCredentials, normalize_import_auth_method, validate_external_idp_endpoint,
+    CredentialMetadata, KiroCredentials, credential_metadata_schema,
+    normalize_credential_metadata_schema, normalize_import_auth_method,
+    validate_credential_metadata, validate_credential_metadata_schema,
+    validate_external_idp_endpoint,
 };
 use crate::kiro::model::events::{Event, strip_tool_use_xml_leaks};
 use crate::kiro::model::requests::conversation::{
@@ -28,73 +31,112 @@ use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::{
     IdcReloginCredentials, MultiTokenManager, RefreshTokenInvalidError,
 };
-use crate::model::config::{Config, KEY_FEED_MIN_INTERVAL_SECS, KeyFeedConfig};
+use crate::model::config::Config;
 
 use super::error::AdminServiceError;
-use super::key_feed;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountRpmLimitConfigResponse,
-    AccountThrottleConfigResponse,
-    AddCredentialRequest,
-    AddCredentialResponse,
-    AssignProxyRequest,
-    AssignRoundRobinResponse,
+    AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
+    AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
     AvailableModelItem,
-    AvailableModelsResponse,
-    BalanceResponse,
-    BillingConfigPayload,
-    ModelPricingPayload,
-    BatchAddProxyRequest,
-    BatchImportEvent,
-    CheckRateLimitRequest,
-    CredentialStatusItem,
-    CredentialsExportResponse,
-    CredentialsStatusResponse,
-    EnableOverageAllResult,
-    ExportedAccount,
-    ExportedCredentials,
-    GitHubRateLimitInfo,
-    ImageUpdateResponse,
-    LoadBalancingModeResponse,
-    LogGovernanceConfigResponse,
-    ModelSelectionMode,
-    ModelTestRequest,
-    ModelTestResponse,
-    PollIdcLoginResponse,
-    ProxyCheckAllResponse,
-    ProxyCheckResponse,
-    ProxyPoolEntry,
-    ProxyPoolResponse,
-    QuotaExceededResult,
-    SelfHealConfigResponse,
-    SetAccountRpmLimitConfigRequest,
-    SetAccountThrottleConfigRequest,
-    SetUpstreamFailoverConfigRequest,
-    KeyFeedConfigResponse,
-    KeyFeedItemResult,
-    KeyFeedPullResult,
-    SetKeyFeedConfigRequest,
-    SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest,
-    SetSelfHealConfigRequest,
-    SetTokenInflationConfigRequest,
-    SetUpdateConfigRequest,
-    StartIdcLoginRequest,
-    StartIdcLoginResponse,
-    StartSocialLoginRequest,
-    StartSocialLoginResponse,
-    TokenInflationConfigResponse,
-    UpdateCheckInfo,
-    UpdateConfigResponse,
-    UpdateCredentialRequest,
+    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
+    CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
+    CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
+    CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
+    GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
+    LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
+    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
+    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
+    SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
+    SetQuotaResetRecoveryConfigRequest, SetSelfHealConfigRequest, SetSessionAffinityConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
+    StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
-    UpstreamHealthCheckBatchResponse,
-    UpstreamHealthCheckResponse,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
+
+/// 将原始 metadata 与 schema 合并为客户端可直接消费的字段列表。
+///
+/// Schema 字段保持其配置顺序，未登记的扩展字段按 key 排序追加；旧凭据缺失的字段
+/// 使用 schema 默认值，既避免客户端重复做 join，也不会丢掉自定义 metadata。
+fn credential_metadata_details(
+    metadata: &CredentialMetadata,
+    schema: &serde_json::Value,
+) -> BTreeMap<String, CredentialMetadataDetail> {
+    let values = match serde_json::to_value(metadata)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+    {
+        Some(values) => values,
+        None => return BTreeMap::new(),
+    };
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+
+    let mut keys: Vec<String> = properties
+        .map(|fields| fields.keys().cloned().collect())
+        .unwrap_or_default();
+    let mut extra_keys: Vec<String> = values
+        .keys()
+        .filter(|key| !properties.is_some_and(|fields| fields.contains_key(*key)))
+        .cloned()
+        .collect();
+    extra_keys.sort();
+    keys.extend(extra_keys);
+
+    keys.into_iter()
+        .filter_map(|key| {
+            let field = properties.and_then(|fields| fields.get(&key));
+            let value = values
+                .get(&key)
+                .cloned()
+                .or_else(|| field.and_then(|schema_field| schema_field.get("default").cloned()))?;
+            let title = field
+                .and_then(|schema_field| schema_field.get("title"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| key.clone());
+            let description = field
+                .and_then(|schema_field| schema_field.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_owned);
+            let value_label = field
+                .and_then(|schema_field| schema_field.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|options| {
+                    options.iter().find_map(|opt| {
+                        let konst = opt.get("const")?;
+                        if konst == &value {
+                            opt.get("title")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned)
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+            Some((
+                key,
+                CredentialMetadataDetail {
+                    title,
+                    description,
+                    value,
+                    value_label,
+                },
+            ))
+        })
+        .collect()
+}
 
 /// 在线检查更新结果缓存时间（秒），30 分钟。
 /// 在线检查更新结果缓存时间（秒），30 分钟。
@@ -161,85 +203,7 @@ fn validate_model_id(model_id: &str) -> Result<&str, AdminServiceError> {
     Ok(model_id)
 }
 
-fn extract_anthropic_test_text(bytes: &[u8]) -> anyhow::Result<String> {
-    let value: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|e| anyhow::anyhow!("Anthropic 响应 JSON 解析失败: {}", e))?;
-    let content = value
-        .get("content")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| anyhow::anyhow!("Anthropic 响应缺少 content 字段"))?;
-
-    let text = content
-        .iter()
-        .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-        .collect::<Vec<_>>()
-        .join("");
-
-    if text.trim().is_empty() {
-        anyhow::bail!("Anthropic 响应没有文本内容");
-    }
-    Ok(text)
-}
-
-#[cfg(test)]
-mod model_test_response_tests {
-    #[test]
-    fn extracts_text_from_anthropic_json() {
-        let body = br#"{
-            "content": [
-                {"type":"thinking","thinking":"internal"},
-                {"type":"text","text":"OK"}
-            ]
-        }"#;
-        assert_eq!(super::extract_anthropic_test_text(body).unwrap(), "OK");
-    }
-
-    #[test]
-    fn rejects_anthropic_json_without_text() {
-        let body = br#"{"content":[{"type":"thinking","thinking":"internal"}]}"#;
-        assert!(super::extract_anthropic_test_text(body).is_err());
-    }
-}
-
-fn normalize_upstream_base_url(value: &str) -> Result<String, AdminServiceError> {
-    let raw = value.trim();
-    let parsed = reqwest::Url::parse(raw)
-        .map_err(|e| AdminServiceError::InvalidCredential(format!("上游 Base URL 无效: {}", e)))?;
-    if !matches!(parsed.scheme(), "http" | "https")
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-        || parsed.query().is_some()
-        || parsed.fragment().is_some()
-    {
-        return Err(AdminServiceError::InvalidCredential(
-            "上游 Base URL 必须是 http/https 地址，且不能包含账号密码、查询参数或 fragment".to_string(),
-        ));
-    }
-    if parsed.path() != "" && parsed.path() != "/" {
-        return Err(AdminServiceError::InvalidCredential(
-            "上游 Base URL 不要包含 /v1 路径，系统会自动请求 /v1/messages 和 /v1/models".to_string(),
-        ));
-    }
-    Ok(raw.trim_end_matches('/').to_string())
-}
-
-/// 截断上游错误正文，防止异常网关返回超大内容或把敏感上下文原样暴露给 Admin UI。
-fn truncate_health_error(value: &str) -> String {
-    const MAX_ERROR_CHARS: usize = 512;
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = compact.chars();
-    let truncated: String = chars.by_ref().take(MAX_ERROR_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{}...", truncated)
-    } else {
-        truncated
-    }
-}
-
 /// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImportStatus {
     Verified,
     /// 直接导入（未验活）成功
@@ -257,22 +221,16 @@ pub(crate) struct ImportItemResult {
     pub rolled_back: bool,
 }
 
-impl ImportStatus {
-    /// 对外的稳定字符串表示（SSE 事件与订阅源明细共用）
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
+impl ImportItemResult {
+    /// 转换为 SSE 事件（携带在数组中的下标）
+    pub fn into_event(self, index: usize) -> BatchImportEvent {
+        let status = match self.status {
             ImportStatus::Verified => "verified",
             ImportStatus::Imported => "imported",
             ImportStatus::Duplicate => "duplicate",
             ImportStatus::Failed => "failed",
         }
-    }
-}
-
-impl ImportItemResult {
-    /// 转换为 SSE 事件（携带在数组中的下标）
-    pub fn into_event(self, index: usize) -> BatchImportEvent {
-        let status = self.status.as_str().to_string();
+        .to_string();
         BatchImportEvent {
             index: Some(index),
             status,
@@ -351,6 +309,8 @@ pub struct AdminService {
     proxy_pool: ProxyPoolManager,
     /// 在线镜像更新运行时配置
     update_config: Mutex<RuntimeUpdateConfig>,
+    /// 凭据 metadata schema；设置页修改后即时生效。
+    credential_metadata_schema: Mutex<serde_json::Value>,
     /// 最近一次"检查更新"结果（带 TTL，用于减少 GitHub API 调用）
     update_check_cache: Mutex<Option<CachedUpdateCheck>>,
     /// 进行中的 IdC 设备授权会话
@@ -361,13 +321,8 @@ pub struct AdminService {
     trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
     /// 用量日志记录器（用于日志治理：保留天数运行时可改）
     usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
-    /// API Key 订阅源运行时配置（改后热生效，同时落盘）
-    key_feed_config: Mutex<KeyFeedConfig>,
-    /// 最近一次订阅源拉取结果（仅进程内存，重启后清空）
-    key_feed_last_pull: Mutex<Option<KeyFeedPullResult>>,
-    /// 订阅源拉取互斥：手动触发与后台调度可能同时发生，串行化避免
-    /// 两轮并发导入同一批 key（去重虽能兜住，但会白跑一堆上游验活请求）
-    key_feed_pull_lock: tokio::sync::Mutex<()>,
+    /// prompt cache 本地计量模拟句柄（开关运行时可改）
+    cache_meter: Option<crate::anthropic::cache_metering::SharedCacheMeter>,
 }
 
 /// Social 登录会话状态
@@ -672,7 +627,7 @@ fn subscription_type_from_title(title: Option<&str>) -> &'static str {
 
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
-const GITHUB_RELEASES_REPO: &str = "2464693633/kiro-rs-lyozc";
+const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
 
 impl AdminService {
     pub fn new(
@@ -688,7 +643,23 @@ impl AdminService {
 
         let balance_cache = Self::load_balance_cache_from(&cache_path);
         let update_config = RuntimeUpdateConfig::from_config(token_manager.config());
-        let key_feed_config = token_manager.config().key_feed.clone();
+        let credential_metadata_schema =
+            match token_manager.config().credential_metadata_schema.clone() {
+                Some(schema) => {
+                    let schema = normalize_credential_metadata_schema(schema);
+                    match validate_credential_metadata_schema(&schema) {
+                        Ok(()) => schema,
+                        Err(error) => {
+                            tracing::warn!(
+                                "配置中的 credentialMetadataSchema 无效，回退内置值: {}",
+                                error
+                            );
+                            credential_metadata_schema()
+                        }
+                    }
+                }
+                None => credential_metadata_schema(),
+            };
 
         let svc = Self {
             token_manager,
@@ -698,14 +669,13 @@ impl AdminService {
             known_endpoints: known_endpoints.into_iter().collect(),
             proxy_pool: ProxyPoolManager::new(proxy_pool_path, token_manager_tls_backend),
             update_config: Mutex::new(update_config),
+            credential_metadata_schema: Mutex::new(credential_metadata_schema),
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
             trace_store: None,
             usage_recorder: None,
-            key_feed_config: Mutex::new(key_feed_config),
-            key_feed_last_pull: Mutex::new(None),
-            key_feed_pull_lock: tokio::sync::Mutex::new(()),
+            cache_meter: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -747,6 +717,96 @@ impl AdminService {
         self
     }
 
+    /// 注入 prompt cache 计量模拟句柄，用于运行时切换总开关。
+    pub fn with_cache_meter(
+        mut self,
+        cache_meter: crate::anthropic::cache_metering::SharedCacheMeter,
+    ) -> Self {
+        self.cache_meter = Some(cache_meter);
+        self
+    }
+
+    /// 查询 prompt cache 计量模拟配置与运行指标。
+    ///
+    /// 运行时句柄优先（反映当前真实生效状态）；句柄缺失时回落到 config.json
+    /// 显式值、再回落到环境变量与默认值，与启动时的优先级一致，`stats` 为 `null`。
+    pub fn get_cache_metering_config(&self) -> CacheMeteringConfigResponse {
+        use crate::anthropic::cache_metering::CacheMeter;
+
+        if let Some(meter) = self.cache_meter.as_ref() {
+            let stats = meter.stats_total();
+            return CacheMeteringConfigResponse {
+                enabled: meter.is_enabled(),
+                capacity: meter.capacity(),
+                persist_enabled: meter.persist_enabled(),
+                flush_interval_secs: meter.flush_interval_secs(),
+                miss_diagnostics: meter.miss_diagnostics(),
+                stats: Some(CacheMeteringStatsResponse {
+                    entries_len: meter.len(),
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    miss_no_entry: stats.miss_no_entry,
+                    miss_expired: stats.miss_expired,
+                    miss_evicted: stats.miss_evicted,
+                    miss_no_breakpoint: stats.miss_no_breakpoint,
+                    miss_no_seed: stats.miss_no_seed,
+                    evicted_total: stats.evicted_total,
+                    expired_total: stats.expired_total,
+                    tombstone_clears: stats.tombstone_clears,
+                }),
+            };
+        }
+
+        let config = self.token_manager.config();
+        CacheMeteringConfigResponse {
+            enabled: config
+                .cache_metering_enabled
+                .or_else(CacheMeter::metering_enabled_from_env)
+                .unwrap_or(true),
+            capacity: CacheMeter::resolve_capacity(
+                config.cache_metering_capacity,
+                CacheMeter::capacity_from_env(),
+            ),
+            persist_enabled: config
+                .cache_metering_persist_enabled
+                .or_else(CacheMeter::persist_enabled_from_env)
+                .unwrap_or(false),
+            flush_interval_secs: CacheMeter::resolve_flush_interval_secs(
+                config.cache_metering_flush_interval_secs,
+                CacheMeter::flush_interval_from_env(),
+            ),
+            miss_diagnostics: config
+                .cache_metering_miss_diagnostics
+                .or_else(CacheMeter::miss_diagnostics_from_env)
+                .unwrap_or(true),
+            stats: None,
+        }
+    }
+
+    /// 更新 prompt cache 计量模拟配置：改运行时原子值 + 持久化到 config.json。
+    pub fn set_cache_metering_config(
+        &self,
+        req: SetCacheMeteringConfigRequest,
+    ) -> Result<CacheMeteringConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "请提供 enabled 字段".to_string(),
+            ));
+        };
+
+        if let Some(meter) = &self.cache_meter {
+            meter.set_enabled(enabled);
+        }
+        if let Err(e) = self
+            .token_manager
+            .update_config_file(|config| config.cache_metering_enabled = Some(enabled))
+        {
+            tracing::warn!("持久化 prompt cache 计量开关配置失败: {}", e);
+        }
+
+        Ok(self.get_cache_metering_config())
+    }
+
     /// 获取所有凭据状态
     pub fn get_all_credentials(&self) -> CredentialsStatusResponse {
         let snapshot = self.token_manager.snapshot();
@@ -756,6 +816,7 @@ impl AdminService {
             snapshot.current_id
         };
         let default_endpoint = self.token_manager.config().default_endpoint.clone();
+        let metadata_schema = self.credential_metadata_schema.lock().clone();
 
         // 一次性快照余额缓存，避免 N 次加锁
         let balance_snapshot: HashMap<u64, CachedBalance> = {
@@ -773,6 +834,7 @@ impl AdminService {
                     .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64)
                     .map(|c| (Some(c.data.clone()), Some(c.cached_at)))
                     .unwrap_or((None, None));
+                let metadata = credential_metadata_details(&entry.metadata, &metadata_schema);
 
                 CredentialStatusItem {
                     id: entry.id,
@@ -785,10 +847,12 @@ impl AdminService {
                     auth_method: entry.auth_method,
                     provider: entry.provider,
                     has_profile_arn: entry.has_profile_arn,
+                    profile_arn: entry.profile_arn,
                     refresh_token_hash: entry.refresh_token_hash,
                     api_key_hash: entry.api_key_hash,
                     masked_api_key: entry.masked_api_key,
                     email: entry.email,
+                    subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
@@ -798,25 +862,46 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    metadata,
                     balance,
                     balance_updated_at,
-                    is_upstream: entry.is_upstream,
-                    upstream_base_url: entry.upstream_base_url,
-                    token_usage_7d: None,
                     created_at: entry.created_at,
                 }
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        // 与调度器保持一致：优先级越小越靠前，同优先级按 ID 升序。
+        credentials.sort_by_key(|c| (c.priority, c.id));
 
         CredentialsStatusResponse {
             total: snapshot.total,
             available: snapshot.available,
             current_id: exposed_current_id,
+            metadata_schema,
             credentials,
         }
+    }
+
+    pub fn get_credential_metadata_schema(&self) -> CredentialMetadataSchemaConfig {
+        CredentialMetadataSchemaConfig {
+            schema: self.credential_metadata_schema.lock().clone(),
+        }
+    }
+
+    pub fn set_credential_metadata_schema(
+        &self,
+        req: CredentialMetadataSchemaConfig,
+    ) -> Result<CredentialMetadataSchemaConfig, AdminServiceError> {
+        validate_credential_metadata_schema(&req.schema)
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        let schema_for_save = req.schema.clone();
+        self.token_manager
+            .update_config_file(move |config| {
+                config.credential_metadata_schema = Some(schema_for_save);
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        *self.credential_metadata_schema.lock() = req.schema;
+        Ok(self.get_credential_metadata_schema())
     }
 
     /// 导出凭据为兼容 JSON（嵌套 `Account` 格式）
@@ -832,7 +917,7 @@ impl AdminService {
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
         }
-        credentials.sort_by_key(|c| c.priority);
+        credentials.sort_by_key(|c| (c.priority, c.id.unwrap_or(u64::MAX)));
 
         let accounts = credentials
             .into_iter()
@@ -1058,7 +1143,7 @@ impl AdminService {
         Ok(available_models_response(id, selection_mode, response))
     }
 
-    /// 对指定模型发送真实、最小化请求，按凭据类型解析 Kiro 或 Anthropic 响应。
+    /// 对指定模型发送真实、最小化的 Kiro 请求。
     pub async fn test_model(
         &self,
         request: ModelTestRequest,
@@ -1082,53 +1167,18 @@ impl AdminService {
             additional_model_request_fields: None,
         })
         .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
-        let anthropic_body = serde_json::to_string(&serde_json::json!({
-            "model": model_id,
-            "max_tokens": 16,
-            "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
-            "stream": false,
-        }))
-        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let started = std::time::Instant::now();
-        let (credential_id, is_upstream, bytes) =
+        let (credential_id, bytes) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
-                let call = if let Some(credential_id) = request.credential_id {
-                    provider
-                        .call_api_dual_for_credential(
-                            credential_id,
-                            &body,
-                            &anthropic_body,
-                        )
-                        .await?
-                } else {
-                    provider
-                        .call_api_dual(&body, Some(&anthropic_body), None, None, None)
-                        .await?
-                };
+                let call = provider.call_api(&body, None, None).await?;
                 let credential_id = call.credential_id;
-                let is_upstream = call.is_upstream;
                 let bytes = call.response.bytes().await?;
-                Ok::<_, anyhow::Error>((credential_id, is_upstream, bytes))
+                Ok::<_, anyhow::Error>((credential_id, bytes))
             })
             .await
             .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
             .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?;
-
-        if is_upstream {
-            let response_text = strip_tool_use_xml_leaks(
-                &extract_anthropic_test_text(&bytes)
-                    .map_err(|error| AdminServiceError::UpstreamError(error.to_string()))?,
-            );
-            return Ok(ModelTestResponse {
-                model_id: model_id.to_string(),
-                credential_id,
-                latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                response_text,
-                credit_usage: None,
-                credit_unit: None,
-            });
-        }
 
         let mut decoder = EventStreamDecoder::new();
         decoder
@@ -1190,180 +1240,55 @@ impl AdminService {
         })
     }
 
-    /// 对单个上游 Anthropic 凭据执行轻量健康检查。
-    ///
-    /// 健康检查直接请求该凭据自己的 `/v1/models`，不会经过凭据池调度，也不会
-    /// 调用 `report_failure`/`report_success` 改变账号状态。这样面板可以区分
-    /// 「这个 key 当前不可用」和「另一个 key 被故障转移选中」两种情况。
-    pub async fn check_upstream_health(
-        &self,
-        credential_id: u64,
-    ) -> Result<UpstreamHealthCheckResponse, AdminServiceError> {
-        let credentials = self
-            .token_manager
-            .clone_credential(credential_id)
-            .ok_or(AdminServiceError::NotFound { id: credential_id })?;
-
-        if !credentials.is_upstream_credential() {
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "凭据 #{} 不是上游 Anthropic API 凭据",
-                credential_id
-            )));
-        }
-
-        let base_url = credentials
-            .upstream_base_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential(format!(
-                    "凭据 #{} 缺少 upstreamBaseUrl",
-                    credential_id
-                ))
-            })?;
-        let api_key = credentials
-            .upstream_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| {
-                AdminServiceError::InvalidCredential(format!(
-                    "凭据 #{} 缺少 upstreamApiKey",
-                    credential_id
-                ))
-            })?;
-
-        let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
-        let global_proxy = self.token_manager.proxy();
-        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
-        // 健康检查不能沿用普通请求的 12 分钟超时；单次探测最多等待 20 秒，
-        // 否则一个挂死的上游会把批量检查整批拖住。
-        let client = build_client(
-            effective_proxy.as_ref(),
-            20,
-            self.token_manager.config().tls_backend,
-        )
-        .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
-
-        let started = std::time::Instant::now();
-        let response = match client
-            .get(&url)
-            .header("x-api-key", api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("accept", "application/json")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let latency_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                if status.is_success() {
-                    UpstreamHealthCheckResponse {
-                        credential_id,
-                        success: true,
-                        status: Some(status.as_u16()),
-                        latency_ms,
-                        error: None,
-                        checked_at: Utc::now().to_rfc3339(),
-                    }
-                } else {
-                    // 只读取并截断错误正文，避免把异常网关返回的大 body 写入 Admin
-                    // 响应；同时不回显请求头中的 API key。
-                    let body = response.text().await.unwrap_or_default();
-                    let detail = truncate_health_error(&body).replace(api_key, "[redacted]");
-                    let error = if detail.is_empty() {
-                        format!("上游返回 HTTP {}", status.as_u16())
-                    } else {
-                        format!("上游返回 HTTP {}: {}", status.as_u16(), detail)
-                    };
-                    UpstreamHealthCheckResponse {
-                        credential_id,
-                        success: false,
-                        status: Some(status.as_u16()),
-                        latency_ms,
-                        error: Some(error),
-                        checked_at: Utc::now().to_rfc3339(),
-                    }
-                }
-            }
-            Err(error) => UpstreamHealthCheckResponse {
-                credential_id,
-                success: false,
-                status: None,
-                latency_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                error: Some(truncate_health_error(&error.to_string())),
-                checked_at: Utc::now().to_rfc3339(),
-            },
-        };
-
-        Ok(response)
-    }
-
-    /// 并发检查多个上游 Anthropic 凭据。
-    ///
-    /// ID 列表省略或为空时检查当前配置中的全部上游凭据。并发度固定为 8，
-    /// 避免面板点击「全部检查」时瞬间打满单机连接池或上游限流窗口。
-    pub async fn check_upstream_health_batch(
-        &self,
-        credential_ids: Option<Vec<u64>>,
-    ) -> UpstreamHealthCheckBatchResponse {
-        let ids = match credential_ids {
-            Some(ids) if !ids.is_empty() => ids,
-            _ => self
-                .token_manager
-                .clone_all_credentials()
-                .into_iter()
-                .filter(|credential| credential.is_upstream_credential())
-                .filter_map(|credential| credential.id)
-                .collect(),
-        };
-
-        let mut results = futures::stream::iter(ids)
-            .map(|credential_id| async move {
-                match self.check_upstream_health(credential_id).await {
-                    Ok(result) => result,
-                    Err(error) => UpstreamHealthCheckResponse {
-                        credential_id,
-                        success: false,
-                        status: None,
-                        latency_ms: 0,
-                        error: Some(error.to_string()),
-                        checked_at: Utc::now().to_rfc3339(),
-                    },
-                }
-            })
-            .buffer_unordered(8)
-            .collect::<Vec<_>>()
-            .await;
-        // 稳定输出顺序便于前端按凭据列表渲染，也避免并发完成顺序导致 diff 抖动。
-        results.sort_by_key(|result| result.credential_id);
-        let total = results.len();
-        let success_count = results.iter().filter(|result| result.success).count();
-        UpstreamHealthCheckBatchResponse {
-            results,
-            total,
-            success_count,
-            failure_count: total.saturating_sub(success_count),
-            checked_at: Utc::now().to_rfc3339(),
-        }
-    }
-
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）
     ///
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存
     /// 与磁盘缓存。失败的条目不会清空旧缓存，调用方可在下次轮询时重试。
     pub async fn refresh_all_balances(&self) -> (usize, usize) {
         let snapshot = self.token_manager.snapshot();
+        let now_ts = Utc::now().timestamp() as f64;
+        let quota_recovery_enabled = self.token_manager.quota_reset_recovery_enabled();
+        // 优先使用凭据自身缓存的上游 nextResetAt。极少数没有本地余额缓存的
+        // QuotaExceeded 凭据，才回退使用同一计费周期中其它凭据的 reset 时间。
+        // 这让到期探测按凭据进行，不会因为一个账号到期而查询全部禁用账号。
+        // 普通 UI/读取路径仍各自执行 5 分钟 TTL 校验。
+        let quota_reset_times: HashMap<u64, Option<f64>> = {
+            let cache = self.balance_cache.lock();
+            let fallback = cache.values().find_map(|cached| cached.data.next_reset_at);
+            snapshot
+                .entries
+                .iter()
+                .filter(|entry| {
+                    entry.disabled && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                })
+                .map(|entry| {
+                    let reset_at = quota_recovery_reset_at(&cache, entry.id, fallback);
+                    (entry.id, reset_at)
+                })
+                .collect()
+        };
         let mut success = 0_usize;
         let mut failure = 0_usize;
 
         for entry in snapshot.entries.into_iter() {
-            if entry.disabled {
+            let quota_recovery_probe = quota_recovery_enabled
+                && entry.disabled
+                && entry.disabled_reason.as_deref() == Some("QuotaExceeded")
+                && quota_reset_times
+                    .get(&entry.id)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|reset_at| quota_reset_is_due(Some(reset_at), now_ts));
+            if entry.disabled && !quota_recovery_probe {
                 continue;
             }
             match self.fetch_balance(entry.id).await {
                 Ok(balance) => {
+                    // 此路径只恢复此前因额度耗尽而被禁用的账号。即使超额开关
+                    // 仍为开启，也不能证明超额额度尚未耗尽；只有订阅额度在新
+                    // 计费周期恢复为正数时才重新加入调度。
+                    let quota_recovered = quota_recovery_probe && balance.remaining > 0.0;
+                    let remaining = balance.remaining;
                     {
                         let mut cache = self.balance_cache.lock();
                         cache.insert(
@@ -1373,6 +1298,24 @@ impl AdminService {
                                 data: balance,
                             },
                         );
+                    }
+                    if quota_recovered {
+                        match self.token_manager.recover_quota_exceeded(entry.id) {
+                            Ok(true) => tracing::info!(
+                                credential_id = entry.id,
+                                remaining,
+                                "上游计费周期已重置，QuotaExceeded 凭据已恢复可用"
+                            ),
+                            Ok(false) => tracing::debug!(
+                                credential_id = entry.id,
+                                "额度恢复探测期间凭据状态已变化，跳过自动恢复"
+                            ),
+                            Err(error) => tracing::warn!(
+                                credential_id = entry.id,
+                                error = %error,
+                                "额度恢复探测确认余额可用，但恢复凭据失败"
+                            ),
+                        }
                     }
                     success += 1;
                 }
@@ -1518,365 +1461,6 @@ impl AdminService {
         });
     }
 
-    // ==================== API Key 订阅源（拼车链接）自动导入 ====================
-
-    /// 读取订阅源配置（token 只回布尔）。
-    pub fn get_key_feed_config(&self) -> KeyFeedConfigResponse {
-        let config = self.key_feed_config.lock().clone();
-        let last_pull = self.key_feed_last_pull.lock().clone();
-        Self::key_feed_response(&config, last_pull)
-    }
-
-    fn key_feed_response(
-        config: &KeyFeedConfig,
-        last_pull: Option<KeyFeedPullResult>,
-    ) -> KeyFeedConfigResponse {
-        KeyFeedConfigResponse {
-            enabled: config.enabled,
-            url: config.url.clone(),
-            token_set: config
-                .token
-                .as_deref()
-                .map(|t| !t.trim().is_empty())
-                .unwrap_or(false),
-            token_param: config.effective_token_param().to_string(),
-            interval_secs: config.effective_interval_secs(),
-            verify: config.verify,
-            priority: config.priority,
-            groups: config.groups.clone(),
-            endpoint: config.endpoint.clone(),
-            reap_disabled: config.reap_disabled,
-            last_pull,
-        }
-    }
-
-    /// 更新订阅源配置（热生效 + 落盘）。
-    ///
-    /// `url` 允许直接粘贴含 `?token=` 的完整链接：这里会拆出 token 存到独立字段，
-    /// 使 Admin API 的响应不回显明文（前端只看到 `tokenSet`）。
-    pub fn set_key_feed_config(
-        &self,
-        req: SetKeyFeedConfigRequest,
-    ) -> Result<KeyFeedConfigResponse, AdminServiceError> {
-        // 端点名校验：与 add_credential 一致，未注册的端点会让每轮导入全量失败
-        if let Some(raw) = req.endpoint.as_deref()
-            && !raw.trim().is_empty()
-            && !self.known_endpoints.contains(raw.trim())
-        {
-            let mut known: Vec<&str> = self.known_endpoints.iter().map(|s| s.as_str()).collect();
-            known.sort();
-            return Err(AdminServiceError::InvalidCredential(format!(
-                "未知端点 \"{}\"，已注册端点: {:?}",
-                raw.trim(),
-                known
-            )));
-        }
-
-        // 令牌参数名：本轮请求带了就用新的，否则沿用现有配置（拆分 URL 时要用）
-        let token_param = req
-            .token_param
-            .as_deref()
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| self.key_feed_config.lock().effective_token_param().to_string());
-
-        // URL 拆分：非空则必须是可解析的 http(s) URL，否则每轮拉取都白跑
-        let mut url_update: Option<Option<String>> = None;
-        let mut token_from_url: Option<String> = None;
-        if let Some(raw) = req.url.as_deref() {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                url_update = Some(None);
-            } else {
-                let (base, token) = key_feed::split_url_and_token(trimmed, &token_param);
-                let parsed = reqwest::Url::parse(&base).map_err(|e| {
-                    AdminServiceError::InvalidCredential(format!("订阅源 URL 无法解析: {}", e))
-                })?;
-                if !matches!(parsed.scheme(), "http" | "https") {
-                    return Err(AdminServiceError::InvalidCredential(
-                        "订阅源 URL 必须为 http 或 https".to_string(),
-                    ));
-                }
-                url_update = Some(Some(base));
-                token_from_url = token;
-            }
-        }
-
-        // token 优先级：显式传入的 token > 从 URL 里拆出来的 > 保持原值。
-        // 显式空串表示清除。
-        let token_update: Option<Option<String>> = match req.token.as_deref() {
-            Some(raw) => {
-                let trimmed = raw.trim();
-                Some(if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(trimmed.to_string())
-                })
-            }
-            None => token_from_url.map(Some),
-        };
-
-        let endpoint_update: Option<Option<String>> = req.endpoint.as_deref().map(|raw| {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
-
-        let groups_update = req.groups.map(|groups| {
-            groups
-                .into_iter()
-                .map(|g| g.trim().to_string())
-                .filter(|g| !g.is_empty())
-                .collect::<Vec<String>>()
-        });
-
-        let apply = |target: &mut KeyFeedConfig| {
-            if let Some(enabled) = req.enabled {
-                target.enabled = enabled;
-            }
-            if req.token_param.is_some() {
-                target.token_param = token_param.clone();
-            }
-            if let Some(url) = &url_update {
-                target.url = url.clone();
-            }
-            if let Some(token) = &token_update {
-                target.token = token.clone();
-            }
-            if let Some(interval) = req.interval_secs {
-                // 落盘前就夹到下限，让配置文件与实际行为一致。若存原始值（如 30），
-                // 将来下限一旦调低，这个值会静默变成生效值 —— 那是个隐蔽的意外。
-                target.interval_secs = interval.max(KEY_FEED_MIN_INTERVAL_SECS);
-            }
-            if let Some(verify) = req.verify {
-                target.verify = verify;
-            }
-            if let Some(priority) = req.priority {
-                target.priority = priority;
-            }
-            if let Some(groups) = &groups_update {
-                target.groups = groups.clone();
-            }
-            if let Some(endpoint) = &endpoint_update {
-                target.endpoint = endpoint.clone();
-            }
-            if let Some(reap) = req.reap_disabled {
-                target.reap_disabled = reap;
-            }
-        };
-
-        {
-            let mut runtime = self.key_feed_config.lock();
-            apply(&mut runtime);
-        }
-        self.update_config_file(|c| apply(&mut c.key_feed));
-
-        Ok(self.get_key_feed_config())
-    }
-
-    /// 拉取一次订阅源并导入其中的新 key。
-    ///
-    /// 幂等：已入库的 key 命中 `sha256(kiroApiKey)` 去重后在任何网络调用之前就被
-    /// 拒绝，所以重复拉到存量 key 的代价是零次上游请求。
-    ///
-    /// 全程持 [`Self::key_feed_pull_lock`]，手动触发与后台调度不会并发导入同一批 key。
-    pub async fn pull_key_feed(&self) -> KeyFeedPullResult {
-        let _guard = self.key_feed_pull_lock.lock().await;
-
-        let config = self.key_feed_config.lock().clone();
-        let pulled_at = Utc::now().to_rfc3339();
-
-        let mut result = KeyFeedPullResult {
-            pulled_at,
-            success: false,
-            total: 0,
-            candidates: 0,
-            imported: 0,
-            duplicate: 0,
-            failed: 0,
-            reaped: 0,
-            earliest_warranty_until: None,
-            message: None,
-            error: None,
-            items: Vec::new(),
-        };
-
-        let proxy = self.token_manager.proxy();
-        let tls_backend = self.token_manager.config().tls_backend;
-
-        let feed = match key_feed::fetch(&config, proxy.as_ref(), tls_backend).await {
-            Ok(feed) => feed,
-            Err(e) => {
-                result.error = Some(e.to_string());
-                self.store_key_feed_result(&result);
-                return result;
-            }
-        };
-
-        result.success = true;
-        result.total = feed.data.len();
-        result.message = feed
-            .msg
-            .clone()
-            .map(|m| m.trim().to_string())
-            .filter(|m| !m.is_empty());
-
-        let candidates = key_feed::to_candidates(&feed, &config);
-        result.candidates = candidates.len();
-        // RFC3339 在同一时区偏移下按字典序即时间序；这里全部由 ms_to_rfc3339 生成
-        // （统一 UTC 偏移），故可直接 min。
-        result.earliest_warranty_until = candidates
-            .iter()
-            .filter_map(|c| c.warranty_until.clone())
-            .min();
-
-        // 串行导入：一轮通常只有个位数新 key，验活各一次上游往返，
-        // 串行足够快且对上游最友好（与 refresh_all_balances 的取舍一致）。
-        for candidate in candidates {
-            let api_region = candidate.request.api_region.clone();
-            let outcome = self
-                .import_one_credential(candidate.request, config.verify)
-                .await;
-
-            let status = outcome.status.as_str().to_string();
-            match status.as_str() {
-                "imported" | "verified" => result.imported += 1,
-                "duplicate" => result.duplicate += 1,
-                _ => result.failed += 1,
-            }
-
-            // 去重是预期常态（存量 key 每轮都会命中），不记明细也不打日志，
-            // 否则 20 个号位每 5 分钟刷 20 行噪音。
-            if status != "duplicate" {
-                if status == "failed" {
-                    tracing::warn!(
-                        "订阅源导入号位 {} 失败: {}",
-                        candidate.label,
-                        outcome.error.as_deref().unwrap_or("未知错误")
-                    );
-                } else {
-                    tracing::info!(
-                        "订阅源导入号位 {} 成功，凭据 #{}",
-                        candidate.label,
-                        outcome
-                            .credential_id
-                            .map(|id| id.to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    );
-                }
-                result.items.push(KeyFeedItemResult {
-                    label: candidate.label,
-                    status,
-                    credential_id: outcome.credential_id,
-                    api_region,
-                    warranty_until: candidate.warranty_until,
-                    error: outcome.error,
-                });
-            }
-        }
-
-        if config.reap_disabled {
-            result.reaped = self.reap_key_feed_credentials();
-        }
-
-        self.store_key_feed_result(&result);
-        result
-    }
-
-    fn store_key_feed_result(&self, result: &KeyFeedPullResult) {
-        *self.key_feed_last_pull.lock() = Some(result.clone());
-    }
-
-    /// 清理由订阅源导入、且已被**自动**禁用的凭据。
-    ///
-    /// 只删同时满足全部条件的凭据，任一不满足就跳过：
-    /// - `source_channel` 带 `keyfeed:` 前缀 → 不误伤手工添加或其它渠道的号；
-    /// - 已禁用 → 还在服务的号绝不动；
-    /// - 禁用原因不是 `Manual` → 运维手动禁用是显式意图（例如留着排查），保留。
-    ///
-    /// 返回实际删除的条数。
-    fn reap_key_feed_credentials(&self) -> usize {
-        let snapshot = self.token_manager.snapshot();
-        let targets: Vec<u64> = snapshot
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.disabled
-                    && key_feed::is_feed_source(entry.source_channel.as_deref())
-                    && entry.disabled_reason.as_deref() != Some("Manual")
-            })
-            .map(|entry| entry.id)
-            .collect();
-
-        let mut reaped = 0_usize;
-        for id in targets {
-            match self.delete_credential(id) {
-                Ok(()) => {
-                    reaped += 1;
-                    tracing::info!("订阅源清理：已删除自动禁用的凭据 #{}", id);
-                }
-                Err(e) => {
-                    tracing::warn!("订阅源清理凭据 #{} 失败: {}", id, e);
-                }
-            }
-        }
-        reaped
-    }
-
-    /// 启动订阅源后台轮询调度器。
-    ///
-    /// 任务始终运行，每轮先读运行时配置：未启用或未配置 URL 就静默跳过，
-    /// 这样从 UI 打开开关无需重启即可生效。间隔按当前配置动态取值（有 60 秒下限）。
-    pub fn start_key_feed_scheduler(self: &Arc<Self>) {
-        let svc = Arc::clone(self);
-        tokio::spawn(async move {
-            // 让 TokenManager / 网络就绪，避免启动瞬间的首轮拉取撞上未初始化状态
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-            loop {
-                let config = svc.key_feed_config.lock().clone();
-                let interval = std::time::Duration::from_secs(config.effective_interval_secs());
-
-                if config.enabled && config.request_url().is_some() {
-                    let started = std::time::Instant::now();
-                    let result = svc.pull_key_feed().await;
-                    if result.success {
-                        // 一轮全是去重（存量号位）是常态，降到 debug 免刷屏；
-                        // 有实际变化时才 info。
-                        if result.imported > 0 || result.failed > 0 || result.reaped > 0 {
-                            tracing::info!(
-                                "订阅源轮询完成：号位 {}，新增 {}，重复 {}，失败 {}，清理 {}，耗时 {:.1}s",
-                                result.total,
-                                result.imported,
-                                result.duplicate,
-                                result.failed,
-                                result.reaped,
-                                started.elapsed().as_secs_f32()
-                            );
-                        } else {
-                            tracing::debug!(
-                                "订阅源轮询完成：号位 {}，全部已在库，耗时 {:.1}s",
-                                result.total,
-                                started.elapsed().as_secs_f32()
-                            );
-                        }
-                    } else {
-                        tracing::warn!(
-                            "订阅源轮询失败：{}",
-                            result.error.as_deref().unwrap_or("未知错误")
-                        );
-                    }
-                }
-
-                tokio::time::sleep(interval).await;
-            }
-        });
-    }
-
     /// 添加新凭据
     pub async fn add_credential(
         &self,
@@ -1897,6 +1481,8 @@ impl AdminService {
         req: AddCredentialRequest,
         fetch_balance: bool,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        validate_credential_metadata(&req.metadata, &self.credential_metadata_schema.lock())
+            .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -1913,20 +1499,6 @@ impl AdminService {
         // 规范化 auth_method：识别企业 SSO 别名；带 tokenEndpoint 但未声明时推断为 external_idp。
         let auth_method =
             normalize_import_auth_method(&req.auth_method, req.token_endpoint.as_deref());
-
-        let has_upstream_base = req
-            .upstream_base_url
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
-        let has_upstream_key = req
-            .upstream_api_key
-            .as_deref()
-            .is_some_and(|value| !value.trim().is_empty());
-        if has_upstream_base != has_upstream_key {
-            return Err(AdminServiceError::InvalidCredential(
-                "上游 API 凭据必须同时提供 Base URL 和 API Key".to_string(),
-            ));
-        }
 
         // 企业 SSO 导入校验（安全边界）：
         // - 必须同时具备 clientId 与 tokenEndpoint（refresh_external_idp_token 的前提）；
@@ -2003,8 +1575,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
-            upstream_base_url: req.upstream_base_url.map(|s| normalize_upstream_base_url(&s)).transpose()?,
-            upstream_api_key: req.upstream_api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+            metadata: req.metadata,
             // 创建时间由 token_manager.add_credential 在入库时统一写入
             created_at: None,
         };
@@ -2020,31 +1591,10 @@ impl AdminService {
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
         if fetch_balance {
-            let is_upstream = self.token_manager.snapshot().entries.iter()
-                .find(|entry| entry.id == credential_id)
-                .map(|entry| entry.is_upstream)
-                .unwrap_or(false);
-            let verification = if is_upstream {
-                self.get_available_models(credential_id).await.map(|_| ())
-            } else {
-                self.get_balance(credential_id).await.map(|_| ())
-            };
-            if let Err(e) = verification {
-                let _ = self.delete_credential(credential_id);
-                return Err(e);
+            if let Err(e) = self.get_balance(credential_id).await {
+                tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
             }
         }
-
-        // 预热模型缓存，使新凭据的优先级立刻可参与调度。
-        //
-        // 放在验活之后：验活失败会删掉凭据，提前预热等于给一个即将消失的 id 白跑
-        // 一次上游请求，还会留下误导性的失败日志。
-        //
-        // 上游凭据在 `fetch_balance` 路径里已经由 `get_available_models` 填过缓存，
-        // 但 Kiro 凭据走的是 `get_balance`（不碰模型缓存），且 `fetch_balance` 为
-        // false 的"直接导入"路径两者都不填 —— 所以这里统一补一次。
-        // 重复预热是廉价的：`refresh_model_cache_for(id, false)` 命中新鲜缓存即返回。
-        self.token_manager.warm_model_cache_for(credential_id);
 
         Ok(AddCredentialResponse {
             success: true,
@@ -2102,23 +1652,6 @@ impl AdminService {
 
         // 3. 验活路径：显式取余额验活（OAuth 正常路径命中 add 内缓存；
         //    API Key 无 token 刷新，余额拉取即真正的验活，失败则回滚）。
-        let is_upstream = self.token_manager.snapshot().entries.iter()
-            .find(|entry| entry.id == resp.credential_id)
-            .map(|entry| entry.is_upstream)
-            .unwrap_or(false);
-        if is_upstream {
-            return match self.get_available_models(resp.credential_id).await {
-                Ok(_) => ImportItemResult {
-                    status: ImportStatus::Verified, credential_id: Some(resp.credential_id),
-                    email: resp.email, balance: None, error: None, rolled_back: false,
-                },
-                Err(e) => {
-                    let rolled_back = self.delete_credential(resp.credential_id).is_ok();
-                    ImportItemResult { status: ImportStatus::Failed, credential_id: Some(resp.credential_id),
-                        email: resp.email, balance: None, error: Some(e.to_string()), rolled_back }
-                }
-            };
-        }
         match self.get_balance(resp.credential_id).await {
             Ok(balance) => ImportItemResult {
                 status: ImportStatus::Verified,
@@ -2156,13 +1689,10 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
-        let upstream_base_url = req.upstream_base_url.map(|v| {
-            if v.trim().is_empty() { Ok(None) } else { normalize_upstream_base_url(&v).map(Some) }
-        }).transpose()?;
-        let upstream_api_key = req.upstream_api_key.map(|v| {
-            let value = v.trim().to_string();
-            if value.is_empty() { None } else { Some(value) }
-        });
+        if let Some(metadata) = req.metadata.as_ref() {
+            validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
+                .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
+        }
         self.token_manager
             .update_credential(
                 id,
@@ -2176,8 +1706,7 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
-                upstream_base_url,
-                upstream_api_key,
+                req.metadata,
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2207,33 +1736,169 @@ impl AdminService {
         }
     }
 
-    /// 获取全局代理 URL
-    pub fn get_global_proxy(&self) -> Option<String> {
-        self.token_manager.proxy().map(|p| p.url.clone())
+    /// 获取全局代理配置
+    pub fn get_global_proxy(&self) -> GlobalProxyResponse {
+        let proxy = self.token_manager.proxy();
+        GlobalProxyResponse {
+            proxy_url: proxy.as_ref().map(|p| p.url.clone()),
+            proxy_username: proxy.as_ref().and_then(|p| p.username.clone()),
+            proxy_password_set: proxy.as_ref().and_then(|p| p.password.as_ref()).is_some(),
+        }
     }
 
-    /// 设置全局代理 URL（None 表示清除）并持久化到配置文件
-    pub fn set_global_proxy(&self, url: Option<String>) -> Result<(), AdminServiceError> {
+    /// 设置全局代理配置（None url 表示清除）并持久化到配置文件
+    pub fn set_global_proxy(
+        &self,
+        url: Option<String>,
+        username: Option<String>,
+        password: Option<Option<String>>,
+    ) -> Result<(), AdminServiceError> {
         if let Some(ref u) = url {
-            let valid_prefix = u.starts_with("http://")
-                || u.starts_with("https://")
-                || u.starts_with("socks5://")
-                || u.starts_with("socks4://");
+            let normalized = u.to_ascii_lowercase();
+            let valid_prefix = [
+                "http://",
+                "https://",
+                "socks4://",
+                "socks4a://",
+                "socks5://",
+                "socks5h://",
+            ]
+            .iter()
+            .any(|scheme| normalized.starts_with(scheme));
             if !valid_prefix {
                 return Err(AdminServiceError::InvalidCredential(
-                    "代理 URL 格式无效，需以 http://、https://、socks5:// 或 socks4:// 开头"
+                    "代理 URL 格式无效，需以 http://、https://、socks4://、socks4a://、socks5:// 或 socks5h:// 开头"
                         .to_string(),
                 ));
             }
         }
 
-        let proxy = url.as_deref().map(ProxyConfig::new);
-        self.token_manager.set_global_proxy(proxy);
+        let username_for_save = username.clone().filter(|s| !s.is_empty());
+        let current_password = self.token_manager.proxy().and_then(|proxy| proxy.password);
+        let password_for_save = match (url.as_ref(), password) {
+            (None, _) => None,
+            (Some(_), None) => current_password,
+            (Some(_), Some(value)) => value.filter(|s| !s.is_empty()),
+        };
 
-        // 从磁盘加载最新 config 再写，避免覆盖其他字段的并发修改
+        let proxy = url.as_deref().map(|u| {
+            let mut cfg = ProxyConfig::new(u);
+            cfg.username = username_for_save.clone();
+            cfg.password = password_for_save.clone();
+            cfg
+        });
+        // 从磁盘加载最新 config 再写；持久化成功后才切换运行时代理，避免半更新。
         let url_for_save = url;
-        self.update_config_file(move |c| c.proxy_url = url_for_save);
+        self.token_manager
+            .update_config_file(move |c| {
+                c.proxy_url = url_for_save;
+                c.proxy_username = username_for_save;
+                c.proxy_password = password_for_save;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        self.token_manager.set_global_proxy(proxy);
         Ok(())
+    }
+
+    /// 获取所有自定义模型配置。
+    pub fn get_custom_models(&self) -> CustomModelsConfigResponse {
+        let models = crate::model::custom_models::all()
+            .into_iter()
+            .map(|m| CustomModelItem {
+                id: m.id,
+                backend_id: m.backend_id,
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+        CustomModelsConfigResponse { models }
+    }
+
+    /// 批量替换自定义模型配置（校验 → 持久化 config.json → 热更新内存注册表）。
+    pub fn set_custom_models(
+        &self,
+        req: SetCustomModelsRequest,
+    ) -> Result<CustomModelsConfigResponse, AdminServiceError> {
+        // 校验必填字段
+        for (i, m) in req.models.iter().enumerate() {
+            let id = m.id.trim();
+            let backend_id = m.backend_id.trim();
+            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型的 id 必须是 1-128 个非控制字符",
+                    i + 1,
+                )));
+            }
+            if backend_id.is_empty()
+                || backend_id.len() > 256
+                || backend_id.chars().any(char::is_control)
+            {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "第 {} 条模型（{}）的 backend_id 必须是 1-256 个非控制字符",
+                    i + 1,
+                    id,
+                )));
+            }
+            if let Some(value) = m.context_window {
+                if !(1..=10_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 contextWindow 必须在 1 到 10000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+            if let Some(value) = m.max_tokens {
+                if !(1..=1_000_000).contains(&value) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "第 {} 条模型的 maxTokens 必须在 1 到 1000000 之间",
+                        i + 1
+                    )));
+                }
+            }
+        }
+
+        let mut seen_ids = HashSet::new();
+        for model in &req.models {
+            let key = model.id.trim().to_ascii_lowercase();
+            if !seen_ids.insert(key) {
+                return Err(AdminServiceError::InvalidCredential(
+                    "自定义模型 id 不能重复（不区分大小写）".to_string(),
+                ));
+            }
+        }
+
+        // 转换为 config::CustomModel 并持久化
+        let custom_models: Vec<crate::model::config::CustomModel> = req
+            .models
+            .into_iter()
+            .map(|m| crate::model::config::CustomModel {
+                id: m.id.trim().to_string(),
+                backend_id: m.backend_id.trim().to_string(),
+                display_name: m.display_name,
+                context_window: m.context_window,
+                max_tokens: m.max_tokens,
+                supports_reasoning: m.supports_reasoning,
+                owned_by: m.owned_by,
+            })
+            .collect();
+
+        let models_for_config = custom_models.clone();
+        self.token_manager
+            .update_config_file(move |c| {
+                c.custom_models = models_for_config;
+            })
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+
+        // 热更新内存注册表
+        crate::model::custom_models::init(custom_models);
+
+        // 使所有已缓存的模型列表失效，确保下次查询反映最新自定义模型
+        self.token_manager.invalidate_all_model_caches();
+
+        Ok(self.get_custom_models())
     }
 
     /// 持久化新的登录API密钥（adminApiKey）到配置文件（内存中的 key 由 handler 层负责更新）
@@ -2805,7 +2470,55 @@ impl AdminService {
         Ok(LoadBalancingModeResponse { mode: req.mode })
     }
 
-    /// 获取账号级风控故障转移配置
+    /// 获取对话 / MCP 上游域名
+    pub fn get_api_domain(&self) -> ApiDomainConfig {
+        ApiDomainConfig {
+            domain: self.token_manager.api_domain(),
+        }
+    }
+
+    /// 设置对话 / MCP 上游域名（运行时生效 + 持久化 config.json）
+    pub fn set_api_domain(
+        &self,
+        req: ApiDomainConfig,
+    ) -> Result<ApiDomainConfig, AdminServiceError> {
+        self.token_manager
+            .set_api_domain(req.domain)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        Ok(self.get_api_domain())
+    }
+
+    /// 获取会话粘性路由配置与运行时统计
+    pub fn get_session_affinity_config(&self) -> SessionAffinityConfigResponse {
+        let stats = self.token_manager.session_affinity().stats();
+        SessionAffinityConfigResponse {
+            enabled: stats.enabled,
+            ttl_secs: stats.ttl_secs,
+            hits: stats.hits,
+            misses: stats.misses,
+            active_bindings: stats.active_bindings,
+        }
+    }
+
+    /// 更新会话粘性路由配置（运行时生效 + 持久化 config.json）
+    pub fn set_session_affinity_config(
+        &self,
+        req: SetSessionAffinityConfigRequest,
+    ) -> Result<SessionAffinityConfigResponse, AdminServiceError> {
+        if req.enabled.is_none() && req.ttl_secs.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 enabled 或 ttlSecs 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_session_affinity_config(req.enabled, req.ttl_secs)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_session_affinity_config())
+    }
+
+    /// 获取账号级 429 限流故障转移配置
     pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
         AccountThrottleConfigResponse {
             failover: self.token_manager.get_account_throttle_failover(),
@@ -2813,7 +2526,7 @@ impl AdminService {
         }
     }
 
-    /// 更新账号级风控故障转移配置
+    /// 更新账号级 429 限流故障转移配置
     pub fn set_account_throttle_config(
         &self,
         req: SetAccountThrottleConfigRequest,
@@ -2831,59 +2544,23 @@ impl AdminService {
         Ok(self.get_account_throttle_config())
     }
 
-    /// 获取上游直通凭据的故障转移检测配置
-    pub fn get_upstream_failover_config(&self) -> crate::model::config::UpstreamFailoverConfig {
-        self.token_manager.get_upstream_failover_config()
-    }
-
-    /// 更新上游直通凭据的故障转移检测配置（热生效 + 持久化到 config.json）
-    pub fn set_upstream_failover_config(
-        &self,
-        req: SetUpstreamFailoverConfigRequest,
-    ) -> Result<crate::model::config::UpstreamFailoverConfig, AdminServiceError> {
-        if req.enabled.is_none()
-            && req.quota_patterns.is_none()
-            && req.suspended_patterns.is_none()
-            && req.throttle_failover.is_none()
-            && req.throttle_cooldown_secs.is_none()
-        {
-            return Err(AdminServiceError::InvalidCredential(
-                "至少提供一个字段".to_string(),
-            ));
-        }
-
-        self.token_manager
-            .set_upstream_failover_config(
-                req.enabled,
-                req.quota_patterns,
-                req.suspended_patterns,
-                req.throttle_failover,
-                req.throttle_cooldown_secs,
-            )
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-
-        Ok(self.get_upstream_failover_config())
-    }
-
-    /// 获取 Token 膨胀倍率配置
-    pub fn get_token_inflation_config(&self) -> TokenInflationConfigResponse {
-        TokenInflationConfigResponse {
-            input_multiplier: self.token_manager.get_input_inflation_multiplier(),
-            output_multiplier: self.token_manager.get_output_inflation_multiplier(),
-            cache_multiplier: self.token_manager.get_cache_inflation_multiplier(),
+    /// 获取普通模型 API 429 自动重试配置
+    pub fn get_model_api_retry_config(&self) -> ModelApiRetryConfigResponse {
+        ModelApiRetryConfigResponse {
+            enabled: self.token_manager.get_model_api_429_retry_enabled(),
         }
     }
 
-    /// 设置 Token 膨胀倍率配置
-    pub fn set_token_inflation_config(
+    /// 更新普通模型 API 429 自动重试配置
+    pub fn set_model_api_retry_config(
         &self,
-        req: SetTokenInflationConfigRequest,
-    ) -> Result<TokenInflationConfigResponse, AdminServiceError> {
+        req: SetModelApiRetryConfigRequest,
+    ) -> Result<ModelApiRetryConfigResponse, AdminServiceError> {
         self.token_manager
-            .set_token_inflation_config(req.input_multiplier, req.output_multiplier, req.cache_multiplier)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+            .set_model_api_429_retry_enabled(req.enabled)
+            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
-        Ok(self.get_token_inflation_config())
+        Ok(self.get_model_api_retry_config())
     }
 
     /// 获取单账号 RPM 限流配置
@@ -2908,6 +2585,29 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_rpm_limit_config())
+    }
+
+    /// 获取月度额度重置后自动恢复配置。
+    pub fn get_quota_reset_recovery_config(&self) -> QuotaResetRecoveryConfigResponse {
+        QuotaResetRecoveryConfigResponse {
+            enabled: self.token_manager.quota_reset_recovery_enabled(),
+        }
+    }
+
+    /// 更新月度额度重置后自动恢复配置。
+    pub fn set_quota_reset_recovery_config(
+        &self,
+        req: SetQuotaResetRecoveryConfigRequest,
+    ) -> Result<QuotaResetRecoveryConfigResponse, AdminServiceError> {
+        let Some(enabled) = req.enabled else {
+            return Err(AdminServiceError::InvalidCredential(
+                "必须提供 enabled 字段".to_string(),
+            ));
+        };
+        self.token_manager
+            .set_quota_reset_recovery_enabled(enabled)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(self.get_quota_reset_recovery_config())
     }
 
     /// 获取自愈治理配置
@@ -3207,16 +2907,12 @@ impl AdminService {
             }
         };
 
-        let now = Utc::now().timestamp() as f64;
         map.into_iter()
             .filter_map(|(k, v)| {
                 let id = k.parse::<u64>().ok()?;
-                // 丢弃超过 TTL 的条目
-                if (now - v.cached_at) < BALANCE_CACHE_TTL_SECS as f64 {
-                    Some((id, v))
-                } else {
-                    None
-                }
+                // 缓存的新鲜度仍由调用方按 TTL 判断。这里保留过期条目，以便
+                // 服务重启后还能在 nextResetAt 到达时复查 QuotaExceeded 凭据。
+                Some((id, v))
             })
             .collect()
     }
@@ -3387,8 +3083,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
-                None,            // upstream_base_url 不修改
-                None,            // upstream_api_key 不修改
+                None,            // metadata 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -3458,7 +3153,16 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None, None)
+                .update_credential(
+                    *cred_id,
+                    None,
+                    Some(Some(url)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
                 .is_ok()
             {
                 assigned += 1;
@@ -3562,8 +3266,6 @@ impl AdminService {
             || msg.contains("kiroApiKey 重复")
             || msg.contains("缺少 kiroApiKey")
             || msg.contains("kiroApiKey 为空")
-            || msg.contains("缺少 upstream Base URL")
-            || msg.contains("缺少 upstream API Key")
             || msg.contains("凭证已过期或无效")
             || msg.contains("权限不足")
             || msg.contains("已被限流");
@@ -3797,9 +3499,6 @@ impl AdminService {
         if let Err(e) = self.get_balance(credential_id).await {
             tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
         }
-
-        // 预热模型缓存，使新凭据的优先级立刻可参与调度（`get_balance` 不填该缓存）。
-        self.token_manager.warm_model_cache_for(credential_id);
 
         tracing::info!("Social 登录成功，已添加凭据 #{}", credential_id);
         Ok(PollIdcLoginResponse::Success { credential_id })
@@ -4059,9 +3758,6 @@ impl AdminService {
                     tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
                 }
 
-                // 预热模型缓存，使新凭据的优先级立刻可参与调度（`get_balance` 不填该缓存）。
-                self.token_manager.warm_model_cache_for(credential_id);
-
                 tracing::info!("IdC 设备授权登录成功，已添加凭据 #{}", credential_id);
                 Ok(PollIdcLoginResponse::Success { credential_id })
             }
@@ -4188,109 +3884,25 @@ impl AdminService {
         )
         .await
     }
-
-    pub fn get_billing_config(&self) -> BillingConfigPayload {
-        let config = self
-            .token_manager
-            .config()
-            .config_path()
-            .and_then(|path| Config::load(path).ok())
-            .unwrap_or_else(|| self.token_manager.config().clone());
-        billing_config_payload(&config.billing)
-    }
-
-    pub fn current_billing_config(&self) -> crate::model::config::BillingConfig {
-        self
-            .token_manager
-            .config()
-            .config_path()
-            .and_then(|path| Config::load(path).ok())
-            .map(|config| config.billing)
-            .unwrap_or_else(|| self.token_manager.config().billing.clone())
-    }
-
-    pub fn set_billing_config(
-        &self,
-        payload: BillingConfigPayload,
-    ) -> Result<BillingConfigPayload, AdminServiceError> {
-        if !payload.rust_multiplier.is_finite()
-            || payload.rust_multiplier < 0.0
-            || !payload.go_multiplier.is_finite()
-            || payload.go_multiplier < 0.0
-        {
-            return Err(AdminServiceError::InvalidCredential(
-                "客户端计费倍率必须是非负有限数字".to_string(),
-            ));
-        }
-        for (id, value) in &payload.upstream_multipliers {
-            if !value.is_finite() || *value < 0.0 {
-                return Err(AdminServiceError::InvalidCredential(format!(
-                    "上游凭据 #{} 的计费倍率无效",
-                    id
-                )));
-            }
-        }
-        for (model, price) in &payload.model_prices {
-            for value in [
-                price.input_per_million,
-                price.output_per_million,
-                price.cache_creation_per_million,
-                price.cache_read_per_million,
-            ] {
-                if !value.is_finite() || value < 0.0 {
-                    return Err(AdminServiceError::InvalidCredential(format!(
-                        "模型 {} 的价格必须是非负有限数字",
-                        model
-                    )));
-                }
-            }
-        }
-        let path = self
-            .token_manager
-            .config()
-            .config_path()
-            .ok_or_else(|| AdminServiceError::InternalError("配置文件路径未知".to_string()))?
-            .to_path_buf();
-        let mut config = Config::load(&path)
-            .map_err(|e| AdminServiceError::InternalError(format!("读取配置失败: {}", e)))?;
-        config.billing = billing_config_from_payload(&payload);
-        config
-            .save()
-            .map_err(|e| AdminServiceError::InternalError(format!("保存费用配置失败: {}", e)))?;
-        Ok(payload)
-    }
 }
 
-fn billing_config_payload(config: &crate::model::config::BillingConfig) -> BillingConfigPayload {
-    BillingConfigPayload {
-        model_prices: config.model_prices.iter().map(|(key, value)| (key.clone(), ModelPricingPayload {
-            input_per_million: value.input_per_million,
-            output_per_million: value.output_per_million,
-            cache_creation_per_million: value.cache_creation_per_million,
-            cache_read_per_million: value.cache_read_per_million,
-        })).collect(),
-        upstream_multipliers: config.upstream_multipliers.clone(),
-        rust_multiplier: config.rust_multiplier,
-        go_multiplier: config.go_multiplier,
-        real_multiplier: config.real_multiplier,
-        nocache_multiplier: config.nocache_multiplier,
-    }
+/// `nextResetAt` 是上游 Usage Limits 响应的 Unix 秒时间戳。只有到期后才对
+/// QuotaExceeded 凭据发起一次恢复探测，避免把被禁用账号持续查询上游。
+fn quota_reset_is_due(reset_at: Option<f64>, now_ts: f64) -> bool {
+    reset_at.is_some_and(|reset_at| reset_at <= now_ts)
 }
 
-fn billing_config_from_payload(payload: &BillingConfigPayload) -> crate::model::config::BillingConfig {
-    crate::model::config::BillingConfig {
-        model_prices: payload.model_prices.iter().map(|(key, value)| (key.clone(), crate::model::config::ModelPricing {
-            input_per_million: value.input_per_million,
-            output_per_million: value.output_per_million,
-            cache_creation_per_million: value.cache_creation_per_million,
-            cache_read_per_million: value.cache_read_per_million,
-        })).collect(),
-        upstream_multipliers: payload.upstream_multipliers.clone(),
-        rust_multiplier: payload.rust_multiplier,
-        go_multiplier: payload.go_multiplier,
-        real_multiplier: payload.real_multiplier,
-        nocache_multiplier: payload.nocache_multiplier,
-    }
+/// 返回某个 QuotaExceeded 凭据的恢复检查时间。优先取它自己的
+/// `nextResetAt`；只有完全没有时才使用调用方提供的同周期备用时间。
+fn quota_recovery_reset_at(
+    cache: &HashMap<u64, CachedBalance>,
+    credential_id: u64,
+    fallback: Option<f64>,
+) -> Option<f64> {
+    cache
+        .get(&credential_id)
+        .and_then(|cached| cached.data.next_reset_at)
+        .or(fallback)
 }
 
 fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
@@ -4304,6 +3916,57 @@ fn classify_rate_limit(error: &anyhow::Error) -> Option<AdminServiceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_recovery_probe_waits_for_upstream_reset_time() {
+        let balance = |next_reset_at| BalanceResponse {
+            id: 1,
+            subscription_title: None,
+            current_usage: 100.0,
+            usage_limit: 100.0,
+            remaining: 0.0,
+            usage_percentage: 100.0,
+            next_reset_at,
+            overage_enabled: Some(false),
+            overage_capable: None,
+            overage_capability_raw: None,
+        };
+
+        assert!(quota_reset_is_due(
+            balance(Some(100.0)).next_reset_at,
+            100.0
+        ));
+        assert!(quota_reset_is_due(balance(Some(99.0)).next_reset_at, 100.0));
+        assert!(!quota_reset_is_due(
+            balance(Some(101.0)).next_reset_at,
+            100.0
+        ));
+        assert!(!quota_reset_is_due(balance(None).next_reset_at, 100.0));
+    }
+
+    #[test]
+    fn quota_recovery_uses_own_reset_time_before_fallback() {
+        let balance = |next_reset_at| CachedBalance {
+            cached_at: 1.0,
+            data: BalanceResponse {
+                id: 1,
+                subscription_title: None,
+                current_usage: 0.0,
+                usage_limit: 100.0,
+                remaining: 100.0,
+                usage_percentage: 0.0,
+                next_reset_at,
+                overage_enabled: None,
+                overage_capable: None,
+                overage_capability_raw: None,
+            },
+        };
+        let cache = HashMap::from([(1, balance(Some(200.0))), (2, balance(Some(100.0)))]);
+
+        assert_eq!(quota_recovery_reset_at(&cache, 1, Some(100.0)), Some(200.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, Some(100.0)), Some(100.0));
+        assert_eq!(quota_recovery_reset_at(&cache, 3, None), None);
+    }
 
     #[test]
     fn available_models_response_preserves_both_token_limits() {
@@ -4342,6 +4005,44 @@ mod tests {
         assert!(validate_model_id("auto").is_err());
         assert!(validate_model_id("AUTO").is_err());
         assert!(validate_model_id(&"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn metadata_details_include_schema_description_and_current_value() {
+        let mut metadata = CredentialMetadata::default();
+        metadata
+            .extra
+            .insert("region".to_string(), serde_json::json!("us-east-1"));
+        let mut schema = credential_metadata_schema();
+        schema["properties"]["region"] = serde_json::json!({
+            "title": "区域",
+            "description": "凭据所属区域",
+            "type": "string"
+        });
+
+        let details = credential_metadata_details(&metadata, &schema);
+        let region = details.get("region").expect("应返回扩展 metadata 字段");
+
+        assert_eq!(region.title, "区域");
+        assert_eq!(region.description.as_deref(), Some("凭据所属区域"));
+        assert_eq!(region.value, serde_json::json!("us-east-1"));
+    }
+
+    #[tokio::test]
+    async fn global_proxy_response_redacts_password() {
+        let proxy = ProxyConfig::new("socks5h://127.0.0.1:1080").with_auth("user", "secret");
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), Some(proxy), None, false)
+                .unwrap(),
+        );
+        let service = AdminService::new(manager, Vec::new());
+
+        let response = service.get_global_proxy();
+        let json = serde_json::to_value(response).unwrap();
+
+        assert_eq!(json["proxyPasswordSet"], true);
+        assert!(json.get("proxyPassword").is_none());
+        assert!(!json.to_string().contains("secret"));
     }
 
     #[tokio::test]
@@ -4488,64 +4189,108 @@ mod tests {
         );
         assert_eq!(subscription_type_from_title(None), "Free");
     }
+}
 
-    #[test]
-    fn health_error_is_compacted_and_bounded() {
-        let error = truncate_health_error("  invalid   api key\nplease retry  ");
-        assert_eq!(error, "invalid api key please retry");
+#[cfg(test)]
+mod cache_metering_config_tests {
+    use super::*;
+    use crate::anthropic::cache_metering::CacheMeter;
 
-        let error = truncate_health_error(&"x".repeat(513));
-        assert_eq!(error.chars().count(), 515);
-        assert!(error.ends_with("..."));
+    fn service_with(config: Config) -> AdminService {
+        let manager =
+            Arc::new(MultiTokenManager::new(config, Vec::new(), None, None, false).unwrap());
+        AdminService::new(manager, Vec::new())
     }
 
+    /// Review Focus 4：句柄缺失时 stats 为 null、配置回落到 config/env/默认，不得 panic。
     #[tokio::test]
-    async fn upstream_health_check_reports_http_status_without_mutating_credential() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn config_falls_back_without_cache_meter_handle() {
+        let service = service_with(Config::default());
+        let resp = service.get_cache_metering_config();
+        let json = serde_json::to_value(&resp).unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-                let count = socket.read(&mut chunk).await.unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&chunk[..count]);
-            }
-            assert!(String::from_utf8_lossy(&request)
-                .to_ascii_lowercase()
-                .contains("x-api-key: sk-health-test"));
-            socket
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 13\r\n\r\ninvalid token",
-                )
-                .await
-                .unwrap();
-        });
+        assert_eq!(json["capacity"], 262_144, "回落到内置默认容量");
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["flushIntervalSecs"], 300);
+        assert_eq!(json["missDiagnostics"], true);
+        assert!(json["stats"].is_null(), "句柄缺失时 stats 必须是 null");
+    }
 
-        let mut credentials = KiroCredentials::default();
-        credentials.id = Some(41);
-        credentials.upstream_base_url = Some(format!("http://{}", address));
-        credentials.upstream_api_key = Some("sk-health-test".to_string());
-        let manager = Arc::new(
-            MultiTokenManager::new(Config::default(), vec![credentials], None, None, false)
-                .unwrap(),
+    /// config.json 显式值在句柄缺失时也要生效（而不是永远吐默认值）。
+    #[tokio::test]
+    async fn config_explicit_values_win_without_handle() {
+        let mut config = Config::default();
+        config.cache_metering_capacity = Some(4_096);
+        config.cache_metering_persist_enabled = Some(true);
+        config.cache_metering_flush_interval_secs = Some(600);
+        config.cache_metering_miss_diagnostics = Some(false);
+
+        let json = serde_json::to_value(service_with(config).get_cache_metering_config()).unwrap();
+        assert_eq!(json["capacity"], 4_096);
+        assert_eq!(json["persistEnabled"], true);
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert!(json["stats"].is_null());
+    }
+
+    /// 有句柄时一律以运行时真实值为准，config.json 里写什么都不算数。
+    #[tokio::test]
+    async fn runtime_handle_overrides_config_values() {
+        let mut config = Config::default();
+        // 故意和句柄对着写，验证优先级
+        config.cache_metering_capacity = Some(262_144);
+        config.cache_metering_flush_interval_secs = Some(300);
+        config.cache_metering_miss_diagnostics = Some(true);
+
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_miss_diagnostics(false)
+                .with_flush_interval_secs(600),
         );
-        let service = AdminService::new(manager.clone(), Vec::new());
+        meter.record_entry(1, 10, 300);
+        assert_eq!(meter.lookup_and_renew(1), Some(10));
+        assert_eq!(meter.lookup_and_renew(2), None);
 
-        let result = service.check_upstream_health(41).await.unwrap();
-        server.await.unwrap();
+        let service = service_with(config).with_cache_meter(meter);
+        let json = serde_json::to_value(service.get_cache_metering_config()).unwrap();
 
-        assert!(!result.success);
-        assert_eq!(result.status, Some(401));
-        assert!(result.error.as_deref().unwrap().contains("invalid token"));
-        assert!(!result.checked_at.is_empty());
-        let snapshot = manager.snapshot();
-        assert_eq!(snapshot.entries[0].total_failure_count, 0);
-        assert!(!snapshot.entries[0].disabled);
+        assert_eq!(json["capacity"], 4_096, "以句柄为准");
+        assert_eq!(json["flushIntervalSecs"], 600);
+        assert_eq!(json["missDiagnostics"], false);
+        assert_eq!(json["persistEnabled"], false);
+        assert_eq!(json["stats"]["entriesLen"], 1);
+        assert_eq!(json["stats"]["hits"], 1);
+        assert_eq!(json["stats"]["missNoEntry"], 1);
+    }
+
+    /// PUT 只改 `enabled`，其余只读字段必须原样保留（回归：别被顺手覆写成默认值）。
+    #[tokio::test]
+    async fn put_only_toggles_enabled() {
+        let meter = Arc::new(
+            CacheMeter::new(None)
+                .with_capacity(4_096)
+                .with_flush_interval_secs(600)
+                .with_miss_diagnostics(false),
+        );
+        let service = service_with(Config::default()).with_cache_meter(meter);
+
+        let before = serde_json::to_value(service.get_cache_metering_config()).unwrap();
+        let resp = service
+            .set_cache_metering_config(SetCacheMeteringConfigRequest {
+                enabled: Some(false),
+            })
+            .expect("PUT 应成功");
+        let after = serde_json::to_value(&resp).unwrap();
+
+        assert_eq!(after["enabled"], false, "enabled 必须被改掉");
+        for key in [
+            "capacity",
+            "flushIntervalSecs",
+            "missDiagnostics",
+            "persistEnabled",
+        ] {
+            assert_eq!(after[key], before[key], "{key} 是只读字段，PUT 不得改动");
+        }
     }
 }

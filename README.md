@@ -2,6 +2,8 @@
 
 **该项目基于 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 进行的二次开发**
 
+Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
+
 `kiro-rs` 是一个用 Rust 编写的 Anthropic Messages API 与 OpenAI Chat Completions / Responses API 兼容代理。它把 `/v1/messages`、`/v1/chat/completions`、`/v1/responses` 等请求转换为 Kiro / Amazon Q 后端请求，并提供一个可选的 Web Admin 面板来管理凭据、客户端 Key、用量、代理池、请求日志和在线更新。
 
 项目当前的核心目标是：让 Claude Code、Codex CLI、Anthropic / OpenAI SDK 或其它兼容客户端，通过统一的本地 / 自托管服务访问 Kiro 账号能力，同时在服务端集中处理多凭据、token 刷新、故障转移、用量统计和可观测性。
@@ -42,15 +44,16 @@
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
-- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key、**上游直通 API（Anthropic / 兼容 API）**。
+- **多凭据管理**：OAuth、Builder ID、Social、Enterprise / IdC、企业 SSO（Microsoft Entra ID / Azure AD）、Kiro API Key。
 - 自动 token 刷新：支持刷新后回写 `credentials.json`。
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
-- **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
-- **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用会按上游租户先尝试已有 ARN，再自动回退到无 ARN。
+- **故障转移**：凭据失败、额度用尽、账号级 429 限流冷却、token 失效强制刷新。
+- **profileArn 策略**：流式端点与 MCP（WebSearch）按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用跳过占位 ARN。
+- **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
-- **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop；上游直通凭据自动透传至 Anthropic 原生 WebSearch。
+- **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
 - **图像处理**：入站图片按环境变量自动缩放 / 重编码，降低 AWS Q 单字段大小限制导致的 400 风险。
 - **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
@@ -282,7 +285,7 @@ export KIRO_RS_API_KEY='sk-kiro-rs-...'
 codex
 ```
 
-两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。当前实现会先取得完整的内部非流式响应，再为 `stream: true` 合成 SSE，因此不是逐 token 的上游实时流。Responses 端点不会把 Codex 的 `exec`、`shell`、`apply_patch` 等本地执行工具声明转发给 Kiro；时效性查询由服务端的 Kiro MCP WebSearch 处理。
+两个 OpenAI 端点都会复用现有的模型映射、凭据故障转移和用量计量链路。`/v1/responses` 在 `stream: true` 时会复用 Anthropic 流式链路，将上游 SSE 事件增量转换为 Responses SSE，而不是等待完整响应后再合成；WebSearch 多轮调用期间也会持续发送搜索进度和保活事件。Responses 端点会将 Codex 声明的 function、custom 和 namespace 工具（包括 `additional_tools`）转换后转发给 Kiro，并将工具调用还原为对应的 Responses 事件；hosted `web_search` 则由服务端的 Kiro MCP WebSearch 处理。
 
 <a id="api-routes"></a>
 ## API 路由
@@ -314,20 +317,15 @@ codex
 | `/api/admin/credentials` | 凭据列表、新增、编辑、删除 |
 | `/api/admin/credentials/{id}/balance` | 查询单个凭据订阅 / 用量 |
 | `/api/admin/credentials/{id}/models` | 查询该凭据上游实际可用模型 |
-| `/api/admin/credentials/{id}/health` | 直接探测单个上游 Anthropic 凭据的 `/v1/models`、HTTP 状态与延迟 |
-| `/api/admin/credentials/upstream-health` | 并发探测全部或指定上游 Anthropic 凭据 |
 | `/api/admin/models` | 使用账号池当前选中的可用凭据实时查询模型 |
 | `/api/admin/models/test` | 对指定模型发送真实的最小化请求并返回响应、耗时和 credit |
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
 | `/api/admin/proxy-pool` | 代理池 |
-| `/api/admin/config/*` | 运行时配置 |
+| `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
-
-上游健康检查直接使用每条 Anthropic 凭据的 Base URL、凭据级代理和 API Key 请求
-`GET /v1/models`，默认单次超时 20 秒；结果只反映本次探测，不会修改凭据池失败计数、禁用状态或故障转移选择。
 
 Admin API 鉴权同样支持：
 
@@ -365,19 +363,24 @@ Admin API 鉴权同样支持：
 | `authRegion` | 无 | token 刷新用 Region，未配置时回退 `region` |
 | `apiRegion` | 无 | Kiro API 请求用 Region，未配置时回退 `region` |
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
+| `apiDomain` | `amazonaws` | 对话 / MCP 上游域名：`amazonaws` → `q.{region}.amazonaws.com`，`kiro` → `runtime.{region}.kiro.dev`。见[上游域名](#api-domain) |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
 | `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
-| `accountThrottleFailover` | `true` | 账号级 429 suspicious activity 时是否冷却并切换凭据 |
-| `accountThrottleCooldownSecs` | `1800` | 账号级风控冷却秒数 |
+| `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
+| `accountThrottleCooldownSecs` | `1800` | 账号级 429 限流冷却秒数 |
+| `modelApi429RetryEnabled` | `true` | 无需换号的容量类模型 API 429 是否由中转自动重试 |
 | `suspendedDetectionEnabled` | `true` | 是否识别 403 账号封禁文案（`suspended` + `locked your account`）并立即禁用该凭据、不参与自愈 |
-| `upstreamFailover` | 见下 | 上游直通凭据的故障转移检测（欠费/封禁文案、429 冷却切号），详见 [上游凭据故障转移](#upstream-failover) |
 | `selfHealEnabled` | `true` | 全部凭据被自动禁用时是否重置失败计数并重新启用（自愈） |
 | `selfHealMinIntervalSecs` | `300` | 两次自愈的最小冷却间隔（秒），打断持续 403 死循环的关键 |
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
+| `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
+| `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
+| `cacheMeteringMissDiagnostics` | `true` | 是否开启 miss 归因墓碑表（约 3MB 封顶），关闭后 `missEvicted` 退化为 `missNoEntry` |
 | `traceEnabled` | `true` | 是否写入 `traces.db` |
 | `traceRetentionDays` | `7` | trace 保留天数 |
 | `usageLogRetentionDays` | `31` | `usage_log.*.jsonl` 保留天数 |
@@ -442,6 +445,8 @@ Admin API 鉴权同样支持：
 
 Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles` 解析真实 `profileArn`，成功后写回凭据。纯 Builder ID/free 账号没有 Enterprise profile 时，会回退到官方 IDE 使用的 Builder ID 占位 ARN，以避免流式端点缺少 `profileArn` 返回 400。
 
+上游对这类账号的 `ListAvailableProfiles` 固定返回 403 `AWS Builder ID is not supported for this operation`，该结果按「无 Enterprise profile」处理：不再请求另一区域，并在进程内标记已解析，后续请求不再重复查询（避免每个请求首字前多出两次串行握手）。
+
 #### Social 登录
 
 ```json
@@ -493,43 +498,6 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 KIRO_API_KEY=ksk_xxx ./kiro-rs
 ```
 
-#### 上游直通 API
-
-```json
-{
-  "upstreamBaseUrl": "https://api.anthropic.com",
-  "upstreamApiKey": "sk-ant-xxx"
-}
-```
-
-**用途**：绕过 Kiro 协议，直接透传请求到 Anthropic 官方 API 或其它兼容端点（如第三方中转 API）。适用于：
-
-- 混合部署：同时使用 Kiro 账号和官方 Anthropic API Key
-- 中转接入：通过 kiro-rs 统一管理多个第三方 API 提供商
-- 功能测试：对比 Kiro 协议与原生 Anthropic 协议的行为差异
-
-**工作机制**：
-
-- 请求路径：客户端 → kiro-rs `/v1/messages` → `upstreamBaseUrl/v1/messages`（原样透传 Anthropic Messages API 格式）
-- 凭据路由：与 Kiro 凭据共享同一个凭据池和故障转移机制，按优先级、可用性和模型支持自动选择
-- WebSearch：检测到 `tools: [{"type": "web_search_20250610"}]` 时，直接透传给上游（由 Anthropic 原生处理），不走 kiro-rs 的 MCP 搜索路径
-- 管理功能：支持查询可用模型、真实测试、余额查询（需上游 API 兼容对应端点）
-
-**字段说明**：
-
-- `upstreamBaseUrl`：上游 API 基础 URL（必填，仅到域名，如 `https://api.anthropic.com`，不要带 `/v1/messages` 路径）
-- `upstreamApiKey`：上游 API Key（必填，格式 `sk-ant-*` 或第三方格式）
-- 其它字段（`priority`、`proxyUrl`、`disabled` 等）与 Kiro 凭据通用
-
-**凭据判定**：同时存在 `upstreamBaseUrl` 和 `upstreamApiKey` 且均非空时识别为上游直通凭据。
-
-**注意事项**：
-
-- 上游凭据**不支持** Kiro 独有功能（如 `profileArn`、MCP 工具调用等）
-- 模型列表和可用性完全取决于上游 API，kiro-rs 不做额外过滤或映射
-- 请求体必须符合 Anthropic Messages API 格式（`model`、`messages`、`max_tokens` 等）
-- 上游 API 的限流、计费、错误码由上游控制，kiro-rs 只负责转发和重试
-
 ### 凭据字段
 
 | 字段 | 说明 |
@@ -570,8 +538,9 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 
 上下文窗口估算：
 
-- `gpt-5.*`：`272_000`（GPT-5.6 静态模型声明最大输出为 `64_000`）
-- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-fable-5`：`1_000_000`
+- `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`：`1_000_000`（静态模型声明最大输出为 `64_000`）
+- 其它 `gpt-5.*`：`272_000`
+- `claude-sonnet-4.6`、`claude-sonnet-4.8`、`claude-sonnet-5`、`claude-sonnet-5.5`、`claude-opus-4.6`、`claude-opus-4.7`、`claude-opus-4.8`、`claude-opus-5`、`claude-opus-5.5`、`claude-haiku-5.5`、`claude-fable-5`：`1_000_000`
 - 其它模型：`200_000`
 
 ### 自定义模型
@@ -692,9 +661,9 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 }
 ```
 
-**Kiro 凭据**：纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
+纯 web_search 请求会直接走上游 MCP 搜索接口。混合工具场景下，如果上游返回只包含 `web_search` 的工具调用，`kiro-rs` 会内部调用同一套 MCP 搜索接口，把结果作为 tool_result 喂回上游，直到上游停止搜索或达到轮数限制；其它工具调用会原样返回给客户端。
 
-**上游直通凭据**：检测到请求带 `web_search` tool 且命中上游凭据时，kiro-rs 会将原始请求（包含 `tools` 字段）直接透传给上游 Anthropic API，由 Anthropic 原生处理 WebSearch（自 2025-06-10 起支持 `web_search_20250610` tool）。响应原样返回，不经过 kiro-rs 的 MCP 路径。这样上游凭据可以使用 Anthropic 的最新 WebSearch 能力，无需 kiro-rs 适配。
+MCP 搜索请求通过 `x-amzn-kiro-profile-arn` 头携带 profileArn，取值规则与对话请求相同（真实 ARN，或 Builder ID / Social 占位 ARN；API Key 凭据不发送）。上游 `/mcp` 缺少该头会返回 400 `profileArn is required for this request.`，表现为客户端收到 502 `Upstream API request failed.`。
 
 <a id="images"></a>
 ## 图片处理
@@ -741,7 +710,7 @@ data/
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
 - `proxy_pool.json`：代理池与健康状态。
-- `cache_metering.json`：prompt cache 计量缓存，定期落盘。
+- `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
 
@@ -752,6 +721,78 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+### Prompt cache 计量容量选型
+
+`CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
+
+```text
+T_eff = min(C / W, TTL)
+```
+
+`C < W × TTL` 时 TTL 完全失效，命中率由容量而不是 TTL 决定，表现为 `cache_read`
+随负载**无声衰减**。上游每请求最多写 4 条断点、默认 TTL 300 秒，所以容量应满足：
+
+```text
+C >= peak_req_per_sec × entries_per_req × TTL_secs
+```
+
+默认 `262144` 支撑约 `262144 / (4 × 300) ≈ 218 req/s`，内存约 16–24MB
+（单条按 64 字节估算）。上界 `8388608` 约 512MB —— 那是「再大就该上 Redis
+共享层而不是堆内存」的界线，不是推荐值。改过切段策略、`entries_per_req`
+远大于 4 的部署，按公式自行调高。
+
+容量、落盘开关、落盘间隔、miss 诊断开关**启动时固定，运行时不可改**：
+改容量会立即触发一次大规模淘汰，不适合做热调旋钮。改这些 = 改 `config.json`
+（或环境变量）+ 重启。Admin API `GET /api/admin/cache-metering` 只读暴露当前生效值。
+
+环境变量（优先级：`config.json` 显式值 > 环境变量 > 内置默认）：
+
+| 环境变量 | 对应字段 | 默认 |
+|---|---|---:|
+| `KIRO_RS_CACHE_CAPACITY` | `cacheMeteringCapacity` | `262144` |
+| `KIRO_RS_CACHE_PERSIST` | `cacheMeteringPersistEnabled` | `false` |
+| `KIRO_RS_CACHE_FLUSH_INTERVAL_SECS` | `cacheMeteringFlushIntervalSecs` | `300` |
+| `KIRO_RS_CACHE_MISS_DIAGNOSTICS` | `cacheMeteringMissDiagnostics` | `true` |
+
+数值解析失败、为 `0` 或为空串都视为「未表态」并打一条 warn，回落到下一优先级，不会中止启动。
+
+#### 怎么判断该不该调容量
+
+后台任务每 60 秒输出一行（本周期无任何增量时不输出）：
+
+```text
+cache_meter stats entries_len=13421 capacity=262144 hits=90120 misses=10233 evicted=0 expired=240311
+  miss_no_entry=8120 miss_expired=1900 miss_evicted=13 miss_no_breakpoint=180 miss_no_seed=20 tombstone_clears=0
+```
+
+- `miss_evicted` 持续非零 + `entries_len` 贴着 `capacity` → **容量不够**，按上面的公式调高。
+- `miss_expired` 占多数、`evicted=0` → 是真实 TTL 过期，调容量没用。
+- `miss_no_breakpoint` / `miss_no_seed` 占多数 → 客户端没声明 `cache_control`，
+  或请求缺少 `metadata.user_id` 且用的是 `id=0` 系统 Key，与容量无关。
+
+单条 miss 的归因还会在 `RUST_LOG=debug` 下输出：有断点的请求按断点逐条打
+`cache_meter miss block_idx=.. reason=Absent|Expired|Evicted`（一个断点最多一条，
+单请求最多 4 条）；整条请求级的两种原因打 `cache_meter miss reason=no_breakpoint`
+与 `cache_meter miss reason=no_seed`。五种原因都可在 debug 日志里看到。
+
+> 计数口径：**一个断点只记一次账**。lookback 会向后探最多 20 个 hash，
+> 「深层没有、浅层命中」是正常的部分前缀命中，只记 1 次 `hits`，不会同时产生
+> 一堆 `misses` —— 否则命中率报表会被探测次数稀释。
+
+#### 升级提示：快照默认不再落盘
+
+`cacheMeteringPersistEnabled` 默认为 `false`，即**默认不再读写 `cache_metering.json`**。
+依据：计量 TTL 只有 300 秒，快照只在重启后 5 分钟内有价值，而容量调大后单次全量
+JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退出都不写该文件，
+也**不会删除**已有文件（留给回滚）。需要原行为显式写：
+
+```json
+{ "cacheMeteringPersistEnabled": true }
+```
+
+快照格式仍是 JSON（未换二进制）：默认关闭后这条路径不再是热点，换格式要带
+迁移与兼容分支，收益不抵复杂度。旧版本写的快照文件可直接被新版本加载。
+
 <a id="admin-ui"></a>
 ## 🖥️ Admin UI
 
@@ -759,7 +800,6 @@ data/
 
 - 概览：整体请求量、token、模型分布、凭据贡献。
 - 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定。
-- 上游健康：逐个或批量探测 Anthropic API 凭据，显示可用性、HTTP 状态、响应头延迟和错误摘要。
 - 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
 
@@ -768,7 +808,7 @@ Admin 还提供：
 - Social 登录和 IdC / Enterprise 登录流程。
 - 全局代理设置和代理池健康检查。
 - 负载均衡模式配置。
-- 账号级风控故障转移配置。
+- 账号级 429 限流故障转移配置。
 - 按请求作用域和凭据隔离的自愈治理（403 封禁识别 / 冷却 / 连续上限，状态跨重启保留）。
 - trace / usage log 保留策略。
 - 在线更新、自动更新和回退。
@@ -787,10 +827,24 @@ credential.authRegion -> credential.region -> config.authRegion -> config.region
 API 请求：
 
 ```text
-credential.apiRegion -> config.apiRegion -> config.region
+credential.apiRegion -> credential.region -> config.apiRegion -> config.region
 ```
 
+仅配置凭据 `region` 时，Token 刷新和 API 请求都默认使用该区域。需要分开设置时，使用凭据级 `authRegion` 和 `apiRegion`；`authRegion` 本身不作为 API 请求区域的回退值。
+
 部分 REST / 管理类上游接口只在 `us-east-1` 和 `eu-central-1` 提供服务，代码会按账号区域选择候选端点并在必要时回退。
+
+<a id="api-domain"></a>
+### 上游域名
+
+`apiDomain` 决定对话（`generateAssistantResponse`）和 MCP（WebSearch）请求的 host：
+
+| 值 | host | 说明 |
+|---|---|---|
+| `amazonaws`（默认） | `q.{apiRegion}.amazonaws.com` | 原有行为 |
+| `kiro` | `runtime.{apiRegion}.kiro.dev` | 新版 Kiro IDE / Kiro CLI 使用的域名；官方客户端只内置 `us-east-1`、`eu-central-1` 等少数区域 |
+
+Token 刷新、用量查询、`ListAvailableProfiles` 等 REST 接口不受影响。可在 Admin 面板「调度设置 → 上游域名」切换，或调用 `PUT /api/admin/config/api-domain`（Body：`{"domain":"kiro"}`），立即生效并写回 `config.json`，无需重启。
 
 ### 代理优先级
 
@@ -827,46 +881,10 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 单凭据连续 API 失败会增加失败计数，达到阈值后跳过。
 - 402 / quota exhausted 会禁用该凭据并切换。
 - 401 / 403 中识别到 bearer token 失效时，会对该凭据强制刷新一次 token 后重试。
-- 429 + suspicious activity 可触发账号级冷却并切换凭据。
+- USER/CREDIT 请求限流和 suspicious activity 429 可触发账号级冷却并切换凭据。
+- `INSUFFICIENT_MODEL_CAPACITY` 等容量类 429 不切换凭据，可配置是否在当前凭据上退避重试。
 - 400 客户端请求错误不会切换凭据。
 - 网关超时和部分不可恢复错误会快速失败，避免一次请求内无限放大重试。
-
-<a id="upstream-failover"></a>
-### 上游凭据故障转移
-
-上游直通凭据（各家中转站）同样参与自动切号。由于中转站的欠费 / 封禁返回文案互不相同，检测规则做成**可配置的子串列表**（大小写不敏感、按字面匹配、不是正则），配置在 `config.json` 的 `upstreamFailover` 段：
-
-```json
-{
-  "upstreamFailover": {
-    "enabled": true,
-    "quotaPatterns": ["credit balance is too low", "insufficient_quota", "余额不足", "额度已用尽"],
-    "suspendedPatterns": ["account has been disabled", "账号已被封禁"],
-    "throttleFailover": true,
-    "throttleCooldownSecs": 60
-  }
-}
-```
-
-- `quotaPatterns`：400/401/402/403 响应体命中欠费文案时，立即禁用该凭据（`QuotaExceeded`）并切号。默认列表覆盖 Anthropic 官方、OpenAI 风格网关（one-api / new-api 系）与常见中文文案。
-- `suspendedPatterns`：401/403 响应体命中封禁文案时，立即禁用（`Suspended`，不参与自愈，需在面板手动重置）并切号，无需等 401/403 攒满 3 次失败计数。
-- `throttleFailover`：上游 429 时把当前凭据冷却（优先取 `Retry-After` 头，否则用 `throttleCooldownSecs`）并立即切到下一个可用凭据，而不是在被限流的 key 上原地重试。
-- 未命中任何文案的普通 401/403 仍按失败计数处理（3 次禁用）；普通 400 仍直接返回，不切号。
-- `enabled` 设为 `false` 时整段关闭，完全回退旧行为。字段缺省时使用内置默认规则，老配置文件无需迁移。
-
-也可以在 Admin UI 中编辑：顶栏设置齿轮菜单 →「调度与限流」→「上游凭据故障转移」，文案列表按行编辑，保存即热生效。
-
-支持通过 Admin API 热更新（立即生效并持久化到 `config.json`，无需重启）：
-
-```bash
-# 查看当前配置
-curl -H "Authorization: Bearer $ADMIN_KEY" http://localhost:8990/api/admin/config/upstream-failover
-
-# 更新检测规则（未提供的字段保持不变；列表传 [] 表示清空该类检测）
-curl -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/json" \
-  http://localhost:8990/api/admin/config/upstream-failover \
-  -d '{"quotaPatterns": ["余额不足", "insufficient_quota"], "throttleCooldownSecs": 120}'
-```
 
 <a id="updates-release"></a>
 ## 在线更新和发布
@@ -879,7 +897,7 @@ curl -X PUT -H "Authorization: Bearer $ADMIN_KEY" -H "Content-Type: application/
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.7.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.7.3)。
+当前稳定版：[v0.9.3](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.3)。
 
 Docker 镜像：
 
@@ -947,6 +965,8 @@ git diff --check
 ## 💬 社区支持
 
 欢迎到 [linux.do](https://linux.do/) 交流、分享和反馈。
+
+也欢迎加入 [Telegram 讨论群组：kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)。
 
 <a id="acknowledgements"></a>
 ## 🙏 致谢

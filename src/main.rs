@@ -92,14 +92,20 @@ async fn main() {
 
     let configured_api_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
 
-    // 构建代理配置
-    let proxy_config = config.proxy_url.as_ref().map(|url| {
-        let mut proxy = http_client::ProxyConfig::new(url);
-        if let (Some(username), Some(password)) = (&config.proxy_username, &config.proxy_password) {
-            proxy = proxy.with_auth(username, password);
-        }
-        proxy
-    });
+    // 构建代理配置（空字符串视为未配置）
+    let proxy_config = config
+        .proxy_url
+        .as_ref()
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| {
+            let mut proxy = http_client::ProxyConfig::new(url);
+            if let (Some(username), Some(password)) =
+                (&config.proxy_username, &config.proxy_password)
+            {
+                proxy = proxy.with_auth(username, password);
+            }
+            proxy
+        });
 
     if proxy_config.is_some() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
@@ -158,9 +164,8 @@ async fn main() {
     });
     let token_manager = Arc::new(token_manager);
     token_manager.start_model_cache_warmer();
-    let kiro_provider = Arc::new(KiroProvider::with_proxy(
+    let kiro_provider = Arc::new(KiroProvider::new(
         token_manager.clone(),
-        proxy_config.clone(),
         endpoints,
         config.default_endpoint.clone(),
     ));
@@ -255,37 +260,89 @@ async fn main() {
         );
     }
 
-    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
-    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
+    // CacheMeter：本地计量模拟，支持可选 Redis 共享元数据层；不承载真实 KV Cache。
+    // 容量 / 落盘 / 落盘间隔 / miss 诊断四项均为「config.json > 环境变量 > 内置默认」，
+    // 在这里解析一次后通过 builder 注入，运行时不可改（改 = 改配置 + 重启）。
+    use anthropic::cache_metering::CacheMeter;
+    let cache_metering_enabled = config
+        .cache_metering_enabled
+        .or_else(CacheMeter::metering_enabled_from_env)
+        .unwrap_or(true);
+    let cache_metering_capacity = CacheMeter::resolve_capacity(
+        config.cache_metering_capacity,
+        CacheMeter::capacity_from_env(),
+    );
+    let cache_metering_persist = config
+        .cache_metering_persist_enabled
+        .or_else(CacheMeter::persist_enabled_from_env)
+        .unwrap_or(false);
+    let cache_metering_flush_interval = CacheMeter::resolve_flush_interval_secs(
+        config.cache_metering_flush_interval_secs,
+        CacheMeter::flush_interval_from_env(),
+    );
+    let cache_metering_miss_diagnostics = config
+        .cache_metering_miss_diagnostics
+        .or_else(CacheMeter::miss_diagnostics_from_env)
+        .unwrap_or(true);
+
+    let cache_metering_snapshot = cache_dir.join("cache_metering.json");
+    let cache_metering_persist_path = if cache_metering_persist {
+        Some(cache_metering_snapshot.clone())
+    } else {
+        // 关闭时不读、不写，也不删除已有文件（留给回滚）
+        if let Ok(meta) = std::fs::metadata(&cache_metering_snapshot) {
+            tracing::info!(
+                "prompt cache 快照持久化已关闭，忽略 {}（{} 字节）",
+                cache_metering_snapshot.display(),
+                meta.len()
+            );
+        }
+        None
+    };
+
     let cache_meter = std::sync::Arc::new(
-        anthropic::cache_metering::CacheMeter::new_with_config(
-            Some(cache_dir.join("cache_metering.json")),
-            config.cache_engine_rust,
-        ),
+        CacheMeter::from_env(cache_metering_persist_path)
+            .await
+            .with_enabled(cache_metering_enabled)
+            .with_capacity(cache_metering_capacity)
+            .with_flush_interval_secs(cache_metering_flush_interval)
+            .with_miss_diagnostics(cache_metering_miss_diagnostics),
     );
     cache_meter.clone().spawn_background();
+    if !cache_metering_enabled {
+        tracing::info!("本地 prompt cache 计量模拟已关闭，usage 将全量计入 input_tokens");
+    } else {
+        tracing::info!(
+            "本地 prompt cache 计量模拟已开启：capacity={}（约 {} req/s @ 4 断点 / 300s TTL），\
+             persist={}，flush_interval={}s，miss_diagnostics={}",
+            cache_metering_capacity,
+            cache_metering_capacity / (4 * 300),
+            cache_metering_persist,
+            cache_metering_flush_interval,
+            cache_metering_miss_diagnostics
+        );
+    }
 
-    // 引擎 B（go 缓存模拟引擎）。独立状态文件：与引擎 A 的哈希空间（u64 vs
-    // [u8;32]）和磁盘格式都不兼容，绝不可共用。`load()` 必须显式调用 ——
-    // 与引擎 A 的 `new` 自动载入不同。
-    let go_cache_tracker = std::sync::Arc::new(
-        anthropic::cache_metering_go::GoCacheTracker::new(
-            Some(cache_dir.join("cache_metering_go.json")),
-            config.cache_engine_go,
-        ),
-    );
-    go_cache_tracker.load();
-    go_cache_tracker.clone().spawn_background();
-
-    // 引擎 C / D 的倍率存储。无缓存状态、无持久化文件 —— 倍率本身存在 config.json，
-    // 这里只是它的运行期原子副本。
-    //
-    // **必须建一份、两边共享**：Admin 热更新是对这个 Arc 内的原子量做 store。若
-    // 请求路径与 Admin 路径各持一份，改配置会静默不生效（无报错、看着成功）。
-    let stateless_multipliers =
-        std::sync::Arc::new(anthropic::cache_engine::StatelessMultipliers::default());
-    stateless_multipliers.apply_real_config(config.cache_engine_real);
-    stateless_multipliers.apply_nocache_config(config.cache_engine_nocache);
+    // 会话粘性路由：绑定表过期条目定期清理（lookup 只顺手清自己命中的那条）
+    {
+        let affinity = token_manager.session_affinity();
+        if affinity.is_enabled() {
+            tracing::info!(
+                "会话粘性路由已开启，TTL {}s：同一会话优先沿用上一轮凭据以保住上游 prompt cache",
+                affinity.ttl_secs()
+            );
+        } else {
+            tracing::info!("会话粘性路由已关闭");
+        }
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(300);
+            loop {
+                tokio::time::sleep(interval).await;
+                tm.session_affinity().evict_expired();
+            }
+        });
+    }
 
     let anthropic_app = anthropic::create_router_with_shared_provider(
         Some(kiro_provider.clone()),
@@ -295,8 +352,6 @@ async fn main() {
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
-        Some(go_cache_tracker.clone()),
-        Some(stateless_multipliers.clone()),
         trace_store.clone(),
     );
 
@@ -319,7 +374,8 @@ async fn main() {
                     .with_log_governance(
                         Some(admin_trace_store.clone()),
                         Some(usage_recorder.clone()),
-                    );
+                    )
+                    .with_cache_meter(cache_meter.clone());
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,
@@ -327,11 +383,6 @@ async fn main() {
                 usage_aggregator.clone(),
                 admin_trace_store,
                 group_manager.clone(),
-            )
-            .with_cache_engines(
-                Some(cache_meter.clone()),
-                Some(go_cache_tracker.clone()),
-                Some(stateless_multipliers.clone()),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
@@ -348,10 +399,6 @@ async fn main() {
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。
             admin_state.service.start_auto_update_scheduler();
 
-            // 启动 API Key 订阅源轮询调度器：keyFeed.enabled 关闭时空转，
-            // 从 UI 打开开关即热生效，无需重启。
-            admin_state.service.start_key_feed_scheduler();
-
             let admin_app = admin::create_admin_router(admin_state);
 
             // 创建 Admin UI 路由
@@ -362,6 +409,10 @@ async fn main() {
             anthropic_app
                 .nest("/api/admin", admin_app)
                 .nest("/admin", admin_ui_app)
+                .route(
+                    "/admin/",
+                    axum::routing::get(|| async { axum::response::Redirect::temporary("/admin") }),
+                )
         }
     } else {
         anthropic_app
@@ -384,7 +435,13 @@ async fn main() {
     tracing::info!("  GET  /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // with_connect_info：把 TCP 对端地址注入请求扩展，直连部署下作为客户端 IP 的兜底
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .unwrap();
 }
 
 /// 文件不存在时初始化配置/凭证文件

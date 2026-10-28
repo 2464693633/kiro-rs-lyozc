@@ -11,78 +11,30 @@ use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials, check_all_proxies,
-        check_proxy, check_rate_limit, check_update, check_upstream_health,
-        check_upstream_health_batch, clear_throttle, complete_social_login,
+        check_proxy, check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
-        export_credentials,
-        force_refresh_token,
-        get_account_rpm_limit_config,
-        get_account_throttle_config,
-        get_billing_config,
-        get_all_credentials,
-        get_cache_engines_config,
-        get_cache_engines_stats,
-        get_credential_balance,
-        get_credential_models,
-        get_current_models,
-        get_global_proxy,
-        get_key_feed_config,
-        get_load_balancing_mode,
-        get_log_governance_config,
-        get_proxy_pool,
-        get_self_heal_config,
-        get_token_inflation_config,
-        get_update_config,
-        get_upstream_failover_config,
-        list_client_keys,
-        list_groups,
-        list_traces,
-        poll_idc_login,
-        poll_idc_relogin,
-        poll_social_login,
-        poll_social_relogin,
-        pull_key_feed,
-        pull_update_image,
-        reset_all_success_count,
-        reset_client_key_stats,
-        reset_failure_count,
-        reset_success_count,
-        reveal_client_key,
-        rollback_image_update,
-        rotate_client_key,
-        set_account_rpm_limit_config,
-        set_account_throttle_config,
-        set_billing_config,
-        set_cache_engines_config,
-        set_client_key_disabled,
-        set_credential_disabled,
-        set_credential_overage,
-        set_credential_priority,
-        set_global_proxy,
-        set_key_feed_config,
-        set_load_balancing_mode,
-        set_log_governance_config,
-        set_proxy_enabled,
-        set_self_heal_config,
-        set_token_inflation_config,
-        set_update_config,
-        set_upstream_failover_config,
-        start_idc_login,
-        start_idc_relogin,
-        start_social_login,
-        start_social_relogin,
-        stats_by_credential,
-        stats_billing,
-        stats_by_model,
-        stats_overview,
-        stats_timeseries,
+        export_credentials, force_refresh_token, get_account_rpm_limit_config,
+        get_account_throttle_config, get_all_credentials,
+        get_credential_balance, get_credential_metadata_schema, get_credential_models,
+        get_current_models, get_global_proxy, get_custom_models,
+        get_api_domain, get_cache_metering_config, get_session_affinity_config,
+        get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
+        get_proxy_pool, get_quota_reset_recovery_config, get_self_heal_config, get_update_config, list_client_keys, list_groups,
+        list_traces, poll_idc_login,
+        poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
+        reset_all_success_count, reset_client_key_stats, reset_failure_count, reset_success_count,
+        rollback_image_update, rotate_client_key, set_account_rpm_limit_config,
+        set_account_throttle_config, set_client_key_disabled, set_client_key_max_credits,
+        set_credential_disabled, set_credential_metadata_schema, set_credential_overage,
+        set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
+        set_api_domain, set_cache_metering_config, set_session_affinity_config,
+        set_log_governance_config, set_model_api_retry_config, set_proxy_enabled, set_quota_reset_recovery_config,
+        set_self_heal_config, set_update_config, start_idc_login, start_idc_relogin,
+        start_social_login, start_social_relogin,
+        stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
         test_model,
-        trace_failure_stats,
-        update_admin_key,
-        update_client_key,
-        update_credential,
-        update_group,
+        trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
@@ -143,8 +95,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/refresh-token", put(update_refresh_token))
         .route("/credentials/{id}/balance", get(get_credential_balance))
         .route("/credentials/{id}/models", get(get_credential_models))
-        .route("/credentials/{id}/health", post(check_upstream_health))
-        .route("/credentials/upstream-health", post(check_upstream_health_batch))
         .route("/models", get(get_current_models))
         .route("/models/test", post(test_model))
         .route("/credentials/{id}/proxy", post(assign_proxy_to_credential))
@@ -163,29 +113,24 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_load_balancing_mode).put(set_load_balancing_mode),
         )
         .route(
+            "/config/api-domain",
+            get(get_api_domain).put(set_api_domain),
+        )
+        .route(
             "/config/account-throttle",
             get(get_account_throttle_config).put(set_account_throttle_config),
         )
         .route(
-            "/config/upstream-failover",
-            get(get_upstream_failover_config).put(set_upstream_failover_config),
+            "/config/model-api-retry",
+            get(get_model_api_retry_config).put(set_model_api_retry_config),
         )
-        .route(
-            "/config/token-inflation",
-            get(get_token_inflation_config).put(set_token_inflation_config),
-        )
-        .route(
-            "/config/billing",
-            get(get_billing_config).put(set_billing_config),
-        )
-        .route(
-            "/config/cache-engines",
-            get(get_cache_engines_config).put(set_cache_engines_config),
-        )
-        .route("/cache-engines/stats", get(get_cache_engines_stats))
         .route(
             "/config/account-rpm-limit",
             get(get_account_rpm_limit_config).put(set_account_rpm_limit_config),
+        )
+        .route(
+            "/config/quota-reset-recovery",
+            get(get_quota_reset_recovery_config).put(set_quota_reset_recovery_config),
         )
         .route(
             "/config/self-heal",
@@ -196,18 +141,29 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_log_governance_config).put(set_log_governance_config),
         )
         .route(
+            "/config/cache-metering",
+            get(get_cache_metering_config).put(set_cache_metering_config),
+        )
+        .route(
+            "/config/session-affinity",
+            get(get_session_affinity_config).put(set_session_affinity_config),
+        )
+        .route(
+            "/config/credential-metadata-schema",
+            get(get_credential_metadata_schema).put(set_credential_metadata_schema),
+        )
+        .route(
             "/config/global-proxy",
             get(get_global_proxy).put(set_global_proxy),
+        )
+        .route(
+            "/config/custom-models",
+            get(get_custom_models).put(set_custom_models),
         )
         .route(
             "/config/update",
             get(get_update_config).put(set_update_config),
         )
-        .route(
-            "/config/key-feed",
-            get(get_key_feed_config).put(set_key_feed_config),
-        )
-        .route("/key-feed/pull", post(pull_key_feed))
         .route("/config/admin-key", put(update_admin_key))
         .route("/system/update/pull", post(pull_update_image))
         .route("/system/update/apply", post(apply_image_update))
@@ -252,18 +208,21 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/client-keys/{id}/disabled", post(set_client_key_disabled))
         .route(
+            "/client-keys/{id}/max-credits",
+            post(set_client_key_max_credits),
+        )
+        .route(
             "/client-keys/{id}/reset-stats",
             post(reset_client_key_stats),
         )
         .route("/client-keys/{id}/rotate", post(rotate_client_key))
-        .route("/client-keys/{id}/reveal", get(reveal_client_key))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/{name}", delete(delete_group).patch(update_group))
         .route("/stats/overview", get(stats_overview))
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
-        .route("/stats/billing", get(stats_billing))
+        .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(

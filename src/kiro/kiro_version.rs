@@ -7,8 +7,8 @@
 //! - 跨平台 `currentRelease` 一致，固定使用 win32-x64 元数据即可；
 //! - 获取失败时调用方回退到 `config.kiro_version`，不阻塞启动。
 //!
-//! 用量类 REST 接口（getUsageLimits / ListAvailableModels / setUserPreference）同样使用
-//! 当前版本；启动初期尚未取到元数据时使用 [`USAGE_API_FALLBACK_VERSION`]。
+//! 注意：用量类 REST 接口（getUsageLimits / ListAvailableModels / setUserPreference）
+//! 不使用这里的「最新版本」，而是固定使用 [`USAGE_API_KIRO_VERSION`]，见该常量的说明。
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -26,11 +26,13 @@ use crate::model::config::TlsBackend;
 const METADATA_URL: &str =
     "https://prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json";
 
-/// 用量类接口在版本元数据尚未加载或加载失败时使用的兼容版本。
+/// 用量类接口（getUsageLimits / ListAvailableModels / setUserPreference）固定使用的
+/// Kiro IDE 版本，避免 IDE 版本漂移影响用量查询。
 ///
-/// AWS 已拒绝旧的 `0.9.2` 客户端标识；`0.12.200` 已实测可用于余额、模型目录
-/// 和 profile 查询。元数据可用后仍优先使用当前官方版本。
-pub const USAGE_API_FALLBACK_VERSION: &str = "0.12.200";
+/// 该版本号只影响 User-Agent，不决定是否需要 profileArn：这些接口对
+/// Enterprise / IdC 账号始终要求真实 profileArn（缺失时 0.9.2 报 403、新版报
+/// 400 `Invalid profileArn.`），带上后两个版本返回的数据一致。
+pub const USAGE_API_KIRO_VERSION: &str = "0.9.2";
 
 static LATEST_VERSION: OnceLock<RwLock<Option<String>>> = OnceLock::new();
 
@@ -46,11 +48,6 @@ pub fn cached() -> Option<String> {
 /// 返回有效的 Kiro IDE 版本：优先用自动获取到的最新版本，否则回退到 `fallback`
 pub fn effective(fallback: &str) -> String {
     cached().unwrap_or_else(|| fallback.to_string())
-}
-
-/// 返回用量类 REST 接口应使用的 Kiro IDE 版本。
-pub fn usage_api() -> String {
-    cached().unwrap_or_else(|| USAGE_API_FALLBACK_VERSION.to_string())
 }
 
 #[derive(Deserialize)]
