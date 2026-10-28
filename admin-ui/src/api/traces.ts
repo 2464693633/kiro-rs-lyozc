@@ -41,3 +41,48 @@ export async function getFailureStats(): Promise<FailureStatsMap> {
   const { data } = await api.get<FailureStatsMap>('/traces/failure-stats')
   return data
 }
+
+export interface ObservationConfig {
+  enabled: boolean
+  keyId: number | null
+}
+
+export interface ObservationSummary {
+  id: string
+  ts: string
+  keyId: number
+  path: string
+  model: string | null
+  labels: { name: string; heuristic: boolean }[]
+  state: 'running' | 'complete' | 'error' | 'interrupted'
+  statusCode: number | null
+  contentType: string | null
+  durationMs: number
+  requestBytes: number
+  requestTruncated: boolean
+  responseBytes: number
+  responseTruncated: boolean
+}
+
+export interface ObservationDetail extends ObservationSummary {
+  requestBody: string
+  responseBody: string
+}
+
+export async function getObservationConfig(): Promise<ObservationConfig> {
+  return (await api.get<ObservationConfig>('/config/request-observation')).data
+}
+
+export async function setObservationConfig(config: ObservationConfig): Promise<ObservationConfig> {
+  return (await api.put<ObservationConfig>('/config/request-observation', config)).data
+}
+
+export async function getObservations(keyId: number | undefined, offset: number) {
+  return (await api.get<{ records: ObservationSummary[]; total: number }>('/observations', {
+    params: { keyId, limit: 25, offset },
+  })).data
+}
+
+export async function getObservation(id: string): Promise<ObservationDetail> {
+  return (await api.get<ObservationDetail>(`/observations/${encodeURIComponent(id)}`)).data
+}

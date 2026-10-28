@@ -1,5 +1,7 @@
 # 检测请求观察器
 
+项目管理后台已内置「请求日志 → 内容观察」，可直接开启并查看请求/响应，使用说明见 `docs/request-observation.md`。下面的 mitmproxy 扩展是独立的外部抓包方案，不会自动把文件导入管理后台。
+
 用 mitmproxy 的反向代理模式，观察发往 kiro-rs 的测试流量。记录实际收到的提示词、工具/schema、图片/文档及 thinking/cache 参数，并按内容特征标注。
 
 ```text

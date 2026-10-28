@@ -70,6 +70,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
     // 需要登录API密钥认证的路由
     let authenticated = Router::new()
         .route(
+            "/config/request-observation",
+            get(super::observations::get_config).put(super::observations::set_config),
+        )
+        .route("/observations", get(super::observations::list))
+        .route("/observations/{id}", get(super::observations::detail))
+        .route(
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )

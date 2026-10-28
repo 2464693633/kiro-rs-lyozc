@@ -25,6 +25,7 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { RequestObservationPage } from '@/components/request-observation-page'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { useUrlState } from '@/hooks/use-url-state'
@@ -1042,7 +1043,25 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
   )
 }
 
+const LOG_VIEW_DEFAULTS = { view: 'chain' }
+
 export function TraceLogPage() {
+  const [view, patch] = useUrlState('traces', LOG_VIEW_DEFAULTS)
+  const content = view.view === 'content'
+  return (
+    <div className="space-y-4">
+      <nav className="flex gap-1 border-b border-border pb-2" aria-label="请求日志视图">
+        <Button size="sm" variant={content ? 'ghost' : 'secondary'}
+          aria-pressed={!content} onClick={() => patch({ view: 'chain' })}>请求链路</Button>
+        <Button size="sm" variant={content ? 'secondary' : 'ghost'}
+          aria-pressed={content} onClick={() => patch({ view: 'content' })}>内容观察</Button>
+      </nav>
+      {content ? <RequestObservationPage /> : <TraceChainLogPage />}
+    </div>
+  )
+}
+
+function TraceChainLogPage() {
   const [url, patchUrl, resetUrl] = useUrlState('traces', URL_DEFAULTS)
   const [searchDraft, setSearchDraft] = useState(url.q)
   const debouncedSearch = useDebounced(searchDraft)

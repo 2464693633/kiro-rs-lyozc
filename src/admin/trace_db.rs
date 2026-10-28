@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
@@ -264,7 +264,8 @@ pub struct TraceQuery {
 
 /// SQLite 持久化存储
 pub struct TraceStore {
-    conn: Mutex<Connection>,
+    pub(super) conn: Mutex<Connection>,
+    pub(super) observation_config: RwLock<super::observations::ObservationConfig>,
     /// 是否启用 trace 写入（运行时可改）。false 时 insert 直接短路。
     enabled: AtomicBool,
     /// 记录保留天数（运行时可改），cleanup 时读取。
@@ -292,8 +293,10 @@ impl TraceStore {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
+        let observation_config = super::observations::init_observations(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            observation_config: RwLock::new(observation_config),
             enabled: AtomicBool::new(enabled),
             retention_days: AtomicU64::new(retention_days.max(1) as u64),
         })
@@ -304,8 +307,10 @@ impl TraceStore {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
         Self::migrate(&conn)?;
+        let observation_config = super::observations::init_observations(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            observation_config: RwLock::new(observation_config),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         })
@@ -680,6 +685,10 @@ impl TraceStore {
         };
         let res = (|| -> rusqlite::Result<usize> {
             tx.execute(
+                "DELETE FROM request_observations WHERE ts_epoch < ?1",
+                [Utc::now().timestamp() - 86400],
+            )?;
+            tx.execute(
                 "DELETE FROM trace_attempts WHERE trace_id IN \
                  (SELECT trace_id FROM traces WHERE ts_epoch < ?1)",
                 [cutoff],
@@ -913,13 +922,7 @@ mod tests {
     }
 
     fn mem_store() -> TraceStore {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
-        TraceStore {
-            conn: Mutex::new(conn),
-            enabled: AtomicBool::new(true),
-            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
-        }
+        TraceStore::open_in_memory().unwrap()
     }
 
     #[test]
@@ -1279,8 +1282,10 @@ mod tests {
         )
         .unwrap();
         TraceStore::migrate(&conn).unwrap();
+        let observation_config = crate::admin::observations::init_observations(&conn).unwrap();
         let store = TraceStore {
             conn: Mutex::new(conn),
+            observation_config: RwLock::new(observation_config),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         };

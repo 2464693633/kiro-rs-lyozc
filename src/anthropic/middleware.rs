@@ -133,7 +133,13 @@ pub async fn auth_middleware(
                     key_source: TraceKeySource::ClientKey,
                     client_ip,
                 });
-                return next.run(request).await;
+                return super::observation::observe_request(
+                    state.trace_store.clone(),
+                    id,
+                    request,
+                    next,
+                )
+                .await;
             }
             KeyAuth::OverLimit { used, limit, .. } => {
                 let error = ErrorResponse::new(
