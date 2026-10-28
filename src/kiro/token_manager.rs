@@ -1937,31 +1937,26 @@ impl MultiTokenManager {
         fresh as u32 >= limit
     }
 
-    /// 当所有其它条件均满足的候选都耗尽 RPM 额度时，返回最早可重试秒数。
-    fn rpm_retry_after_secs(
+    /// Return the earliest time a matching enabled account clears both its
+    /// throttle cooldown and RPM window. A cooldown is not a disabled account.
+    fn capacity_retry_after_secs(
         &self,
         entries: &[CredentialEntry],
         model: Option<&str>,
         group: Option<&str>,
         now: Instant,
     ) -> Option<u64> {
-        if !self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-        let limit = self.account_rpm_limit.load(Ordering::Relaxed) as usize;
-        if limit == 0 {
-            return None;
-        }
+        let limit = if self.account_rpm_limit_enabled.load(Ordering::Relaxed) {
+            self.account_rpm_limit.load(Ordering::Relaxed) as usize
+        } else {
+            0
+        };
 
         let window = StdDuration::from_secs(RPM_WINDOW_SECS);
         let mut earliest_retry_after = None;
 
         for entry in entries.iter().filter(|entry| {
             !entry.disabled
-                && !entry
-                    .throttled_until
-                    .map(|until| until > now)
-                    .unwrap_or(false)
                 && credential_matches_request(&entry.credentials, model, group)
                 && self.cached_model_support(entry.id, model) != CachedModelSupport::Unsupported
         }) {
@@ -1970,22 +1965,26 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|&&ts| now.duration_since(ts) < window)
                 .count();
-            if fresh_count < limit {
+            let mut remaining = entry
+                .throttled_until
+                .map(|until| until.saturating_duration_since(now))
+                .unwrap_or_default();
+            if limit > 0 && fresh_count >= limit {
+                // A runtime limit reduction may require multiple timestamps to expire.
+                let release_index = fresh_count - limit;
+                let release_at = entry
+                    .rpm_window
+                    .iter()
+                    .filter(|&&ts| now.duration_since(ts) < window)
+                    .nth(release_index)
+                    .copied()
+                    .expect("fresh_count 与窗口迭代结果应一致")
+                    + window;
+                remaining = remaining.max(release_at.saturating_duration_since(now));
+            }
+            if remaining.is_zero() {
                 return None;
             }
-
-            // 窗口可能因运行时下调 limit 而暂时多于上限；需要等到
-            // fresh_count - limit + 1 个时间戳过期后才重新有额度。
-            let release_index = fresh_count - limit;
-            let release_at = entry
-                .rpm_window
-                .iter()
-                .filter(|&&ts| now.duration_since(ts) < window)
-                .nth(release_index)
-                .copied()
-                .expect("fresh_count 与窗口迭代结果应一致")
-                + window;
-            let remaining = release_at.saturating_duration_since(now);
             let retry_after = remaining
                 .as_secs()
                 .saturating_add(u64::from(remaining.subsec_nanos() > 0))
@@ -2243,10 +2242,10 @@ impl MultiTokenManager {
                     (new_id, new_creds)
                 } else {
                     let entries = self.entries.lock();
-                    // RPM 打满（而非全部禁用）时回 429 并带 Retry-After，
+                    // RPM 打满或账号冷却（而非全部禁用）时回 429 并带 Retry-After，
                     // 让调用方知道这是限流而不是凭据耗尽。
                     if let Some(retry_after) =
-                        self.rpm_retry_after_secs(&entries, model, group, Instant::now())
+                        self.capacity_retry_after_secs(&entries, model, group, Instant::now())
                     {
                         return Err(
                             UpstreamRateLimitError::new(Some(retry_after.to_string())).into()
@@ -7994,6 +7993,80 @@ mod tests {
             Some(2)
         );
         assert_eq!(manager.snapshot().available, 1);
+    }
+
+    #[tokio::test]
+    async fn test_account_cooldown_remains_rate_limited_on_the_next_request() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g2"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.report_account_throttled_for_request(
+            1,
+            StdDuration::from_secs(60),
+            None,
+            Some("g1"),
+        );
+        let error = match manager.acquire_context(None, Some("g1")).await {
+            Ok(_) => panic!("cooling account must not be selected"),
+            Err(error) => error,
+        };
+        let rate_limit = error
+            .downcast_ref::<UpstreamRateLimitError>()
+            .expect("cooldown must return a typed 429");
+        let delay: u64 = rate_limit.retry_after().unwrap().parse().unwrap();
+        assert!((1..=60).contains(&delay));
+        let entries = manager.entries.lock();
+        assert_eq!(
+            manager.capacity_retry_after_secs(&entries, None, Some("g2"), Instant::now()),
+            None
+        );
+        assert_eq!(
+            manager.capacity_retry_after_secs(
+                &entries,
+                None,
+                Some("g1"),
+                Instant::now() + StdDuration::from_secs(61)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_capacity_delay_combines_rpm_and_cooldown_per_account() {
+        let mut config = Config::default();
+        config.account_rpm_limit_enabled = true;
+        config.account_rpm_limit = 1;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &[]), grouped_cred("b", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let now = Instant::now();
+        let mut entries = manager.entries.lock();
+        entries[0].throttled_until = Some(now + StdDuration::from_secs(120));
+        entries[1].rpm_window.push_back(now);
+        assert_eq!(
+            manager.capacity_retry_after_secs(&entries, None, None, now),
+            Some(60)
+        );
+        entries[1].throttled_until = Some(now + StdDuration::from_secs(90));
+        assert_eq!(
+            manager.capacity_retry_after_secs(&entries, None, None, now),
+            Some(90)
+        );
+        entries[1].disabled = true;
+        assert_eq!(
+            manager.capacity_retry_after_secs(&entries, None, None, now),
+            Some(120)
+        );
     }
 
     #[test]

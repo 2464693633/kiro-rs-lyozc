@@ -20,6 +20,7 @@ const FEATURE_NAMES: Record<string, string> = {
   signature_replay: '签名回传', cache_control: '缓存控制', strict_tool: '严格工具',
   number_fingerprint_candidate: '数字指纹', knowledge_probe_candidate: '知识截止探测',
   identity_probe_candidate: '模型身份探测',
+  server_code_execution: '服务端代码执行',
 }
 const STATES = { running: '处理中', complete: '完成', error: '失败', interrupted: '中断' }
 

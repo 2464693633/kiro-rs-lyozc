@@ -100,6 +100,9 @@ where
 pub struct OutputConfig {
     #[serde(default = "default_effort")]
     pub effort: String,
+    /// Preserve the client's JSON Schema for the compatibility adapter.
+    #[serde(default)]
+    pub format: Option<serde_json::Value>,
 }
 
 fn default_effort() -> String {

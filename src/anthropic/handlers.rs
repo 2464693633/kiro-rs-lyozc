@@ -799,13 +799,72 @@ pub async fn get_models(
     .into_response()
 }
 
+async fn post_compatible_messages(
+    state: AppState,
+    key_ctx: KeyContext,
+    mut payload: MessagesRequest,
+    cc: bool,
+) -> Response {
+    if payload.tools.as_ref().is_some_and(|tools| {
+        tools.iter().any(|tool| {
+            tool.tool_type
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("code_execution_"))
+        })
+    }) {
+        return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(
+            "invalid_request_error",
+            "Server-side code_execution is unavailable: this gateway has no isolated execution backend. Use a client-executed custom tool instead.",
+        ))).into_response();
+    }
+    let structured = match super::structured_output::prepare(&mut payload) {
+        Ok(enabled) => enabled,
+        Err(message) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", message)),
+            )
+                .into_response();
+        }
+    };
+    if let Err(message) = super::documents::prepare(&mut payload).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
+    let buffered_sse = structured && payload.stream;
+    if buffered_sse {
+        payload.stream = false;
+    }
+    let response = if cc {
+        post_messages_cc_inner(state, key_ctx, payload).await
+    } else {
+        post_messages_inner(state, key_ctx, payload).await
+    };
+    if buffered_sse {
+        super::structured_output::as_sse(response).await
+    } else {
+        response
+    }
+}
+
 /// POST /v1/messages
 ///
 /// 创建消息（对话）
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_compatible_messages(state, key_ctx, payload, false).await
+}
+
+async fn post_messages_inner(
+    state: AppState,
+    key_ctx: KeyContext,
+    mut payload: MessagesRequest,
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
@@ -850,41 +909,12 @@ pub async fn post_messages(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        return resp;
-    }
-
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
+    // Native web search, alone or mixed with client tools, runs through the
+    // model loop so the model selects queries and answers from actual results.
+    if websearch::has_web_search_tool(&payload) || websearch::has_web_search_among_tools(&payload) {
         tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
+            "detected native web_search, entering the model search loop"
         );
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
@@ -1042,6 +1072,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            super::structured_output::format(&payload).cloned(),
         )
         .await
     }
@@ -1417,8 +1448,9 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    output_format: Option<serde_json::Value>,
 ) -> Response {
-    match execute_non_stream_request(
+    match execute_non_stream_request_with_format(
         provider,
         request_body,
         model,
@@ -1429,6 +1461,7 @@ async fn handle_non_stream_request(
         cache_usage,
         tracer,
         group,
+        output_format,
     )
     .await
     {
@@ -1492,6 +1525,35 @@ pub(crate) async fn execute_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+) -> Result<serde_json::Value, NonStreamExecutionError> {
+    execute_non_stream_request_with_format(
+        provider,
+        request_body,
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        hook,
+        cache_usage,
+        tracer,
+        group,
+        None,
+    )
+    .await
+}
+
+async fn execute_non_stream_request_with_format(
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: &str,
+    model: &str,
+    input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: std::collections::HashMap<String, String>,
+    hook: UsageRecordHook,
+    cache_usage: super::cache_metering::CacheUsage,
+    tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
+    output_format: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, NonStreamExecutionError> {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1812,6 +1874,13 @@ pub(crate) async fn execute_non_stream_request(
             provider_token_usage,
         );
 
+    let validation_error =
+        super::structured_output::validate(output_format.as_ref(), &content, &stop_reason).err();
+    let status = if validation_error.is_some() {
+        "error"
+    } else {
+        "success"
+    };
     // 构建 Anthropic 响应
     let mut usage_json = json!({
         "input_tokens": final_input_tokens,
@@ -1844,12 +1913,14 @@ pub(crate) async fn execute_non_stream_request(
         cache_creation_tokens,
         cache_read_tokens,
         credits,
-        "success",
+        status,
     );
     tracer.finalize(
-        "success",
-        None,
-        None,
+        status,
+        validation_error
+            .as_ref()
+            .map(|_| "upstream_output_schema_error"),
+        validation_error.as_deref(),
         None,
         TraceUsage {
             input_tokens: final_input_tokens.max(0) as u64,
@@ -1864,6 +1935,15 @@ pub(crate) async fn execute_non_stream_request(
             source: UsageSource::resolve(provider_token_usage.is_some(), &cache_usage),
         },
     );
+    if let Some(message) = validation_error {
+        return Err(NonStreamExecutionError::Response(
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_output_schema_error", message)),
+            )
+                .into_response(),
+        ));
+    }
     Ok(response_body)
 }
 
@@ -1961,8 +2041,9 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     });
 
     if is_opus_4_6 {
-        payload.output_config = Some(OutputConfig {
+        payload.output_config.get_or_insert_with(|| OutputConfig {
             effort: "high".to_string(),
+            format: None,
         });
     }
 }
@@ -2000,7 +2081,15 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
-    JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
+    JsonExtractor(payload): JsonExtractor<MessagesRequest>,
+) -> Response {
+    post_compatible_messages(state, key_ctx, payload, true).await
+}
+
+async fn post_messages_cc_inner(
+    state: AppState,
+    key_ctx: KeyContext,
+    mut payload: MessagesRequest,
 ) -> Response {
     tracing::info!(
         model = %payload.model,
@@ -2034,40 +2123,11 @@ pub async fn post_messages_cc(
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
 
-    // 检查是否为 WebSearch 请求
-    if websearch::has_web_search_tool(&payload) {
-        tracing::info!("检测到 WebSearch 工具，路由到 WebSearch 处理");
-
-        // 估算输入 tokens
-        let input_tokens = token::count_all_tokens(
-            payload.model.clone(),
-            payload.system.clone(),
-            payload.messages.clone(),
-            payload.tools.clone(),
-        ) as i32;
-
-        let resp = websearch::handle_websearch_request(
-            provider,
-            &payload,
-            input_tokens,
-            key_ctx.group.as_deref(),
-        )
-        .await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
-        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
-        return resp;
-    }
-
     let payload_stream = payload.stream;
-    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
-    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
-    if websearch::has_web_search_among_tools(&payload) {
+    // Native web search uses the same model loop on both public endpoints.
+    if websearch::has_web_search_tool(&payload) || websearch::has_web_search_among_tools(&payload) {
         tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
+            "detected native web_search, entering the model search loop"
         );
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
@@ -2221,6 +2281,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            super::structured_output::format(&payload).cloned(),
         )
         .await
     }
@@ -2261,6 +2322,18 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn thinking_alias_preserves_the_clients_output_schema_and_effort() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-opus-4-6-thinking", "messages":[{"role":"user","content":"hello"}],
+            "output_config":{"effort":"low","format":{"type":"json_schema","schema":{"type":"object"}}}
+        })).unwrap();
+        override_thinking_from_model_name(&mut payload);
+        let config = payload.output_config.unwrap();
+        assert_eq!(config.effort, "low");
+        assert_eq!(config.format.unwrap()["schema"]["type"], "object");
+    }
 
     #[test]
     fn dropped_stream_settles_latest_usage_exactly_once() {

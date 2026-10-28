@@ -1665,6 +1665,23 @@ async fn run_web_search_loop_inner(
 
         let final_usage = settlement.usage();
         let final_metering = settlement.response_metering(latest_metering.as_ref());
+        if let Err(message) = super::structured_output::validate(
+            super::structured_output::format(&payload),
+            &content,
+            &stop_reason,
+        ) {
+            settlement.finish(
+                "error",
+                "error",
+                Some("upstream_output_schema_error"),
+                Some(&message),
+            );
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new("upstream_output_schema_error", message)),
+            )
+                .into_response();
+        }
         settlement.finish("success", "success", None, None);
 
         return if let Some(emitter) = emitter.as_deref_mut() {

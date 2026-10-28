@@ -2640,6 +2640,7 @@ mod tests {
                 budget_tokens,
             }),
             output_config: effort.map(|effort| OutputConfig {
+                format: None,
                 effort: effort.to_string(),
             }),
             metadata: None,

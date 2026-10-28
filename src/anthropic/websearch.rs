@@ -2,23 +2,29 @@
 //!
 //! 实现 Anthropic WebSearch 请求到 Kiro MCP 的转换和响应生成
 
+#[cfg(test)]
 use std::convert::Infallible;
 
+#[cfg(test)]
 use axum::{
     body::Body,
     http::{StatusCode, header},
-    response::{IntoResponse, Json, Response},
+    response::Response,
 };
+#[cfg(test)]
 use bytes::Bytes;
+#[cfg(test)]
 use futures::{Stream, stream};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::admin::trace_db::TraceSink;
 
+#[cfg(test)]
 use super::stream::SseEvent;
-use super::types::{ErrorResponse, MessagesRequest};
+use super::types::MessagesRequest;
 
 /// MCP 请求
 #[derive(Debug, Serialize)]
@@ -133,33 +139,34 @@ pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
 
 /// 从消息中提取搜索查询
 ///
-/// 读取 messages 的第一条消息的第一个内容块
-/// 并去除 "Perform a web search for the query: " 前缀
+/// Read all text blocks in the latest user turn. The production path lets the
+/// model choose its query; this helper remains useful for explicit query inputs.
+#[cfg(test)]
 pub fn extract_search_query(req: &MessagesRequest) -> Option<String> {
-    // 获取第一条消息
-    let first_msg = req.messages.first()?;
+    let first_msg = req
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")?;
 
     // 提取文本内容
     let text = match &first_msg.content {
         serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Array(arr) => {
-            // 获取第一个内容块
-            let first_block = arr.first()?;
-            if first_block.get("type")?.as_str()? == "text" {
-                first_block.get("text")?.as_str()?.to_string()
-            } else {
-                return None;
-            }
-        }
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter(|block| block["type"] == "text")
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => return None,
     };
 
     // 去除前缀 "Perform a web search for the query: "
-    const PREFIX: &str = "Perform a web search for the query: ";
-    let query = if text.starts_with(PREFIX) {
-        text[PREFIX.len()..].to_string()
+    const PREFIX: &str = "Perform a web search for the query:";
+    let query = if let Some((_, query)) = text.split_once(PREFIX) {
+        query.trim().to_string()
     } else {
-        text
+        text.trim().to_string()
     };
 
     if query.is_empty() { None } else { Some(query) }
@@ -234,6 +241,7 @@ pub fn parse_search_results(mcp_response: &McpResponse) -> Option<WebSearchResul
 }
 
 /// 生成 WebSearch SSE 响应流
+#[cfg(test)]
 pub fn create_websearch_sse_stream(
     model: String,
     query: String,
@@ -252,6 +260,7 @@ pub fn create_websearch_sse_stream(
 }
 
 /// 生成 WebSearch SSE 事件序列
+#[cfg(test)]
 fn generate_websearch_events(
     model: &str,
     query: &str,
@@ -471,6 +480,7 @@ pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchRes
     summary
 }
 
+#[cfg(test)]
 fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Vec<Value> {
     search_results
         .as_ref()
@@ -496,6 +506,7 @@ fn websearch_result_content(search_results: &Option<WebSearchResults>) -> Vec<Va
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 fn build_websearch_content(
     query: &str,
     tool_use_id: &str,
@@ -518,6 +529,7 @@ fn build_websearch_content(
     ]
 }
 
+#[cfg(test)]
 fn finish_mcp_call(
     result: anyhow::Result<McpResponse>,
 ) -> Result<Option<WebSearchResults>, Response> {
@@ -530,6 +542,7 @@ fn finish_mcp_call(
     }
 }
 
+#[cfg(test)]
 fn render_websearch_response(
     stream_response: bool,
     model: String,
@@ -568,51 +581,6 @@ fn render_websearch_response(
             None,
         )
     }
-}
-
-/// 处理 WebSearch 请求
-pub async fn handle_websearch_request(
-    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
-    payload: &MessagesRequest,
-    input_tokens: i32,
-    group: Option<&str>,
-) -> Response {
-    // 1. 提取搜索查询
-    let query = match extract_search_query(payload) {
-        Some(q) => q,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse::new(
-                    "invalid_request_error",
-                    "无法从消息中提取搜索查询",
-                )),
-            )
-                .into_response();
-        }
-    };
-
-    tracing::info!(query = %query, "处理 WebSearch 请求");
-
-    // 2. 创建 MCP 请求
-    let (tool_use_id, mcp_request) = create_mcp_request(&query);
-
-    // 3. 调用 Kiro MCP API
-    let search_results =
-        match finish_mcp_call(call_mcp_api(&provider, &mcp_request, None, group).await) {
-            Ok(results) => results,
-            Err(response) => return response,
-        };
-
-    // 4. 按请求模式生成响应
-    render_websearch_response(
-        payload.stream,
-        payload.model.clone(),
-        query,
-        tool_use_id,
-        search_results,
-        input_tokens,
-    )
 }
 
 /// 调用 Kiro MCP API
@@ -903,6 +871,23 @@ mod tests {
 
         let query = extract_search_query(&req);
         assert_eq!(query, Some("What is the weather today?".to_string()));
+    }
+
+    #[test]
+    fn search_query_uses_latest_user_text_after_instructions() {
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4", "messages":[
+                {"role":"user","content":"old query"},
+                {"role":"assistant","content":"old answer"},
+                {"role":"user","content":[{"type":"image"},
+                    {"type":"text","text":"You must call the web_search tool before answering."},
+                    {"type":"text","text":"Perform a web search for the query: AI news 2026-10-28"}]}
+            ]
+        })).unwrap();
+        assert_eq!(
+            extract_search_query(&request).as_deref(),
+            Some("AI news 2026-10-28")
+        );
     }
 
     #[test]

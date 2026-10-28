@@ -24,6 +24,7 @@
 
 pub mod cache_metering;
 mod converter;
+mod documents;
 mod handlers;
 mod middleware;
 mod observation;
@@ -31,6 +32,7 @@ mod openai;
 mod responses;
 mod router;
 pub mod stream;
+mod structured_output;
 pub mod types;
 mod websearch;
 mod websearch_loop;

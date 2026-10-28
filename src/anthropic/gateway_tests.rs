@@ -21,7 +21,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::ConnectInfo,
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::post,
 };
 use bytes::Bytes;
@@ -52,6 +52,8 @@ enum Mode {
     Stalled,
     SlowHeaders,
     SlowErrorBody,
+    Structured(&'static str),
+    Search,
     MetadataFirst,
     Active,
     /// 上游内容过滤拦截：只有 reasoning，`metadataEvent.stopReason = CONTENT_FILTERED`，
@@ -67,6 +69,7 @@ enum Mode {
 struct Fixture {
     state: AppState,
     calls: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
     connections: Arc<Mutex<HashSet<SocketAddr>>>,
     close_headers: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
@@ -133,13 +136,18 @@ async fn fixture(mode: Mode) -> Fixture {
 
 async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
+    let bodies = Arc::new(Mutex::new(Vec::new()));
+    let seen_bodies = bodies.clone();
     let connections = Arc::new(Mutex::new(HashSet::new()));
     let close_headers = Arc::new(AtomicUsize::new(0));
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
-    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap| {
+    let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
+        let bodies = seen_bodies.clone();
         async move {
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            bodies.lock().push(request.clone());
             calls.fetch_add(1, Ordering::Relaxed);
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
@@ -151,6 +159,27 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if let Mode::Structured(text) = mode {
+                let mut bytes = frame("assistantResponseEvent", json!({"content":text})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Search) {
+                if request["jsonrpc"] == "2.0" {
+                    assert_eq!(request["params"]["arguments"]["query"], "rust release");
+                    return axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"isError":false,
+                        "content":[{"type":"text","text":json!({"results":[{"title":"Rust release",
+                            "url":"https://example.test/rust", "snippet":"search evidence"}]}).to_string()}]}})).into_response();
+                }
+                let mut bytes = if request.to_string().contains("search evidence") {
+                    frame("assistantResponseEvent", json!({"content":"Synthesized answer using search evidence."})).to_vec()
+                } else {
+                    frame("toolUseEvent", json!({"name":"web_search","toolUseId":"search_1",
+                        "input":"{\"query\":\"rust release\"}","stop":true})).to_vec()
+                };
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
+                return Response::new(Body::from(bytes));
+            }
             if matches!(mode, Mode::Large) {
                 let frames = (0..18000).map(|_| frame("assistantResponseEvent", json!({"content": "x".repeat(1024)})));
                 return Response::new(Body::from_stream(stream::iter(frames.map(Ok::<_, Infallible>))));
@@ -237,6 +266,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     Fixture {
         state,
         calls,
+        bodies,
         connections,
         close_headers,
         task,
@@ -295,6 +325,132 @@ async fn first_content(
         }
     }
     panic!("stream ended without content");
+}
+
+async fn compatibility_request(state: AppState, cc: bool, payload: serde_json::Value) -> Response {
+    let payload = Json(serde_json::from_value(payload).unwrap());
+    if cc {
+        post_messages_cc(axum::extract::State(state), Extension(key()), payload).await
+    } else {
+        post_messages(axum::extract::State(state), Extension(key()), payload).await
+    }
+}
+
+fn structured_request(stream: bool) -> serde_json::Value {
+    json!({"model":"gpt-5.6-sol","max_tokens":128,"stream":stream,
+        "messages":[{"role":"user","content":"Return kind and count"}],
+        "output_config":{"format":{"type":"json_schema","schema":{"type":"object",
+            "properties":{"kind":{"enum":["one","two"]},"count":{"type":"integer"}},
+            "required":["kind","count"],"additionalProperties":false}}}})
+}
+
+#[tokio::test]
+async fn gateway_structured_json_and_sse_work_on_both_routes() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::Structured(r#"{"kind":"two","count":7}"#)).await;
+            let response =
+                compatibility_request(f.state.clone(), cc, structured_request(streaming)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            if streaming {
+                let wire = String::from_utf8(body.to_vec()).unwrap();
+                assert!(wire.contains("event: message_stop"));
+                assert!(wire.contains("text_delta"));
+                assert!(wire.contains("count"));
+                assert!(wire.contains("\"output_tokens\":17"));
+            } else {
+                let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let answer: serde_json::Value =
+                    serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(answer, json!({"kind":"two","count":7}));
+            }
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+            assert!(f.bodies.lock()[0].to_string().contains("JSON Schema"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_invalid_structured_output_fails_and_records_usage() {
+    for cc in [false, true] {
+        let mut f = fixture(Mode::Structured("I am Kiro")).await;
+        let store = Arc::new(TraceStore::open_in_memory().unwrap());
+        f.state = f.state.clone().with_trace_store(Some(store.clone()));
+        let response = compatibility_request(f.state.clone(), cc, structured_request(true)).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream_output_schema_error"));
+        let (records, _) = store.query_paged(&TraceQuery {
+            limit: 5,
+            ..Default::default()
+        });
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].final_status, "error");
+        assert_eq!(records[0].output_tokens, 17);
+    }
+}
+
+#[tokio::test]
+async fn gateway_pdf_text_reaches_upstream_on_both_routes() {
+    use base64::Engine;
+    for cc in [false, true] {
+        let f = fixture(Mode::Normal(Duration::ZERO)).await;
+        let payload = json!({"model":"gpt-5.6-sol","max_tokens":64,
+            "messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64",
+                "media_type":"application/pdf","data":base64::engine::general_purpose::STANDARD.encode(super::documents::test_pdf("PDF72ABC"))}},
+                {"type":"text","text":"Read the attached code"}]}]});
+        let response = compatibility_request(f.state.clone(), cc, payload).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(f.bodies.lock()[0].to_string().contains("PDF72ABC"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_unsupported_server_execution_and_invalid_schemas_never_reach_upstream() {
+    for cc in [false, true] {
+        let f = fixture(Mode::Normal(Duration::ZERO)).await;
+        let mut execution = structured_request(false);
+        execution["tools"] = json!([{"type":"code_execution_20250825","name":"code_execution"}]);
+        assert_eq!(
+            compatibility_request(f.state.clone(), cc, execution)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut schema = structured_request(false);
+        schema["output_config"]["format"]["schema"] = json!({"$ref":"http://127.0.0.1/private"});
+        assert_eq!(
+            compatibility_request(f.state.clone(), cc, schema)
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(f.calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[tokio::test]
+async fn gateway_pure_search_executes_and_uses_results_for_an_answer() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::Search).await;
+            let payload = json!({"model":"gpt-5.6-sol","max_tokens":256,"stream":streaming,
+                "messages":[{"role":"user","content":"You must call the web_search tool before answering. Perform a web search for the query: rust release"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"}]});
+            let response = compatibility_request(f.state.clone(), cc, payload).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8_lossy(&body);
+            assert!(
+                wire.contains("Synthesized answer using search evidence."),
+                "{wire}"
+            );
+            assert!(wire.contains("server_tool_use"), "{wire}");
+            assert!(wire.contains("web_search_tool_result"), "{wire}");
+            assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+        }
+    }
 }
 
 #[tokio::test]

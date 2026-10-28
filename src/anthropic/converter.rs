@@ -958,6 +958,12 @@ fn process_message_content_dedup(
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
+                if item.get("type").and_then(serde_json::Value::as_str) == Some("document") {
+                    return Err(ConversionError::InvalidMessageSequence(
+                        "Document blocks must pass through the document adapter before conversion"
+                            .into(),
+                    ));
+                }
                 if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
                     match block.block_type.as_str() {
                         "text" => {
@@ -2343,6 +2349,7 @@ mod tests {
             tool_choice: None,
             thinking: None,
             output_config: Some(OutputConfig {
+                format: None,
                 effort: effort.to_string(),
             }),
             metadata: None,

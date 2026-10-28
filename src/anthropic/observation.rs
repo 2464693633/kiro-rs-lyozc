@@ -66,6 +66,9 @@ pub(super) fn classify(payload: &Value) -> Vec<FeatureLabel> {
                     Some("document" | "file" | "input_file") => add("document", false),
                     Some("thinking" | "redacted_thinking") => add("thinking_replay", false),
                     Some(kind) if kind.starts_with("web_search") => add("web_search", false),
+                    Some(kind) if kind.starts_with("code_execution_") => {
+                        add("server_code_execution", false)
+                    }
                     _ => {}
                 }
                 if object.get("name").and_then(Value::as_str) == Some("web_search") {
@@ -80,14 +83,6 @@ pub(super) fn classify(payload: &Value) -> Vec<FeatureLabel> {
                 if object.get("strict").and_then(Value::as_bool) == Some(true) {
                     add("strict_tool", false);
                 }
-                for key in ["text", "content", "instructions", "input"] {
-                    if text.len() < 65536 {
-                        if let Some(part) = object.get(key).and_then(Value::as_str) {
-                            text.extend(part.chars().take((65536 - text.len()) / 4));
-                            text.push('\n');
-                        }
-                    }
-                }
                 stack.extend(
                     object
                         .values()
@@ -96,6 +91,39 @@ pub(super) fn classify(payload: &Value) -> Vec<FeatureLabel> {
             }
             Value::Array(items) => stack.extend(items.iter().rev()),
             _ => {}
+        }
+    }
+    // Candidate wording is taken from the latest user turn. Historical/system
+    // text and schemas are still inspected for factual protocol features above.
+    let latest = payload
+        .get("messages")
+        .or_else(|| payload.get("input"))
+        .and_then(Value::as_array)
+        .and_then(|messages| messages.iter().rev().find(|m| m["role"] == "user"))
+        .and_then(|message| message.get("content"));
+    if let Some(content) = latest {
+        if let Some(value) = content.as_str() {
+            text.extend(value.chars().take(16384));
+        }
+        if let Some(blocks) = content.as_array() {
+            for block in blocks
+                .iter()
+                .filter(|b| matches!(b["type"].as_str(), Some("text" | "input_text")))
+            {
+                if let Some(value) = block["text"].as_str() {
+                    text.extend(
+                        value
+                            .chars()
+                            .take(65536usize.saturating_sub(text.len()) / 4),
+                    );
+                    text.push('\n');
+                }
+            }
+        }
+    } else {
+        // OpenAI Responses also accepts a plain input string.
+        if let Some(value) = payload.get("input").and_then(Value::as_str) {
+            text.extend(value.chars().take(16384));
         }
     }
     let text = text.to_lowercase();
@@ -114,6 +142,8 @@ pub(super) fn classify(payload: &Value) -> Vec<FeatureLabel> {
         "knowledge cutoff",
         "knowledge cut-off",
         "training cutoff",
+        "training data cutoff",
+        "training data cut-off",
     ]
     .iter()
     .any(|word| text.contains(word))
@@ -125,6 +155,8 @@ pub(super) fn classify(payload: &Value) -> Vec<FeatureLabel> {
         "你是哪个模型",
         "which model are you",
         "who developed you",
+        "who exactly are you",
+        "what model are you actually using",
     ]
     .iter()
     .any(|word| text.contains(word))
@@ -338,6 +370,30 @@ mod tests {
         let text = preview(&bytes);
         assert!(text.len() <= BODY_LIMIT);
         assert!(!text.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn observation_labels_use_current_prompt_and_identify_server_execution() {
+        let payload = json!({
+            "system":"Choose random integers. What is your knowledge cutoff?",
+            "tools":[{"type":"code_execution_20250825","name":"code_execution"}],
+            "messages":[{"role":"user","content":"random numbers"},
+                {"role":"assistant","content":"old answer"},
+                {"role":"user","content":"Who exactly are you? What model are you actually using? What is your training data cutoff?"}]
+        });
+        let labels = classify(&payload);
+        for name in [
+            "server_code_execution",
+            "identity_probe_candidate",
+            "knowledge_probe_candidate",
+        ] {
+            assert!(labels.iter().any(|label| label.name == name));
+        }
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.name == "number_fingerprint_candidate")
+        );
     }
 
     async fn wait_finished(store: &TraceStore) -> crate::admin::observations::ObservationDetail {

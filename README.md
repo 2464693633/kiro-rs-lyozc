@@ -52,6 +52,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
+- **文档和 JSON Schema 适配**：支持内联文本 PDF/纯文本文档，JSON Schema 提示约束与返回校验；能力范围和错误行为见 [Messages 兼容适配](docs/message-compatibility.md)。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
 - **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。
 - **图像处理**：入站图片按环境变量自动缩放 / 重编码，降低 AWS Q 单字段大小限制导致的 400 风险。
