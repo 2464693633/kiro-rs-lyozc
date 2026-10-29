@@ -68,6 +68,15 @@ pub(super) fn prepare(
     {
         return Err("Execution bridge tool names are reserved".into());
     }
+    if payload
+        .tool_choice
+        .as_ref()
+        .is_some_and(|choice| choice["type"] == "none")
+    {
+        payload.tools = None;
+        normalize_history(payload);
+        return Ok(None);
+    }
     let cache_control = declared[0].cache_control.clone();
     let tools = payload.tools.as_mut().unwrap();
     tools.retain(|tool| tool.tool_type.as_deref() != Some("code_execution_20250825"));
@@ -476,6 +485,17 @@ mod tests {
                 .is_some()
         );
         assert_eq!(req.tools.unwrap().len(), 2);
+    }
+    #[test]
+    fn disabled_tool_choice_does_not_expose_internal_execution_tools() {
+        let mut req = request();
+        req.tool_choice = Some(json!({"type":"none"}));
+        assert!(
+            prepare(&mut req, CodeExecutionMode::Bridge)
+                .unwrap()
+                .is_none()
+        );
+        assert!(req.tools.is_none());
     }
     #[test]
     fn unavailable_is_not_a_fabricated_process_result() {
