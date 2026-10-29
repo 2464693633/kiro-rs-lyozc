@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="referrer" content="no-referrer">
+  <title>API 内容监控</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="API 内容监控首页"><span class="brand-icon" aria-hidden="true">↔</span><span>API 内容监控<small>观察请求 · 比较响应</small></span></a>
+    <div class="header-actions"><span id="connection-state" class="status-chip neutral">未登录</span><button id="logout" class="button quiet small" type="button" hidden>退出</button></div>
+  </header>
+  <main>
+    <section id="login-view" class="login-card card" aria-labelledby="login-title">
+      <p class="eyebrow">管理入口</p><h1 id="login-title">登录内容监控</h1>
+      <p class="muted">输入管理口令后，配置上游服务并查看检测请求。</p>
+      <form id="login-form">
+        <label for="admin-token">管理口令</label>
+        <input id="admin-token" name="admin-token" type="password" autocomplete="current-password" required spellcheck="false">
+        <p id="login-error" class="inline-error" role="alert" hidden></p>
+        <button id="login-button" class="button primary wide" type="submit">进入监控</button>
+      </form>
+      <p class="microcopy">管理口令仅保存在当前浏览器会话，不会出现在 URL 查询参数中。</p>
+    </section>
+    <div id="app-view" hidden>
+      <div class="page-intro"><div><p class="eyebrow">透明转发</p><h1>看清每一次检测</h1><p class="muted">填写上游地址与 Key，再让 CCTest 测试本页提供的代理入口。</p></div><p class="scope-note">可观察 API 行为和流式时序，不能由此还原源码或证明签名有效。</p></div>
+      <div class="setup-grid">
+        <section class="card config-card" aria-labelledby="config-title">
+          <div class="section-top"><div><p class="step-number">01 / 连接上游</p><h2 id="config-title">对方的服务</h2></div><span id="saved-state" class="text-state">加载中…</span></div>
+          <form id="config-form">
+            <label for="upstream-url">上游 Base URL</label>
+            <input id="upstream-url" name="upstream-url" type="url" placeholder="https://api.example.com" autocomplete="off" spellcheck="false" required>
+            <label for="upstream-key">上游 API Key <span id="upstream-key-state" class="label-meta">尚未保存</span></label>
+            <input id="upstream-key" name="upstream-key" type="password" placeholder="粘贴对方提供的 API Key" autocomplete="new-password" spellcheck="false">
+            <p id="key-help" class="field-help">保存后不回显原始 Key，也不会保存在浏览器本地存储中。</p>
+            <details class="advanced"><summary>高级设置</summary><label for="auth-mode">上游鉴权方式</label><select id="auth-mode" name="auth-mode"><option value="x-api-key">x-api-key（Anthropic）</option><option value="bearer">Authorization: Bearer</option></select></details>
+            <label class="switch-row" for="enabled"><span><strong>启用监控转发</strong><small>保存后生效，使用独立代理 Key 鉴权</small></span><input id="enabled" type="checkbox" role="switch"></label>
+            <div class="button-row"><button id="save-config" class="button primary" type="submit">保存配置</button><button id="check-connection" class="button secondary" type="button">检查连接</button></div>
+            <p id="config-message" class="form-message" role="status" aria-live="polite"></p>
+          </form>
+        </section>
+        <section class="card relay-card" aria-labelledby="relay-title">
+          <div class="section-top"><div><p class="step-number">02 / 开始检测</p><h2 id="relay-title">填到 CCTest</h2></div><span id="relay-state" class="status-chip neutral">等待配置</span></div>
+          <label for="public-url">CCTest 接口地址</label><div class="input-action"><input id="public-url" readonly spellcheck="false" aria-describedby="relay-help"><button id="copy-url" class="button secondary" type="button" disabled>复制</button></div>
+          <label for="relay-key">代理测试 Key <span class="label-meta">不是上游 Key</span></label><div class="input-action"><input id="relay-key" type="password" readonly spellcheck="false"><button id="toggle-relay-key" class="button quiet" type="button" aria-pressed="false" disabled>显示</button><button id="copy-relay-key" class="button secondary" type="button" disabled>复制</button></div>
+          <p id="relay-help" class="field-help">检测网站使用这里的地址和代理测试 Key。上游 Key 只用于监控服务连接对方的 API。</p>
+          <div class="flow" aria-label="转发链路"><span>CCTest</span><i aria-hidden="true">→</i><span class="flow-current">内容监控</span><i aria-hidden="true">→</i><span>上游 API</span></div>
+          <div class="capture-info"><strong>原样转发，旁路记录</strong><p>请求与响应内容按容量上限记录，超出部分仍继续转发。检测结束后可导出本次记录进行对比。</p><p id="retention-info" class="microcopy">正在读取保留设置…</p></div>
+        </section>
+      </div>
+      <section class="records-section" aria-labelledby="records-title">
+        <div class="records-heading"><div><p class="eyebrow">03 / 观察结果</p><h2 id="records-title">请求记录 <span id="record-count" class="count">0</span></h2></div><div class="records-actions"><label class="auto-refresh"><input id="auto-refresh" type="checkbox" checked>自动刷新</label><button id="refresh-records" class="button secondary small" type="button">刷新</button><button id="export-records" class="button secondary small" type="button">导出 JSON</button><button id="clear-records" class="button quiet danger small" type="button">清空</button></div></div>
+        <div class="filter-bar"><input id="record-search" type="search" placeholder="搜索模型、路径或特性" aria-label="搜索请求记录"><select id="status-filter" aria-label="按状态筛选"><option value="all">全部状态</option><option value="success">成功</option><option value="error">错误</option><option value="pending">进行中</option></select><select id="feature-filter" aria-label="按特性筛选"><option value="all">全部特性</option></select><span id="last-updated" class="microcopy" aria-live="polite"></span></div>
+        <p id="records-error" class="inline-error" role="alert" hidden></p>
+        <div class="workspace card">
+          <div class="record-list-pane"><div id="record-list" class="record-list" aria-label="请求列表"><p class="empty-state">正在加载记录…</p></div><div class="pagination"><button id="previous-page" class="button quiet small" type="button" disabled>上一页</button><span id="page-info" class="microcopy">第 1 页</span><button id="next-page" class="button quiet small" type="button" disabled>下一页</button></div></div>
+          <section id="record-detail" class="record-detail" aria-label="请求详情"><div class="detail-placeholder"><span aria-hidden="true">↗</span><h3>选择一条记录</h3><p>查看请求、响应和 SSE 事件时间线。</p></div></section>
+        </div>
+      </section>
+    </div>
+  </main>
+  <footer>API 内容监控 · 原始记录仅用于你有权访问的接口对比</footer>
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

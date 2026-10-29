@@ -1,0 +1,34 @@
+# Local runtime state, observations and exported data.
+/data/
+/state.json
+/state.pending
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.jsonl
+/captures/
+/exports/
+/logs/
+*.log
+
+# Local credentials and environment settings.
+.env
+.env.*
+!.env.example
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python caches and virtual environments.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.venv/
+/venv/
