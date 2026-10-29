@@ -49,6 +49,9 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
+    Execution { client_tool: bool },
+    ExecutionSchema,
+    ExecutionSearch,
     Stalled,
     SlowHeaders,
     SlowErrorBody,
@@ -208,6 +211,39 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 let mut bytes = frame("assistantResponseEvent", json!({"content": "damaged"})).to_vec();
                 if matches!(mode, Mode::Truncated) { bytes.truncate(bytes.len() - 4); }
                 else { let last = bytes.len() - 1; bytes[last] ^= 1; }
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::ExecutionSearch) {
+                if request["jsonrpc"] == "2.0" {
+                    return axum::Json(json!({"jsonrpc":"2.0","id":request["id"],"result":{"isError":false,
+                        "content":[{"type":"text","text":json!({"results":[{"title":"Rust release","url":"https://example.test/rust","snippet":"search evidence"}]}).to_string()}]}})).into_response();
+                }
+                let mut bytes=if request.to_string().contains("No command was run.") {
+                    assert!(request.to_string().contains("search evidence"),"Search evidence was lost between bridge rounds");
+                    frame("assistantResponseEvent",json!({"content":"The search evidence was preserved; execution was unavailable."})).to_vec()
+                } else if request.to_string().contains("search evidence") {
+                    frame("toolUseEvent",json!({"name":"__kiro_server_bash_execution","toolUseId":"execution_1","input":"{\"command\":\"python3 -c 'print(35)'\"}","stop":true})).to_vec()
+                } else {
+                    frame("toolUseEvent",json!({"name":"web_search","toolUseId":"search_1","input":"{\"query\":\"rust release\"}","stop":true})).to_vec()
+                };
+                bytes.extend_from_slice(&frame("metadataEvent",json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
+                return Response::new(Body::from(bytes));
+            }
+            if matches!(mode, Mode::Execution { .. } | Mode::ExecutionSchema) {
+                let client_tool=matches!(mode, Mode::Execution { client_tool:true });
+                let mut bytes = if request.to_string().contains("No command was run.") {
+                    frame("assistantResponseEvent", json!({"content":if matches!(mode,Mode::ExecutionSchema) { "{\"ok\":true}" } else { "The execution backend is unavailable; no command was run." }})).to_vec()
+                } else {
+                    frame("toolUseEvent", json!({"name":"__kiro_server_bash_execution","toolUseId":"execution_1","input":"{\"command\":\"python3 -c 'print(5*7)'\"}","stop":true})).to_vec()
+                };
+                if matches!(mode,Mode::ExecutionSchema) && !request.to_string().contains("No command was run.") {
+                    let mut preface=frame("assistantResponseEvent",json!({"content":"I will try the tool first. "})).to_vec();
+                    preface.extend(bytes); bytes=preface;
+                }
+                if client_tool {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run","toolUseId":"client_1","input":"{\"command\":\"client action\"}","stop":true})));
+                }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
                 return Response::new(Body::from(bytes));
             }
             if matches!(mode, Mode::Tools) {
@@ -623,6 +659,127 @@ async fn gateway_unsupported_server_execution_and_invalid_schemas_never_reach_up
         );
         assert_eq!(f.calls.load(Ordering::Relaxed), 0);
     }
+}
+
+fn execution_request(streaming: bool) -> serde_json::Value {
+    json!({"model":"claude-opus-5-5","max_tokens":128,"stream":streaming,
+        "messages":[{"role":"user","content":"Use the server tool to compute five times seven"}],
+        "tools":[{"type":"code_execution_20250825","name":"code_execution"}]})
+}
+
+fn enable_execution_bridge(state: &AppState) {
+    state.protocol_compatibility.update_with_persistence(
+        crate::model::config::ProtocolCompatibilityConfig {
+            code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
+            search_incremental_streaming: true,
+            enabled_key_ids: vec![],
+        }, |_| Ok(())
+    ).unwrap();
+}
+
+#[tokio::test]
+async fn gateway_execution_bridge_returns_unavailable_and_continues_without_fabricating_success() {
+    for cc in [false,true] {
+        for streaming in [false,true] {
+            let f=fixture(Mode::Execution { client_tool:false }).await;
+            enable_execution_bridge(&f.state);
+            let response=compatibility_request(f.state.clone(),cc,execution_request(streaming)).await;
+            assert_eq!(response.status(),StatusCode::OK);
+            let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
+            let wire=String::from_utf8_lossy(&bytes);
+            assert!(wire.contains("bash_code_execution_tool_result_error"),"{wire}");
+            assert!(wire.contains("unavailable"),"{wire}");
+            assert!(wire.contains("no command was run"),"{wire}");
+            assert!(!wire.contains("return_code"),"{wire}");
+            assert!(!wire.contains("__kiro_server"),"{wire}");
+            assert_eq!(f.calls.load(Ordering::Relaxed),2);
+            let message=if streaming {
+                let events:Vec<serde_json::Value>=wire.lines().filter_map(|line|line.strip_prefix("data: ")).map(|line|serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(events.iter().filter(|e|e["type"]=="message_start").count(),1);
+                assert_eq!(events.iter().filter(|e|e["type"]=="message_stop").count(),1);
+                events.into_iter().find(|e|e["type"]=="message_delta").unwrap()
+            } else { serde_json::from_slice(&bytes).unwrap() };
+            assert_eq!(message["usage"]["input_tokens"],26);
+            assert_eq!(message["usage"]["output_tokens"],34);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_execution_declaration_does_not_invent_calls_and_scope_is_enforced() {
+    let f=fixture(Mode::Normal(Duration::ZERO)).await;
+    enable_execution_bridge(&f.state);
+    let response=compatibility_request(f.state.clone(),false,execution_request(false)).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("server_tool_use"));
+    assert_eq!(f.calls.load(Ordering::Relaxed),1);
+    f.state.protocol_compatibility.update_with_persistence(crate::model::config::ProtocolCompatibilityConfig {
+        code_execution_mode:crate::model::config::CodeExecutionMode::Bridge,
+        search_incremental_streaming:false,enabled_key_ids:vec![u64::MAX],
+    },|_|Ok(())).unwrap();
+    assert_eq!(compatibility_request(f.state.clone(),false,execution_request(false)).await.status(),StatusCode::BAD_REQUEST);
+    assert_eq!(f.calls.load(Ordering::Relaxed),1);
+}
+
+#[tokio::test]
+async fn gateway_execution_bridge_preserves_client_tool_turns() {
+    let f=fixture(Mode::Execution { client_tool:true }).await;
+    enable_execution_bridge(&f.state);
+    let mut request=execution_request(false);
+    request["tools"].as_array_mut().unwrap().push(json!({"name":"run","description":"A client action","input_schema":{"type":"object","properties":{"command":{"type":"string"}}}}));
+    let response=compatibility_request(f.state.clone(),false,request).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let message:serde_json::Value=serde_json::from_slice(&to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap();
+    assert_eq!(message["stop_reason"],"tool_use");
+    assert!(message["content"].as_array().unwrap().iter().any(|b|b["type"]=="tool_use" && b["name"]=="run"));
+    assert!(message["content"].as_array().unwrap().iter().any(|b|b["type"]=="bash_code_execution_tool_result"));
+    assert_eq!(f.calls.load(Ordering::Relaxed),1);
+}
+
+#[tokio::test]
+async fn gateway_execution_bridge_revalidates_the_aggregated_structured_answer() {
+    let f=fixture(Mode::ExecutionSchema).await;
+    enable_execution_bridge(&f.state);
+    let mut request=execution_request(false);
+    request["output_config"]=json!({"format":{"type":"json_schema","schema":{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}},"additionalProperties":false}}});
+    let response=compatibility_request(f.state.clone(),false,request).await;
+    assert_eq!(response.status(),StatusCode::BAD_GATEWAY);
+    let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("upstream_output_schema_error"));
+    assert_eq!(f.calls.load(Ordering::Relaxed),2);
+}
+
+#[tokio::test]
+async fn gateway_search_zero_budget_returns_tool_error_without_calling_search_backend() {
+    for streaming in [false,true] {
+        let f=fixture(Mode::Search).await;
+        let request=json!({"model":"claude-opus-5-5","max_tokens":128,"stream":streaming,
+            "messages":[{"role":"user","content":"Search for a rust release"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":0}]});
+        let response=compatibility_request(f.state.clone(),false,request).await;
+        assert_eq!(response.status(),StatusCode::OK);
+        let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("max_uses_exceeded"));
+        assert!(f.bodies.lock().iter().all(|body|body["jsonrpc"]!="2.0"));
+    }
+}
+
+#[tokio::test]
+async fn gateway_execution_and_search_preserve_context_and_search_budget_across_rounds() {
+    let f=fixture(Mode::ExecutionSearch).await;
+    enable_execution_bridge(&f.state);
+    let mut request=execution_request(false);
+    request["tools"].as_array_mut().unwrap().push(json!({"type":"web_search_20250305","name":"web_search","max_uses":1}));
+    let response=compatibility_request(f.state.clone(),false,request).await;
+    assert_eq!(response.status(),StatusCode::OK);
+    let message:serde_json::Value=serde_json::from_slice(&to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap();
+    let wire=message.to_string();
+    assert!(wire.contains("search evidence was preserved"),"{wire}");
+    assert!(wire.contains("bash_code_execution_tool_result_error"),"{wire}");
+    assert_eq!(message["usage"]["server_tool_use"]["web_search_requests"],1);
+    assert_eq!(f.bodies.lock().iter().filter(|body|body["jsonrpc"]=="2.0").count(),1);
+    assert_eq!(f.calls.load(Ordering::Relaxed),4);
 }
 
 #[tokio::test]

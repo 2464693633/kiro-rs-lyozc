@@ -805,18 +805,11 @@ async fn post_compatible_messages(
     mut payload: MessagesRequest,
     cc: bool,
 ) -> Response {
-    if payload.tools.as_ref().is_some_and(|tools| {
-        tools.iter().any(|tool| {
-            tool.tool_type
-                .as_deref()
-                .is_some_and(|kind| kind.starts_with("code_execution_"))
-        })
-    }) {
-        return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new(
-            "invalid_request_error",
-            "Server-side code_execution is unavailable: this gateway has no isolated execution backend. Use a client-executed custom tool instead.",
-        ))).into_response();
-    }
+    let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
+    let execution = match super::code_execution::prepare(&mut payload, compatibility.code_execution_mode) {
+        Ok(plan) => plan,
+        Err(message) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("invalid_request_error", message))).into_response(),
+    };
     let structured = match super::structured_output::prepare(&mut payload) {
         Ok(enabled) => enabled,
         Err(message) => {
@@ -833,6 +826,9 @@ async fn post_compatible_messages(
             Json(ErrorResponse::new("invalid_request_error", message)),
         )
             .into_response();
+    }
+    if let Some(plan) = execution {
+        return super::code_execution::run(state, key_ctx, payload, cc, plan).await;
     }
     let buffered_sse = structured && payload.stream;
     if buffered_sse {
@@ -861,7 +857,7 @@ pub async fn post_messages(
     post_compatible_messages(state, key_ctx, payload, false).await
 }
 
-async fn post_messages_inner(
+pub(super) async fn post_messages_inner(
     state: AppState,
     key_ctx: KeyContext,
     mut payload: MessagesRequest,
@@ -934,6 +930,7 @@ async fn post_messages_inner(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
+            state.protocol_compatibility_for_key(key_ctx.key_id).search_incremental_streaming,
         )
         .await;
     }
@@ -2107,7 +2104,7 @@ pub async fn post_messages_cc(
     post_compatible_messages(state, key_ctx, payload, true).await
 }
 
-async fn post_messages_cc_inner(
+pub(super) async fn post_messages_cc_inner(
     state: AppState,
     key_ctx: KeyContext,
     mut payload: MessagesRequest,
@@ -2168,6 +2165,7 @@ async fn post_messages_cc_inner(
             state.tool_compatibility_mode,
             state.cache_meter.clone(),
             key_ctx.key_id,
+            state.protocol_compatibility_for_key(key_ctx.key_id).search_incremental_streaming,
         )
         .await;
     }

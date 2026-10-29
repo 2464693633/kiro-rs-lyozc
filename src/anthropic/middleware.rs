@@ -52,6 +52,9 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// Runtime protocol settings, shared with the Admin control plane.
+    pub protocol_compatibility:
+        crate::model::protocol_compatibility::SharedProtocolCompatibility,
 }
 
 impl AppState {
@@ -70,13 +73,25 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            protocol_compatibility: Arc::new(
+                crate::model::protocol_compatibility::ProtocolCompatibilityRuntime::default(),
+            ),
         }
     }
 
     /// 注入可与 Admin 控制面共享的 KiroProvider。
     pub fn with_shared_kiro_provider(mut self, provider: Arc<KiroProvider>) -> Self {
+        self.protocol_compatibility = provider.token_manager().protocol_compatibility();
         self.kiro_provider = Some(provider);
         self
+    }
+
+    /// A nonmatching key scope always receives the conservative defaults.
+    pub fn protocol_compatibility_for_key(
+        &self,
+        key_id: u64,
+    ) -> crate::model::config::ProtocolCompatibilityConfig {
+        self.protocol_compatibility.for_key(key_id)
     }
 
     /// 注入用量记录组件

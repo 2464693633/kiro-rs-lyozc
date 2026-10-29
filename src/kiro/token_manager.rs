@@ -1218,6 +1218,8 @@ enum CachedModelSupport {
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: Config,
+    /// Live protocol settings shared by Admin and authenticated API requests.
+    protocol_compatibility: crate::model::protocol_compatibility::SharedProtocolCompatibility,
     /// 全局代理（运行时可修改）
     proxy: Mutex<Option<ProxyConfig>>,
     /// 凭据条目列表
@@ -1503,8 +1505,14 @@ impl MultiTokenManager {
         let self_heal_min_interval_secs = config.self_heal_min_interval_secs;
         let self_heal_max_consecutive_rounds = config.self_heal_max_consecutive_rounds;
         let quota_reset_recovery_enabled = config.quota_reset_recovery_enabled;
+        let protocol_compatibility = Arc::new(
+            crate::model::protocol_compatibility::ProtocolCompatibilityRuntime::new(
+                config.protocol_compatibility.clone(),
+            ),
+        );
         let manager = Self {
             config,
+            protocol_compatibility,
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
@@ -1573,6 +1581,27 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn protocol_compatibility(
+        &self,
+    ) -> crate::model::protocol_compatibility::SharedProtocolCompatibility {
+        self.protocol_compatibility.clone()
+    }
+
+    /// Persist first, then atomically publish to the shared runtime snapshot.
+    pub fn set_protocol_compatibility(
+        &self,
+        candidate: crate::model::config::ProtocolCompatibilityConfig,
+    ) -> anyhow::Result<crate::model::protocol_compatibility::ProtocolCompatibilitySnapshot> {
+        if self.config.config_path().is_none() {
+            anyhow::bail!("Protocol compatibility settings require a writable config file");
+        }
+        self.protocol_compatibility
+            .update_with_persistence(candidate, |config| {
+                let config = config.clone();
+                self.update_config_file(move |file| file.protocol_compatibility = config)
+            })
     }
 
     /// 串行执行一次 config.json 读改写，供所有 Admin 运行时配置入口复用。

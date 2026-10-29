@@ -79,6 +79,9 @@ enum EmptyToolResultDisposition {
 struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
+    /// Byte length of the stable visible prefix already delivered in this round.
+    /// Full text is retained for history, tool recovery and stop-reason handling.
+    streamed_prefix_bytes: usize,
     /// Accumulated thinking / reasoning text (Kiro reasoningContentEvent).
     /// Surfaced out-of-band via render_json's `kiro_thinking` so Anthropic
     /// clients never see (and never replay) an unsigned thinking block.
@@ -109,6 +112,91 @@ struct RoundOutcome {
     /// `ConversionResult::tool_name_map`. Used to restore the original tool name when a
     /// leaked `<invoke>` carries a shortened (>63 char) tool name.
     tool_name_map: std::collections::HashMap<String, String>,
+}
+
+/// Only plain, stable prefixes may leave the buffered tool-recovery path early.
+/// A possible XML tag or standalone invoke preamble falls back to the existing
+/// complete-round parser. Partial preambles are at most five bytes long; the
+/// gate stores an offset, not a second unbounded XML/tool buffer.
+#[derive(Default)]
+struct IncrementalTextPrefix {
+    emitted_bytes: usize,
+}
+
+impl IncrementalTextPrefix {
+    fn next<'a>(&mut self, accumulated: &'a str) -> &'a str {
+        // strip_tool_use_xml_leaks trims the final view; do not send leading or
+        // currently trailing whitespace which that final parser could remove.
+        let text = accumulated.trim_start();
+        let mut end = text.find('<').unwrap_or(text.len());
+        let mut offset = 0;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim();
+            let complete_line = line.ends_with('\n');
+            if ["call", "count", "card"].iter().any(|token| {
+                trimmed == *token
+                    || (!complete_line && !trimmed.is_empty() && token.starts_with(trimmed))
+            }) {
+                end = end.min(offset);
+                break;
+            }
+            offset += line.len();
+            if offset >= end {
+                break;
+            }
+        }
+        end = text[..end].trim_end().len();
+        if end <= self.emitted_bytes {
+            return "";
+        }
+        let delta = &text[self.emitted_bytes..end];
+        self.emitted_bytes = end;
+        delta
+    }
+}
+
+async fn append_assistant_text(
+    text: &mut String,
+    incremental: &mut IncrementalTextPrefix,
+    emitter: &mut Option<&mut WebSearchSseEmitter>,
+    part: &str,
+) {
+    text.push_str(part);
+    if let Some(emitter) = emitter.as_deref_mut() {
+        let delta = incremental.next(text);
+        if !delta.is_empty() {
+            emitter.text_delta(delta).await;
+        }
+    }
+}
+
+/// Remove only text already sent by the current round. Tool recovery and its
+/// deduplication run on the full text before this presentation-only operation.
+fn without_streamed_prefix(content: Vec<Value>, mut remaining: usize) -> Vec<Value> {
+    content
+        .into_iter()
+        .filter_map(|mut block| {
+            if remaining == 0 || block["type"] != "text" {
+                return Some(block);
+            }
+            let text = block["text"].as_str().unwrap_or("");
+            let consumed = remaining.min(text.len());
+            // Prefixes are measured at actual UTF-8 boundaries, including when
+            // the complete parser splits a narrative from an invoke block.
+            if !text.is_char_boundary(consumed) {
+                tracing::error!("web_search incremental text prefix lost UTF-8 alignment");
+                return Some(block);
+            }
+            remaining -= consumed;
+            let suffix = text[consumed..].to_string();
+            if suffix.is_empty() && block.get("citations").is_none() {
+                None
+            } else {
+                block["text"] = json!(suffix);
+                Some(block)
+            }
+        })
+        .collect()
 }
 
 impl RoundOutcome {
@@ -272,6 +360,7 @@ async fn decode_round(
     model: &str,
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
+    mut emitter: Option<&mut WebSearchSseEmitter>,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -289,6 +378,7 @@ async fn decode_round(
     let mut last_metering: Option<MeteringEvent> = None;
     let mut stop_reason_override: Option<String> = None;
     let mut stream_error = None;
+    let mut incremental = IncrementalTextPrefix::default();
 
     while let Some(chunk) = body_stream.next().await {
         let chunk = match chunk {
@@ -318,7 +408,10 @@ async fn decode_round(
                 Err(_) => continue,
             };
             match event {
-                Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::AssistantResponse(resp) => {
+                    append_assistant_text(&mut text, &mut incremental, &mut emitter, &resp.content)
+                        .await;
+                }
                 Event::ReasoningContent(r) => {
                     if let Some(t) = &r.text {
                         thinking.push_str(t);
@@ -386,9 +479,13 @@ async fn decode_round(
 
     // 剥离混入文本的字面 <tool_use> XML 泄漏（与非流式同口径）。
     let text = crate::kiro::model::events::strip_tool_use_xml_leaks(&text);
+    if let Some(emitter) = emitter.as_deref_mut() {
+        emitter.close_text().await;
+    }
 
     RoundOutcome {
         text,
+        streamed_prefix_bytes: incremental.emitted_bytes,
         thinking,
         tool_uses,
         context_input_tokens,
@@ -427,6 +524,7 @@ async fn run_round(
     tracer: &RequestTracer,
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
+    emitter: Option<&mut WebSearchSseEmitter>,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -516,6 +614,7 @@ async fn run_round(
         &payload.model,
         &conversion.tool_name_map,
         tracer,
+        emitter,
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -577,9 +676,17 @@ fn append_search_round(
     for (tu, results) in round.tool_uses.iter().zip(searched.iter()) {
         let query = tool_query(tu).unwrap_or_default();
         let summary = websearch::generate_search_summary(&query, results);
-        user_content.push(json!({
+        let mut feedback = json!({
             "type": "tool_result", "tool_use_id": tu.id, "content": summary
-        }));
+        });
+        if results
+            .as_ref()
+            .and_then(|results| results.error.as_deref())
+            == Some("max_uses_exceeded")
+        {
+            feedback["is_error"] = json!(true);
+        }
+        user_content.push(feedback);
 
         // Client presentation: server_tool_use + web_search_tool_result (Contract A)
         let (srv_id, _mcp) = websearch::create_mcp_request(&query);
@@ -590,7 +697,7 @@ fn append_search_round(
         presentation.push(json!({
             "type": "web_search_tool_result",
             "tool_use_id": srv_id,
-            "content": build_result_block(results)
+            "content": search_result_content(results)
         }));
     }
     payload.messages.push(Message {
@@ -621,6 +728,38 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
             .collect(),
         None => vec![],
     }
+}
+
+fn search_result_content(results: &Option<WebSearchResults>) -> Value {
+    if results
+        .as_ref()
+        .and_then(|results| results.error.as_deref())
+        == Some("max_uses_exceeded")
+    {
+        json!({
+            "type": "web_search_tool_result_error",
+            "error_code": "max_uses_exceeded"
+        })
+    } else {
+        json!(build_result_block(results))
+    }
+}
+
+fn reserve_search_call(requests: &mut u32, limit: Option<u32>) -> bool {
+    if limit.is_some_and(|limit| *requests >= limit) {
+        return false;
+    }
+    *requests = requests.saturating_add(1);
+    true
+}
+
+fn max_uses_exceeded(query: &str) -> Option<WebSearchResults> {
+    Some(WebSearchResults {
+        results: Vec::new(),
+        total_results: Some(0),
+        query: Some(query.to_string()),
+        error: Some("max_uses_exceeded".to_string()),
+    })
 }
 
 /// Splits a round's tool_uses into (web_search calls, client tool calls),
@@ -787,7 +926,7 @@ fn build_flush_content(
             content.push(json!({
                 "type": "web_search_tool_result",
                 "tool_use_id": srv_id,
-                "content": build_result_block(results)
+                "content": search_result_content(results)
             }));
         } else {
             // Client tool (exec, get_time, ...): returned to the client verbatim.
@@ -952,6 +1091,7 @@ struct WebSearchSseEmitter {
     next_block_index: i32,
     active_blocks: BTreeSet<i32>,
     terminal: bool,
+    text_block: Option<i32>,
 }
 
 impl WebSearchSseEmitter {
@@ -961,6 +1101,7 @@ impl WebSearchSseEmitter {
             next_block_index: 0,
             active_blocks: BTreeSet::new(),
             terminal: false,
+            text_block: None,
         }
     }
 
@@ -975,7 +1116,46 @@ impl WebSearchSseEmitter {
         }
     }
 
+    async fn text_delta(&mut self, text: &str) {
+        if text.is_empty() || self.terminal {
+            return;
+        }
+        let index = if let Some(index) = self.text_block {
+            index
+        } else {
+            let index = self.next_block_index;
+            self.next_block_index += 1;
+            self.active_blocks.insert(index);
+            self.text_block = Some(index);
+            self.send(SseEvent::new(
+                "content_block_start",
+                json!({"type":"content_block_start","index":index,
+                       "content_block":{"type":"text","text":""}}),
+            ))
+            .await;
+            index
+        };
+        self.send(SseEvent::new(
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":index,
+                   "delta":{"type":"text_delta","text":text}}),
+        ))
+        .await;
+    }
+
+    async fn close_text(&mut self) {
+        if let Some(index) = self.text_block.take() {
+            self.active_blocks.remove(&index);
+            self.send(SseEvent::new(
+                "content_block_stop",
+                json!({"type":"content_block_stop","index":index}),
+            ))
+            .await;
+        }
+    }
+
     async fn begin_search(&mut self, query: &str) -> PendingWebSearch {
+        self.close_text().await;
         let block_index = self.next_block_index;
         self.next_block_index += 1;
         self.active_blocks.insert(block_index);
@@ -1044,7 +1224,7 @@ impl WebSearchSseEmitter {
                 "content_block": {
                     "type": "web_search_tool_result",
                     "tool_use_id": pending.tool_use_id,
-                    "content": build_result_block(results)
+                    "content": search_result_content(results)
                 }
             }),
         ))
@@ -1069,6 +1249,7 @@ impl WebSearchSseEmitter {
         metering: Option<&MeteringEvent>,
         web_search_requests: u32,
     ) {
+        self.close_text().await;
         let content = without_web_search_presentation(content);
         let (mut events, next_index) = build_sse_content_events(&content, self.next_block_index);
         self.next_block_index = next_index;
@@ -1123,6 +1304,7 @@ impl WebSearchSseEmitter {
             return;
         }
         let active_blocks = std::mem::take(&mut self.active_blocks);
+        self.text_block = None;
         for index in active_blocks {
             self.send(SseEvent::new(
                 "content_block_stop",
@@ -1278,6 +1460,7 @@ async fn execute_web_search(
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
     web_search_requests: &mut u32,
+    max_uses: Option<u32>,
 ) -> anyhow::Result<Option<WebSearchResults>> {
     let query = tool_query(tool_use);
     let pending = if let Some(emitter) = emitter.as_deref_mut() {
@@ -1292,7 +1475,13 @@ async fn execute_web_search(
         // Count one logical server-tool invocation, including an empty result.
         // Provider retries are part of that invocation; malformed inputs never
         // call MCP and therefore must not increase this counter.
-        *web_search_requests = web_search_requests.saturating_add(1);
+        if !reserve_search_call(web_search_requests, max_uses) {
+            let result = max_uses_exceeded(&query);
+            if let (Some(emitter), Some(pending)) = (emitter.as_deref_mut(), pending) {
+                emitter.complete_search(pending, &result).await;
+            }
+            return Ok(result);
+        }
         match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group).await {
             Ok(response) => websearch::parse_search_results(&response),
             Err(error) if websearch::is_no_results_mcp_error(&error) => {
@@ -1371,7 +1560,17 @@ pub(super) async fn run_web_search_loop(
     tool_compatibility_mode: ToolCompatibilityMode,
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
+    incremental_streaming: bool,
 ) -> Response {
+    if let Err(message) = websearch::max_uses_limit(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new("invalid_request_error", message)),
+        )
+            .into_response();
+    }
+    let incremental_streaming =
+        incremental_streaming && super::structured_output::format(&payload).is_none();
     if !stream_client {
         return run_web_search_loop_inner(
             provider,
@@ -1383,6 +1582,7 @@ pub(super) async fn run_web_search_loop(
             cache_meter,
             key_id,
             None,
+            false,
         )
         .await;
     }
@@ -1408,6 +1608,7 @@ pub(super) async fn run_web_search_loop(
                 cache_meter,
                 key_id,
                 Some(&mut emitter),
+                incremental_streaming,
             ))
             .catch_unwind(),
         )
@@ -1450,12 +1651,14 @@ async fn run_web_search_loop_inner(
     cache_meter: Option<SharedCacheMeter>,
     key_id: u64,
     mut emitter: Option<&mut WebSearchSseEmitter>,
+    incremental_streaming: bool,
 ) -> Response {
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
     let mut web_search_requests = 0u32;
+    let max_uses = websearch::max_uses_limit(&payload).unwrap_or(None);
     let expose_thinking = payload
         .thinking
         .as_ref()
@@ -1484,6 +1687,11 @@ async fn run_web_search_loop_inner(
                 tracer.as_ref(),
                 group.as_deref(),
                 tool_compatibility_mode,
+                if incremental_streaming {
+                    emitter.as_deref_mut()
+                } else {
+                    None
+                },
             )
             .await
             {
@@ -1591,6 +1799,7 @@ async fn run_web_search_loop_inner(
                     false,
                     &mut emitter,
                     &mut web_search_requests,
+                    max_uses,
                 )
                 .await
                 {
@@ -1636,6 +1845,7 @@ async fn run_web_search_loop_inner(
                     true,
                     &mut emitter,
                     &mut web_search_requests,
+                    max_uses,
                 )
                 .await
                 {
@@ -1703,7 +1913,7 @@ async fn run_web_search_loop_inner(
         return if let Some(emitter) = emitter.as_deref_mut() {
             emitter
                 .finish(
-                    content,
+                    without_streamed_prefix(content, round.streamed_prefix_bytes),
                     &stop_reason,
                     final_usage,
                     visible_thinking,
@@ -2001,6 +2211,208 @@ mod tests {
         events
     }
 
+    #[tokio::test]
+    async fn incremental_plain_text_arrives_before_the_next_upstream_chunk() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let (continue_sender, continue_receiver) = tokio::sync::oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let mut emitter = WebSearchSseEmitter::new(sender);
+            let mut raw = String::new();
+            let mut prefix = IncrementalTextPrefix::default();
+            append_assistant_text(
+                &mut raw,
+                &mut prefix,
+                &mut Some(&mut emitter),
+                "First sentence.",
+            )
+            .await;
+            // Stand in for the provider awaiting the next generated bytes. The
+            // consumer must already see the first delta before releasing this.
+            continue_receiver.await.unwrap();
+            append_assistant_text(
+                &mut raw,
+                &mut prefix,
+                &mut Some(&mut emitter),
+                " Second sentence.",
+            )
+            .await;
+            emitter.close_text().await;
+            emitter
+                .finish(
+                    without_streamed_prefix(
+                        vec![json!({"type":"text","text":raw})],
+                        prefix.emitted_bytes,
+                    ),
+                    "end_turn",
+                    TokenUsage::default(),
+                    "",
+                    None,
+                    0,
+                )
+                .await;
+        });
+        let start = decode_sse(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(start.0, "content_block_start");
+        let first = decode_sse(
+            tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(first.1["delta"]["text"], "First sentence.");
+        assert!(
+            !producer.is_finished(),
+            "first text must arrive while generation is still pending"
+        );
+        continue_sender.send(()).unwrap();
+        producer.await.unwrap();
+        let remaining = drain_sse(&mut receiver);
+        let texts: Vec<_> = remaining
+            .iter()
+            .filter_map(|(_, data)| data["delta"]["text"].as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![" Second sentence."],
+            "final flush must not repeat streamed text"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|(event, _)| event == "content_block_stop")
+                .count(),
+            1
+        );
+        assert_eq!(remaining.last().unwrap().0, "message_stop");
+    }
+
+    #[test]
+    fn incremental_prefix_keeps_split_xml_and_invoke_preambles_for_the_existing_parser() {
+        for pieces in [
+            vec![
+                " 你好。\nca",
+                "ll\n<inv",
+                "oke name=\"exec\"><parameter name=\"cmd\">pwd</parameter></invoke>",
+            ],
+            vec![
+                " 你好。 ",
+                "<tool_",
+                "use name=\"exec\">hidden</tool_use> 完成。",
+            ],
+            vec![
+                " 你好。\n```xml\n",
+                "<invoke name=\"exec\">example</invoke>\n```",
+            ],
+        ] {
+            let mut raw = String::new();
+            let mut prefix = IncrementalTextPrefix::default();
+            let mut delivered = String::new();
+            for piece in pieces {
+                raw.push_str(piece);
+                delivered.push_str(prefix.next(&raw));
+            }
+            assert!(!delivered.contains('<'));
+            assert!(!delivered.contains("call"));
+            let sanitized = crate::kiro::model::events::strip_tool_use_xml_leaks(&raw);
+            let complete =
+                build_flush_content(vec![], &sanitized, &[], &[], &names(&["exec"]), &nomap());
+            let expected: String = complete
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            let remaining = without_streamed_prefix(complete.clone(), prefix.emitted_bytes);
+            let rest: String = remaining
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect();
+            assert_eq!(
+                delivered + &rest,
+                expected,
+                "incremental and buffered text must agree"
+            );
+            let complete_tools: Vec<_> = complete
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect();
+            let remaining_tools: Vec<_> = remaining
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .collect();
+            assert_eq!(complete_tools, remaining_tools);
+            assert_eq!(
+                resolve_flush_stop_reason(None, true, &complete),
+                resolve_flush_stop_reason(None, true, &remaining)
+            );
+        }
+    }
+
+    #[test]
+    fn search_budget_is_shared_across_rounds_and_denials_do_not_consume_calls() {
+        let mut requests = 0;
+        assert!(!reserve_search_call(&mut requests, Some(0)));
+        assert_eq!(requests, 0);
+        assert!(reserve_search_call(&mut requests, Some(2)));
+        assert!(reserve_search_call(&mut requests, Some(2)));
+        assert!(!reserve_search_call(&mut requests, Some(2)));
+        assert!(!reserve_search_call(&mut requests, Some(2)));
+        assert_eq!(requests, 2);
+        assert!(reserve_search_call(&mut requests, None));
+        assert_eq!(requests, 3);
+    }
+
+    #[tokio::test]
+    async fn max_uses_error_keeps_result_id_and_is_an_error_in_model_history() {
+        let results = max_uses_exceeded("Rust");
+        assert_eq!(
+            search_result_content(&results),
+            json!({
+                "type":"web_search_tool_result_error","error_code":"max_uses_exceeded"
+            })
+        );
+        let mut payload = payload_with_last_block(json!({"type":"text","text":"search"}));
+        let mut presentation = Vec::new();
+        append_search_round(
+            &mut payload,
+            &round_outcome("", vec![tu("web_search")]),
+            &[results],
+            &mut presentation,
+        );
+        assert_eq!(presentation[1]["tool_use_id"], presentation[0]["id"]);
+        assert_eq!(
+            presentation[1]["content"]["error_code"],
+            "max_uses_exceeded"
+        );
+        let feedback = &payload.messages.last().unwrap().content[0];
+        assert_eq!(feedback["is_error"], true);
+        assert!(
+            feedback["content"]
+                .as_str()
+                .unwrap()
+                .contains("not executed")
+        );
+
+        let (sender, mut receiver) = mpsc::channel(8);
+        let mut emitter = WebSearchSseEmitter::new(sender);
+        let pending = emitter.begin_search("Rust").await;
+        emitter
+            .complete_search(pending, &max_uses_exceeded("Rust"))
+            .await;
+        let events = drain_sse(&mut receiver);
+        assert_eq!(
+            events[2].1["content_block"]["tool_use_id"],
+            events[0].1["content_block"]["id"]
+        );
+        assert_eq!(
+            events[2].1["content_block"]["content"]["error_code"],
+            "max_uses_exceeded"
+        );
+    }
+
     fn tu(name: &str) -> CompletedToolUse {
         CompletedToolUse {
             id: format!("toolu_{}", name),
@@ -2247,7 +2659,10 @@ mod tests {
             .find(|data| data["content_block"]["type"] == "web_search_tool_result")
             .unwrap()["content_block"]["tool_use_id"];
         assert!(srv_id.is_string());
-        assert_eq!(result_ref, srv_id, "streamed result must reference its server_tool_use");
+        assert_eq!(
+            result_ref, srv_id,
+            "streamed result must reference its server_tool_use"
+        );
 
         let stops: Vec<i64> = events
             .iter()
@@ -2497,6 +2912,7 @@ mod tests {
     fn round_outcome(text: &str, tool_uses: Vec<CompletedToolUse>) -> RoundOutcome {
         RoundOutcome {
             text: text.to_string(),
+            streamed_prefix_bytes: 0,
             thinking: String::new(),
             tool_uses,
             context_input_tokens: None,
@@ -2803,7 +3219,10 @@ mod tests {
             .iter()
             .find(|c| c["type"] == "web_search_tool_result")
             .unwrap();
-        assert_eq!(res["tool_use_id"], srv["id"], "result must reference its server_tool_use");
+        assert_eq!(
+            res["tool_use_id"], srv["id"],
+            "result must reference its server_tool_use"
+        );
         assert!(
             content
                 .iter()

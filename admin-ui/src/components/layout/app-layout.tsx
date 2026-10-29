@@ -18,6 +18,7 @@ import {
   Globe,
   PackageOpen,
   ShieldCheck,
+  Wrench,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -94,6 +95,7 @@ export const TABS: readonly TabItem[] = [
       { key: "models", label: "模型配置", icon: Cpu },
       { key: "network", label: "网络代理", icon: Globe },
       { key: "log", label: "日志治理", icon: ScrollText },
+      { key: "protocol", label: "协议兼容", icon: Wrench },
       { key: "system", label: "系统更新", icon: PackageOpen },
       { key: "security", label: "安全防护", icon: ShieldCheck },
     ],

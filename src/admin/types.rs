@@ -627,6 +627,45 @@ pub struct LogGovernanceConfigResponse {
     pub usage_log_retention_days: u32,
 }
 
+/// Complete replacement of the opt-in protocol compatibility settings.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetProtocolCompatibilityRequest {
+    pub code_execution_mode: crate::model::config::CodeExecutionMode,
+    pub search_incremental_streaming: bool,
+    pub enabled_key_ids: Vec<u64>,
+}
+
+impl From<SetProtocolCompatibilityRequest> for crate::model::config::ProtocolCompatibilityConfig {
+    fn from(value: SetProtocolCompatibilityRequest) -> Self {
+        Self {
+            code_execution_mode: value.code_execution_mode,
+            search_incremental_streaming: value.search_incremental_streaming,
+            enabled_key_ids: value.enabled_key_ids,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolCompatibilityDiagnostics {
+    pub code_execution_backend: &'static str,
+    pub system_transport: &'static str,
+    pub signature_replay: &'static str,
+    pub module_version: &'static str,
+    pub gateway_version: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolCompatibilityConfigResponse {
+    #[serde(flatten)]
+    pub config: crate::model::config::ProtocolCompatibilityConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    pub diagnostics: ProtocolCompatibilityDiagnostics,
+}
+
 /// 更新日志治理配置（字段缺省表示不修改）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

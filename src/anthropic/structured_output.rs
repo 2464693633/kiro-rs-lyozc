@@ -135,7 +135,7 @@ pub(super) async fn as_sse(response: Response) -> Response {
     response
 }
 
-fn sse_events(message: &Value) -> Vec<SseEvent> {
+pub(super) fn sse_events(message: &Value) -> Vec<SseEvent> {
     let mut start = message.clone();
     start["content"] = json!([]);
     start["stop_reason"] = Value::Null;
@@ -154,7 +154,7 @@ fn sse_events(message: &Value) -> Vec<SseEvent> {
                     start["text"] = json!("");
                     deltas.push(json!({"type":"text_delta","text":block["text"]}));
                 }
-                Some("tool_use") => {
+                Some("tool_use" | "server_tool_use") => {
                     start["input"] = json!({});
                     deltas.push(json!({"type":"input_json_delta","partial_json":block["input"].to_string()}));
                 }

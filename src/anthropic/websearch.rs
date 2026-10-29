@@ -117,6 +117,22 @@ fn is_native_web_search_tool(t: &crate::anthropic::types::Tool) -> bool {
             .is_some_and(|typ| typ.starts_with("web_search_"))
 }
 
+/// Request-wide budget for the declared native search tool. Zero explicitly
+/// disables execution while still allowing the model to receive a tool error.
+pub(crate) fn max_uses_limit(req: &MessagesRequest) -> Result<Option<u32>, String> {
+    let Some(limit) = req.tools.as_ref().and_then(|tools| {
+        tools
+            .iter()
+            .find(|tool| is_native_web_search_tool(tool))
+            .and_then(|tool| tool.max_uses)
+    }) else {
+        return Ok(None);
+    };
+    u32::try_from(limit)
+        .map(Some)
+        .map_err(|_| "web_search.max_uses must be a non-negative integer".to_string())
+}
+
 /// 检查请求是否为纯 WebSearch 请求
 ///
 /// 条件：tools 有且只有一个，且为 Anthropic 原生 web_search 工具。
@@ -456,6 +472,13 @@ fn generate_websearch_events(
 
 /// 生成搜索结果摘要
 pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
+    if results
+        .as_ref()
+        .and_then(|results| results.error.as_deref())
+        == Some("max_uses_exceeded")
+    {
+        return "Web search was not executed: max_uses_exceeded. The request's web_search usage limit has been reached; answer using the results already available.".to_string();
+    }
     let mut summary = format!("Here are the search results for \"{}\":\n\n", query);
 
     if let Some(results) = results {
@@ -636,6 +659,23 @@ pub(crate) fn is_no_results_mcp_error(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_search_max_uses_accepts_zero_and_rejects_negative_limits() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5-5", "max_tokens":32,
+            "messages":[{"role":"user","content":"search"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":0}]
+        }))
+        .unwrap();
+        assert_eq!(max_uses_limit(&payload).unwrap(), Some(0));
+        payload.tools.as_mut().unwrap()[0].max_uses = Some(2);
+        assert_eq!(max_uses_limit(&payload).unwrap(), Some(2));
+        payload.tools.as_mut().unwrap()[0].max_uses = Some(-1);
+        assert!(max_uses_limit(&payload).is_err());
+        payload.tools.as_mut().unwrap()[0].max_uses = None;
+        assert_eq!(max_uses_limit(&payload).unwrap(), None);
+    }
 
     #[test]
     fn test_mcp_rate_limit_is_not_converted_to_empty_results() {
@@ -986,7 +1026,10 @@ mod tests {
             .iter()
             .find(|e| e.data["content_block"]["type"] == "web_search_tool_result")
             .expect("web_search_tool_result block");
-        assert_eq!(result_block.data["content_block"]["tool_use_id"], "srvtoolu_abc");
+        assert_eq!(
+            result_block.data["content_block"]["tool_use_id"],
+            "srvtoolu_abc"
+        );
 
         let content = build_websearch_content("q", "srvtoolu_abc", &None);
         let block = content

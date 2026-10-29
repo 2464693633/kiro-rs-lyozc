@@ -20,6 +20,7 @@ use super::{
         get_current_models, get_global_proxy, get_custom_models,
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
+        get_protocol_compatibility,
         get_proxy_pool, get_quota_reset_recovery_config, get_self_heal_config, get_update_config, list_client_keys, list_groups,
         list_traces, poll_idc_login,
         poll_idc_relogin, poll_social_login, poll_social_relogin, pull_update_image,
@@ -30,6 +31,7 @@ use super::{
         set_credential_priority, set_custom_models, set_global_proxy, set_load_balancing_mode,
         set_api_domain, set_cache_metering_config, set_session_affinity_config,
         set_log_governance_config, set_model_api_retry_config, set_proxy_enabled, set_quota_reset_recovery_config,
+        set_protocol_compatibility,
         set_self_heal_config, set_update_config, start_idc_login, start_idc_relogin,
         start_social_login, start_social_relogin,
         stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
@@ -151,6 +153,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
             get(get_cache_metering_config).put(set_cache_metering_config),
         )
         .route(
+            "/protocol-compatibility",
+            get(get_protocol_compatibility).put(set_protocol_compatibility),
+        )
+        .route(
             "/config/session-affinity",
             get(get_session_affinity_config).put(set_session_affinity_config),
         )
@@ -240,4 +246,134 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .merge(authenticated)
         .layer(DefaultBodyLimit::max(MAX_ADMIN_BODY_SIZE))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod protocol_compatibility_tests {
+    use std::sync::Arc;
+
+    use axum::http::StatusCode;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::admin::{AdminService, ClientKeyManager, GroupManager, TraceStore, UsageAggregator};
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::{CodeExecutionMode, Config};
+
+    struct FixtureFile(std::path::PathBuf);
+    impl Drop for FixtureFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn protocol_compatibility_api_persists_before_publishing_and_is_admin_only() {
+        let file = FixtureFile(std::env::temp_dir().join(format!(
+            "kiro-protocol-compatibility-{}.json",
+            uuid::Uuid::new_v4()
+        )));
+        std::fs::write(&file.0, r#"{"region":"eu-central-1"}"#).unwrap();
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::load(&file.0).unwrap(), Vec::new(), None, None, false)
+                .unwrap(),
+        );
+        let runtime = manager.protocol_compatibility();
+        let keys = Arc::new(ClientKeyManager::new());
+        keys.create_with_key(
+            "fixture".into(),
+            None,
+            None,
+            "fixture-client-key".into(),
+        );
+        let state = AdminState::new(
+            "fixture-admin-key",
+            AdminService::new(manager, Vec::<String>::new()),
+            keys,
+            Arc::new(UsageAggregator::new()),
+            Arc::new(TraceStore::open_in_memory().unwrap()),
+            Arc::new(GroupManager::new()),
+        );
+        let app = create_admin_router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/protocol-compatibility",
+            listener.local_addr().unwrap()
+        );
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for key in [None, Some("fixture-client-key")] {
+            let mut request = client.get(&url);
+            if let Some(key) = key {
+                request = request.header("x-api-key", key);
+            }
+            assert_eq!(request.send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        let auth_get = || client.get(&url).header("x-api-key", "fixture-admin-key");
+        let initial: Value = auth_get().send().await.unwrap().json().await.unwrap();
+        assert_eq!(initial["codeExecutionMode"], "reject");
+        assert_eq!(initial["searchIncrementalStreaming"], false);
+        assert_eq!(initial["enabledKeyIds"], json!([]));
+        assert_eq!(initial["diagnostics"]["codeExecutionBackend"], "unavailable");
+        assert_eq!(initial["diagnostics"]["systemTransport"], "conversation_history");
+        assert_eq!(initial["diagnostics"]["signatureReplay"], "unsupported");
+        assert!(initial["diagnostics"]["moduleVersion"].is_string());
+        let candidate = json!({
+            "codeExecutionMode":"bridge",
+            "searchIncrementalStreaming":true,
+            "enabledKeyIds":[7,3,7]
+        });
+        let response = client
+            .put(&url)
+            .header("x-api-key", "fixture-admin-key")
+            .json(&candidate)
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value = response.json().await.unwrap();
+        assert_eq!(saved["enabledKeyIds"], json!([3,7]));
+        assert!(saved["updatedAt"].is_string());
+        assert_eq!(runtime.for_key(7).code_execution_mode, CodeExecutionMode::Bridge);
+        assert!(runtime.for_key(3).search_incremental_streaming);
+        assert!(!runtime.for_key(8).search_incremental_streaming);
+        let persisted = Config::load(&file.0).unwrap();
+        assert_eq!(persisted.region, "eu-central-1");
+        assert_eq!(persisted.protocol_compatibility.enabled_key_ids, vec![3,7]);
+        let restarted = MultiTokenManager::new(persisted, Vec::new(), None, None, false).unwrap();
+        assert_eq!(restarted.protocol_compatibility().for_key(7), runtime.for_key(7));
+        for invalid in [json!({}), json!({"codeExecutionMode":"fake","searchIncrementalStreaming":true,"enabledKeyIds":[]})] {
+            assert_eq!(client.put(&url).header("x-api-key", "fixture-admin-key").json(&invalid)
+                .send().await.unwrap().status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        std::fs::write(&file.0, "invalid json").unwrap();
+        let response = client.put(&url).header("x-api-key", "fixture-admin-key")
+            .json(&json!({"codeExecutionMode":"reject","searchIncrementalStreaming":false,"enabledKeyIds":[]}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(runtime.for_key(7).code_execution_mode, CodeExecutionMode::Bridge);
+        let after_failure: Value = auth_get().send().await.unwrap().json().await.unwrap();
+        assert_eq!(after_failure, saved);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn protocol_compatibility_without_a_persistence_path_does_not_enable_features() {
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), Vec::new(), None, None, false).unwrap(),
+        );
+        let runtime = manager.protocol_compatibility();
+        let service = AdminService::new(manager, Vec::<String>::new());
+        let request = super::super::types::SetProtocolCompatibilityRequest {
+            code_execution_mode: CodeExecutionMode::Bridge,
+            search_incremental_streaming: true,
+            enabled_key_ids: Vec::new(),
+        };
+        assert!(service.set_protocol_compatibility(request).is_err());
+        assert_eq!(runtime.for_key(1).code_execution_mode, CodeExecutionMode::Reject);
+        assert!(!runtime.for_key(1).search_incremental_streaming);
+        assert!(runtime.snapshot().updated_at.is_none());
+    }
 }

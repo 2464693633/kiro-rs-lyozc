@@ -3,3 +3,4 @@
 pub mod arg;
 pub mod config;
 pub mod custom_models;
+pub mod protocol_compatibility;

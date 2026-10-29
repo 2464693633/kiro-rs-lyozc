@@ -55,6 +55,8 @@ use super::types::{
     SetUpdateConfigRequest, StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest,
     StartSocialLoginResponse, UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest,
     UpdateRefreshTokenRequest,
+    ProtocolCompatibilityConfigResponse, ProtocolCompatibilityDiagnostics,
+    SetProtocolCompatibilityRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -724,6 +726,39 @@ impl AdminService {
     ) -> Self {
         self.cache_meter = Some(cache_meter);
         self
+    }
+
+    pub fn get_protocol_compatibility(&self) -> ProtocolCompatibilityConfigResponse {
+        Self::protocol_compatibility_response(
+            self.token_manager.protocol_compatibility().snapshot(),
+        )
+    }
+
+    pub fn set_protocol_compatibility(
+        &self,
+        request: SetProtocolCompatibilityRequest,
+    ) -> Result<ProtocolCompatibilityConfigResponse, AdminServiceError> {
+        let snapshot = self
+            .token_manager
+            .set_protocol_compatibility(request.into())
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(Self::protocol_compatibility_response(snapshot))
+    }
+
+    fn protocol_compatibility_response(
+        snapshot: crate::model::protocol_compatibility::ProtocolCompatibilitySnapshot,
+    ) -> ProtocolCompatibilityConfigResponse {
+        ProtocolCompatibilityConfigResponse {
+            config: snapshot.config,
+            updated_at: snapshot.updated_at,
+            diagnostics: ProtocolCompatibilityDiagnostics {
+                code_execution_backend: "unavailable",
+                system_transport: "conversation_history",
+                signature_replay: "unsupported",
+                module_version: crate::model::protocol_compatibility::MODULE_VERSION,
+                gateway_version: env!("CARGO_PKG_VERSION"),
+            },
+        }
     }
 
     /// 查询 prompt cache 计量模拟配置与运行指标。

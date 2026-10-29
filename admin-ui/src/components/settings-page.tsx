@@ -6,6 +6,7 @@ import {
   PackageOpen,
   ShieldCheck,
   Tags,
+  Wrench,
 } from 'lucide-react'
 import { PageHeader } from '@/components/console/page-header'
 import { Badge } from '@/components/ui/badge'
@@ -19,6 +20,7 @@ import { SystemSection } from '@/components/settings/system-section'
 import { SecuritySection } from '@/components/settings/security-section'
 import { MetadataSection } from '@/components/settings/metadata-section'
 import { ModelsSection } from '@/components/settings/models-section'
+import { ProtocolSection } from '@/components/settings/protocol-section'
 
 /**
  * 设置页 —— 把此前散在三处的 7 个配置端点收拢到一处。
@@ -31,7 +33,7 @@ import { ModelsSection } from '@/components/settings/models-section'
  * 一次点击就该切换完；但参数（冷却时长、连续上限、保留天数这些）全部移到这里 ——
  * 下拉菜单里塞数字输入框本来就不是它该干的事。
  */
-type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'system' | 'security'
+type SectionKey = 'dispatch' | 'metadata' | 'network' | 'log' | 'models' | 'protocol' | 'system' | 'security'
 
 const SECTIONS: {
   key: SectionKey
@@ -64,6 +66,11 @@ const SECTIONS: {
     icon: <Cpu className="h-4 w-4" />,
   },
   {
+    key: 'protocol',
+    label: '协议兼容',
+    icon: <Wrench className="h-4 w-4" />,
+  },
+  {
     key: 'system',
     label: '系统',
     icon: <PackageOpen className="h-4 w-4" />,
@@ -93,10 +100,12 @@ export function SettingsPage() {
         ]}
         icon={activeMeta.icon}
         title={`设置 · ${activeMeta.label}`}
-        description="所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。"
+        description={active === 'protocol'
+          ? '保存后按客户端 Key 范围应用；当前生效值与能力诊断直接读取服务器。'
+          : '所有改动即时生效并直接落盘写入 config.json，无需重启服务进程。'}
         badge={
           <Badge variant="outline" className="font-mono text-xs">
-            热重载就绪
+            {active === 'protocol' ? '按 Key 生效' : '热重载就绪'}
           </Badge>
         }
       />
@@ -135,6 +144,7 @@ export function SettingsPage() {
             {active === 'models' && <ModelsSection />}
             {active === 'network' && <NetworkSection />}
             {active === 'log' && <LogSection />}
+            {active === 'protocol' && <ProtocolSection />}
             {active === 'system' && <SystemSection />}
             {active === 'security' && <SecuritySection />}
           </CardContent>

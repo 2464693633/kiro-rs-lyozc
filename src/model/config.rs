@@ -52,6 +52,42 @@ pub enum ToolCompatibilityMode {
     Raw,
 }
 
+/// Server-side code execution remains unavailable. `Bridge` preserves the
+/// server-tool protocol and reports an unavailable tool result without running
+/// user code or claiming a sandbox backend.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeExecutionMode {
+    #[default]
+    Reject,
+    Bridge,
+}
+
+/// Opt-in protocol compatibility features. An empty scope applies to every
+/// authenticated client key; a nonempty scope applies only to the listed IDs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProtocolCompatibilityConfig {
+    pub code_execution_mode: CodeExecutionMode,
+    pub search_incremental_streaming: bool,
+    pub enabled_key_ids: Vec<u64>,
+}
+
+impl ProtocolCompatibilityConfig {
+    pub fn normalize(&mut self) {
+        self.enabled_key_ids.sort_unstable();
+        self.enabled_key_ids.dedup();
+    }
+
+    pub fn for_key(&self, key_id: u64) -> Self {
+        if self.enabled_key_ids.is_empty() || self.enabled_key_ids.contains(&key_id) {
+            self.clone()
+        } else {
+            Self::default()
+        }
+    }
+}
+
 /// 自定义模型定义。
 ///
 /// 用户在 `config.json` 的 `customModels` 数组里声明客户端模型别名到 Kiro 后端
@@ -384,6 +420,10 @@ pub struct Config {
     #[serde(default)]
     pub custom_models: Vec<CustomModel>,
 
+    /// Runtime-editable protocol compatibility settings shared by API and Admin.
+    #[serde(default)]
+    pub protocol_compatibility: ProtocolCompatibilityConfig,
+
     /// 凭据 metadata 的 JSON Schema。未配置时使用程序内置 schema。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_metadata_schema: Option<serde_json::Value>,
@@ -572,6 +612,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
             custom_models: Vec::new(),
+            protocol_compatibility: ProtocolCompatibilityConfig::default(),
             credential_metadata_schema: None,
             config_path: None,
         }

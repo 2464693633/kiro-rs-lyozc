@@ -34,6 +34,7 @@ use super::{
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
         SetCustomModelsRequest,
+        SetProtocolCompatibilityRequest,
     },
     usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
@@ -698,6 +699,22 @@ pub async fn set_log_governance_config(
 /// 获取 prompt cache 本地计量模拟开关
 pub async fn get_cache_metering_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_cache_metering_config())
+}
+
+/// GET /api/admin/protocol-compatibility
+pub async fn get_protocol_compatibility(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_protocol_compatibility())
+}
+
+/// PUT /api/admin/protocol-compatibility
+pub async fn set_protocol_compatibility(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetProtocolCompatibilityRequest>,
+) -> impl IntoResponse {
+    match state.service.set_protocol_compatibility(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 /// PUT /api/admin/config/cache-metering

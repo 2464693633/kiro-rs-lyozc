@@ -58,6 +58,7 @@ const NON_DATA_QUERY_ROOTS = new Set([
   'logGovernanceConfig',
   'global-proxy',
   'custom-models',
+  'protocol-compatibility',
   'update-config',
   'system-update-check',
 ])
