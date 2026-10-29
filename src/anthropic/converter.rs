@@ -2419,6 +2419,36 @@ mod tests {
     }
 
     #[test]
+    fn format_only_output_config_does_not_enable_native_reasoning() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-opus-5-5", "messages":[{"role":"user","content":"Return JSON"}],
+            "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+        }))
+        .unwrap();
+        assert!(
+            convert_request(&req)
+                .unwrap()
+                .additional_model_request_fields
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn structured_output_without_explicit_effort_uses_the_requested_thinking_budget() {
+        let req: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-opus-5-5", "messages":[{"role":"user","content":"Return JSON"}],
+            "thinking":{"type":"enabled","budget_tokens":1024},
+            "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+        }))
+        .unwrap();
+        let config = convert_request(&req)
+            .unwrap()
+            .additional_model_request_fields
+            .unwrap();
+        assert_eq!(config.output_config.unwrap().effort, "low");
+    }
+
+    #[test]
     fn test_opus_5_5_maps_upstream_id_and_keeps_xhigh() {
         let req =
             minimal_adaptive_thinking_request_with_effort("claude-opus-5-5-thinking", "xhigh");

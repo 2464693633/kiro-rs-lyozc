@@ -54,6 +54,7 @@ enum Mode {
     SlowErrorBody,
     Structured(&'static str),
     StructuredWithReasoning(&'static str),
+    StructuredWithSignatureOnly(&'static str),
     Search,
     HiddenReasoning,
     CachedUsage,
@@ -171,10 +172,13 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":0,"outputTokens":17,"cacheReadInputTokens":18224,"cacheWriteInputTokens":4}})));
                 return Response::new(Body::from(bytes));
             }
-            if let Mode::Structured(text) | Mode::StructuredWithReasoning(text) = mode {
+            if let Mode::Structured(text) | Mode::StructuredWithReasoning(text) | Mode::StructuredWithSignatureOnly(text) = mode {
                 let mut bytes = Vec::new();
                 if matches!(mode, Mode::StructuredWithReasoning(_)) {
                     bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"private structured reasoning","signature":"private-structured-signature"})));
+                }
+                if matches!(mode, Mode::StructuredWithSignatureOnly(_)) {
+                    bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"signature":"opaque-upstream-signature-only"})));
                 }
                 bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":text})));
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
@@ -464,6 +468,64 @@ async fn gateway_structured_json_hides_reasoning_and_preserves_known_buffered_us
                     .unwrap()["message"]["usage"];
                 assert_eq!(usage["input_tokens"], 13, "buffered input is already known");
                 assert_eq!(usage["output_tokens"], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_preserves_signature_only_blocks_with_and_without_structured_output() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for structured in [false, true] {
+                let mut f = fixture(Mode::StructuredWithSignatureOnly(
+                    r#"{"kind":"two","count":7}"#,
+                ))
+                .await;
+                f.state.extract_thinking = true;
+                let mut payload = structured_request(streaming);
+                if !structured {
+                    payload.as_object_mut().unwrap().remove("output_config");
+                }
+                payload["thinking"] = json!({"type":"enabled","budget_tokens":1024});
+                let response = compatibility_request(f.state.clone(), cc, payload).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                if streaming {
+                    let wire = String::from_utf8_lossy(&bytes);
+                    let events: Vec<serde_json::Value> = wire
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .map(|data| serde_json::from_str(data).unwrap())
+                        .collect();
+                    let block = events
+                        .iter()
+                        .find(|event| {
+                            event["type"] == "content_block_start"
+                                && event["content_block"]["type"] == "thinking"
+                        })
+                        .expect("signed empty thinking block must survive");
+                    assert_eq!(block["content_block"]["thinking"], "");
+                    let signatures: Vec<_> = events
+                        .iter()
+                        .filter(|event| event["delta"]["type"] == "signature_delta")
+                        .collect();
+                    assert_eq!(signatures.len(), 1);
+                    assert_eq!(
+                        signatures[0]["delta"]["signature"],
+                        "opaque-upstream-signature-only"
+                    );
+                } else {
+                    let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let block = message["content"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|block| block["type"] == "thinking")
+                        .expect("signed empty thinking block must survive");
+                    assert_eq!(block["thinking"], "");
+                    assert_eq!(block["signature"], "opaque-upstream-signature-only");
+                }
             }
         }
     }

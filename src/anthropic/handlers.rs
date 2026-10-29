@@ -1978,7 +1978,10 @@ fn build_non_stream_content(
     native_redacted_thinking: Vec<String>,
 ) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
-    let has_native_thinking = !native_thinking.is_empty();
+    let has_native_thinking = !native_thinking.is_empty()
+        || native_thinking_signature
+            .as_ref()
+            .is_some_and(|signature| !signature.is_empty());
 
     if thinking_enabled {
         if has_native_thinking {
@@ -2853,6 +2856,30 @@ mod tests {
         assert_eq!(content[1]["data"], "encrypted-thinking");
         assert_eq!(content[2]["type"], "text");
         assert_eq!(content[2]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_preserves_signature_only_native_thinking() {
+        for answer in ["", "final answer"] {
+            let content = build_non_stream_content(
+                true,
+                answer.to_string(),
+                String::new(),
+                Some("original-upstream-signature+/=".to_string()),
+                Vec::new(),
+            );
+            assert_eq!(
+                content[0],
+                json!({
+                    "type":"thinking", "thinking":"", "signature":"original-upstream-signature+/="
+                })
+            );
+            if answer.is_empty() {
+                assert_eq!(content.len(), 1);
+            } else {
+                assert_eq!(content[1], json!({"type":"text", "text":answer}));
+            }
+        }
     }
 
     #[test]

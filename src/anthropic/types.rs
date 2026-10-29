@@ -98,15 +98,13 @@ where
 /// OutputConfig 配置
 #[derive(Debug, Deserialize, Clone)]
 pub struct OutputConfig {
-    #[serde(default = "default_effort")]
+    /// An omitted effort is not an explicit reasoning request. In particular,
+    /// format-only structured output must not silently enable high effort.
+    #[serde(default)]
     pub effort: String,
     /// Preserve the client's JSON Schema for the compatibility adapter.
     #[serde(default)]
     pub format: Option<serde_json::Value>,
-}
-
-fn default_effort() -> String {
-    "high".to_string()
 }
 
 /// Claude Code 请求中的 metadata
@@ -321,6 +319,18 @@ pub struct CountTokensResponse {
 #[cfg(test)]
 mod tests {
     use super::MessagesRequest;
+
+    #[test]
+    fn format_only_output_config_preserves_absent_effort() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-opus-5-5", "messages":[{"role":"user","content":"Return JSON"}],
+            "output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}
+        }))
+        .unwrap();
+        let config = request.output_config.unwrap();
+        assert!(config.effort.is_empty());
+        assert_eq!(config.format.unwrap()["type"], "json_schema");
+    }
 
     fn request_json(max_tokens: Option<i32>) -> serde_json::Value {
         let mut value = serde_json::json!({

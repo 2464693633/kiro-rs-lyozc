@@ -257,4 +257,31 @@ mod tests {
         assert!(wire.contains("original"));
         assert!(wire.contains("credit_usage"));
     }
+
+    #[test]
+    fn structured_output_keeps_an_opaque_signature_with_empty_thinking() {
+        let content = vec![
+            json!({"type":"thinking","thinking":"","signature":"unchanged+opaque/value=="}),
+            json!({"type":"text","text":r#"{"kind":"two","count":7}"#}),
+        ];
+        assert!(validate(Some(&schema()), &content, "end_turn").is_ok());
+        let events = sse_events(
+            &json!({"content":content, "usage":{"input_tokens":3,"output_tokens":5}, "stop_reason":"end_turn"}),
+        );
+        let deltas: Vec<_> = events
+            .iter()
+            .filter(|event| event.data["delta"]["type"] == "signature_delta")
+            .collect();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0].data["delta"]["signature"],
+            "unchanged+opaque/value=="
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data["delta"]["type"] == "thinking_delta"
+                    && event.data["delta"]["thinking"] == "")
+        );
+    }
 }

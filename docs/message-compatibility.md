@@ -18,6 +18,8 @@
 
 保留并处理 `output_config.format = {"type":"json_schema","schema":{...}}`。先校验 Schema，再将格式要求发送给上游；收到 `end_turn` 的最终文本后，解析 JSON 并验证 Schema。必填项、枚举、字段类型、额外字段和本地 `$ref` 均参与验证。
 
+只指定 `format` 而未指定 `effort` 时，不会自动开启高强度推理；显式 thinking 的预算和显式 effort 仍按原规则传递。
+
 - 非法/不支持的 Schema：400。
 - 上游最终答案不是合法 JSON 或不符合 Schema：502，`upstream_output_schema_error`；请求链路记为失败，并保留实际消耗用量。
 - `tool_use`、拒答、`max_tokens` 等停止原因保持原语义，不能按正常完成的结构化答案使用。
@@ -34,6 +36,8 @@
 最终 JSON/SSE 用量包含 `server_tool_use.web_search_requests`，记录真正进入 MCP 的逻辑搜索次数；空结果计一次，内部重试不重复计数，只声明工具但未调用时为 0。上游没有原生 citation 时不会根据 Markdown 链接补造引用；已有 text citations 会在 SSE 中保留。搜索每轮模型正文目前仍先完整收集再发送，工具执行进度实时发送，因此正文首字节可能等待较久。
 
 未请求 `thinking.type: enabled/adaptive` 的响应不会把上游原生推理混入正文，也不会通过搜索扩展字段暴露；模型别名中的 thinking 后缀仍按原规则启用。隐藏内容仍参与缺少上游精确用量时的本地输出估算。此规则只识别原生推理事件，不按文字内容猜测或删改普通回答。
+
+原生 thinking 文本为空而签名非空时，仍保留空 thinking 块及原始 signature；结构化输出缓冲为 SSE 时同样保留。签名作为不透明值传递，不通过重写内容、工具 ID 或渠道字段来改变来源。没有上游签名的旧文本标签路径仍使用已有兼容占位，它不具备密码学签名语义。
 
 带 `type: code_execution_*` 的服务端工具请求返回 400，并说明未配置隔离执行后端。不会把生成的普通 `tool_use` 宣称为执行完成。自定义客户端工具照常返回客户端执行。
 

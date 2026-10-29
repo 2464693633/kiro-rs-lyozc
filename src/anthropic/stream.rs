@@ -16,10 +16,12 @@ use crate::kiro::model::events::{Event, MeteringEvent, TokenUsage};
 /// 否则 SDK / 服务端会拒绝请求并报：
 /// `The content[].thinking in the thinking mode must be passed back to the API`。
 ///
-/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
-/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
+/// Legacy fallback for text-tag thinking when upstream supplies no signature.
+/// Kiro can also return a native signature: that opaque value takes precedence
+/// and must be preserved unchanged, including when its display text is empty.
 /// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
 /// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
+/// It is not a cryptographic signature and cannot establish channel authenticity.
 pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
 
 /// 上游内容过滤拦截（`metadataEvent.stopReason = CONTENT_FILTERED`）映射到的
@@ -1450,6 +1452,9 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 上游原生 reasoningContentEvent 下发的 thinking 签名
     pending_thinking_signature: Option<String>,
+    /// Whether any nonempty displayed thinking text was emitted. A signature-only
+    /// block is valid and must not by itself imply exhausted thinking tokens.
+    thinking_text_emitted: bool,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1550,6 +1555,7 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             pending_thinking_signature: None,
+            thinking_text_emitted: false,
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
@@ -2269,6 +2275,10 @@ impl StreamContext {
             && !signature.is_empty()
         {
             self.pending_thinking_signature = Some(signature.to_string());
+            // A native reasoning block may omit its displayed text while still
+            // carrying a valid signature. Open an empty block so the original
+            // signature is closed and emitted before answer/tool/EOF boundaries.
+            events.extend(self.ensure_thinking_block());
         }
 
         if let Some(text) = reasoning.text.as_deref()
@@ -2315,7 +2325,8 @@ impl StreamContext {
     }
 
     /// 创建 thinking_delta 事件
-    fn create_thinking_delta_event(&self, index: i32, thinking: &str) -> SseEvent {
+    fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
+        self.thinking_text_emitted |= !thinking.is_empty();
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2336,8 +2347,9 @@ impl StreamContext {
     /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
     /// `The content[].thinking in the thinking mode must be passed back to the API`。
     ///
-    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
-    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
+    /// This helper is the legacy fallback for text-tag thinking without a native
+    /// signature. Native reasoning closes through close_open_thinking_block and
+    /// preserves the upstream value. 该字段不参与转发回 Kiro 的逻辑
     /// （converter 只读 `block.thinking`，不读 signature）。
     fn create_signature_delta_event(&self, index: i32) -> SseEvent {
         self.create_signature_delta_event_with(index, THINKING_SIGNATURE_PLACEHOLDER)
@@ -2559,8 +2571,9 @@ impl StreamContext {
                 } else {
                     // 如果还在 thinking 块内，发送剩余内容作为 thinking_delta
                     if let Some(thinking_index) = self.thinking_block_index {
+                        let remaining_thinking = self.thinking_buffer.clone();
                         events.push(
-                            self.create_thinking_delta_event(thinking_index, &self.thinking_buffer),
+                            self.create_thinking_delta_event(thinking_index, &remaining_thinking),
                         );
                     }
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
@@ -2585,11 +2598,13 @@ impl StreamContext {
             self.thinking_buffer.clear();
         }
 
-        // 如果整个流中只产生了 thinking 块，没有 text 也没有 tool_use，
+        // 如果整个流中实际输出了非空 thinking 文字，没有 text 也没有 tool_use，
         // 则设置 stop_reason 为 max_tokens（表示模型耗尽了 token 预算在思考上），
         // 并补发一套完整的 text 事件（内容为一个空格），确保 content 数组中有 text 块
+        // 仅含签名的空 thinking 块不触发此兼容回退。
         if self.thinking_enabled
             && self.thinking_block_index.is_some()
+            && self.thinking_text_emitted
             && !self.state_manager.has_non_thinking_blocks()
         {
             self.state_manager.set_stop_reason("max_tokens");
@@ -5221,6 +5236,151 @@ mod tests {
                 && e.data["delta"]["type"] == "signature_delta"
                 && e.data["delta"]["signature"] == "signature-before-text"
         }));
+    }
+
+    #[test]
+    fn test_native_signature_only_survives_answer_tool_and_eof_boundaries() {
+        const ORIGINAL_SIGNATURE: &str = "original-upstream-signature+/=";
+        for boundary in ["answer", "tool", "eof"] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test-model",
+                1,
+                true,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            let mut events = ctx.generate_initial_events();
+            events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                crate::kiro::model::events::ReasoningContentEvent {
+                    text: None,
+                    signature: Some(ORIGINAL_SIGNATURE.to_string()),
+                    redacted_content: None,
+                },
+            )));
+            match boundary {
+                "answer" => events.extend(ctx.process_assistant_response("final answer")),
+                "tool" => events.extend(ctx.process_kiro_event(&Event::ToolUse(
+                    crate::kiro::model::events::ToolUseEvent {
+                        name: "test_tool".to_string(),
+                        tool_use_id: "toolu_original".to_string(),
+                        input: "{}".to_string(),
+                        stop: true,
+                    },
+                ))),
+                _ => {}
+            }
+            events.extend(ctx.generate_final_events());
+            let (start, index) = block_start_position(&events, "thinking");
+            let stop = block_stop_position(&events, index);
+            let signatures: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| {
+                    event.data["index"] == index && event.data["delta"]["type"] == "signature_delta"
+                })
+                .collect();
+            assert_eq!(signatures.len(), 1, "{boundary}");
+            assert_eq!(
+                signatures[0].1.data["delta"]["signature"],
+                ORIGINAL_SIGNATURE
+            );
+            assert!(
+                start < signatures[0].0 && signatures[0].0 < stop,
+                "{boundary}"
+            );
+            assert_eq!(collect_thinking_content(&events), "");
+            if boundary != "eof" {
+                let block_type = if boundary == "answer" {
+                    "text"
+                } else {
+                    "tool_use"
+                };
+                assert!(
+                    stop < block_start_position(&events, block_type).0,
+                    "{boundary}"
+                );
+            } else {
+                assert_eq!(collect_text_content(&events), "");
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| event.data["content_block"]["type"] == "text")
+                );
+                let final_event = events
+                    .iter()
+                    .find(|event| event.event == "message_delta")
+                    .unwrap();
+                assert_eq!(final_event.data["delta"]["stop_reason"], "end_turn");
+            }
+        }
+    }
+
+    #[test]
+    fn test_nonempty_native_and_legacy_thinking_only_keep_max_tokens_fallback() {
+        for native in [true, false] {
+            let mut ctx = StreamContext::new_with_thinking(
+                "test-model",
+                1,
+                true,
+                HashMap::new(),
+                test_known_tools(),
+            );
+            let mut events = ctx.generate_initial_events();
+            if native {
+                events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+                    crate::kiro::model::events::ReasoningContentEvent {
+                        text: Some("actual reasoning".to_string()),
+                        signature: Some("original-upstream-signature".to_string()),
+                        redacted_content: None,
+                    },
+                )));
+            } else {
+                events.extend(
+                    ctx.process_assistant_response("<thinking>actual reasoning</thinking>\n\n"),
+                );
+            }
+            events.extend(ctx.generate_final_events());
+            assert_eq!(collect_thinking_content(&events), "actual reasoning");
+            assert_eq!(collect_text_content(&events), " ");
+            let final_event = events
+                .iter()
+                .find(|event| event.event == "message_delta")
+                .unwrap();
+            assert_eq!(final_event.data["delta"]["stop_reason"], "max_tokens");
+        }
+    }
+
+    #[test]
+    fn test_native_signature_only_stays_hidden_when_thinking_disabled() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: None,
+                signature: Some("private-upstream-signature".to_string()),
+                redacted_content: None,
+            },
+        )));
+        events.extend(ctx.process_assistant_response("final answer"));
+        events.extend(ctx.generate_final_events());
+        assert_eq!(collect_thinking_content(&events), "");
+        assert_eq!(collect_text_content(&events), "final answer");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.to_sse_string().contains("private-upstream-signature"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data["content_block"]["type"] == "thinking")
+        );
     }
 
     #[test]
