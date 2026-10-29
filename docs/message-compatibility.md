@@ -41,6 +41,12 @@
 
 ## 部署和复测
 
-需要从本仓库重新构建前端和后端，或重新构建 Docker 镜像后更新实例。使用公共上游旧镜像不会包含这些变更。
+推荐使用本仓库 GitHub Actions 在云端构建，服务器只拉取镜像并重启，无需安装 Rust/Bun 或在服务器编译：
+
+- 推送 `main`/`master`：`build.yaml` 构建可下载程序，`docker-build.yaml` 构建并推送 `beta-<提交 SHA 前六位>` 和 `beta` 镜像，不更新 `latest`。
+- 推送 `v*` 版本标签，或手动运行 `release.yaml`：构建前端和各平台程序，使用 `Dockerfile.release` 打包已编译的 Linux 静态程序，发布版本镜像和 `latest`。版本必须与 `Cargo.toml` 一致；手动发布还要求标签不存在。
+- Docker Hub 发布需要仓库 Secrets `DOCKERHUB_USERNAME`、`DOCKERHUB_TOKEN`；镜像命名空间使用仓库变量 `DOCKERHUB_NAMESPACE`，未配置时使用小写 GitHub 仓库所有者名。无需把凭据发到对话中。
+
+服务器通过 `KIRO_RS_IMAGE` 指定上述实际发布的镜像，然后执行 `docker compose pull`、`docker compose up -d`。仓库 Compose 默认仍指向公共上游 `zyphrzero/kiro-rs:latest`，必须覆盖成自己的镜像，才会包含本仓库的修复。
 
 使用新生成的 PDF 内容、多个不同 Schema 和实际搜索问题复测；观察日志只能验证请求和响应，外部网站的判分仍需重新运行。429/502 的具体线上原因需结合链路中的上游尝试记录确认。

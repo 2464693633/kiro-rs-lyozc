@@ -3,6 +3,7 @@ name: Build Artifacts
 on:
   push:
     branches:
+      - main
       - master
     paths-ignore:
       - '**.md'
