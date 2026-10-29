@@ -58,6 +58,9 @@ enum Mode {
     Structured(&'static str),
     StructuredWithReasoning(&'static str),
     StructuredWithSignatureOnly(&'static str),
+    Signature {
+        only: bool,
+    },
     Search,
     HiddenReasoning,
     CachedUsage,
@@ -166,6 +169,15 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if let Mode::Signature { only } = mode {
+                let mut reasoning = json!({"signature":super::signature_compat::fixture_signature()});
+                if !only { reasoning["text"] = json!("fixture reasoning"); }
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&frame("reasoningContentEvent", reasoning));
+                bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":"fixture answer"})));
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
+                return Response::new(Body::from(bytes));
+            }
             if matches!(mode, Mode::HiddenReasoning | Mode::CachedUsage) {
                 let mut bytes = Vec::new();
                 if matches!(mode, Mode::HiddenReasoning) {
@@ -398,6 +410,80 @@ fn structured_request(stream: bool) -> serde_json::Value {
         "output_config":{"format":{"type":"json_schema","schema":{"type":"object",
             "properties":{"kind":{"enum":["one","two"]},"count":{"type":"integer"}},
             "required":["kind","count"],"additionalProperties":false}}}})
+}
+
+#[tokio::test]
+async fn gateway_signature_metadata_experiment_requires_opt_in_and_explicit_key_scope() {
+    let original = super::signature_compat::fixture_signature();
+    let rewritten = super::signature_compat::present(&original, true).into_owned();
+    assert_ne!(original, rewritten);
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for only in [false, true] {
+                for (enabled, ids, expected) in [
+                    (false, vec![0], &original),
+                    (true, vec![], &original),
+                    (true, vec![1], &original),
+                    (true, vec![0], &rewritten),
+                ] {
+                    let mut f = fixture(Mode::Signature { only }).await;
+                    f.state.extract_thinking = true;
+                    f.state
+                        .protocol_compatibility
+                        .update_with_persistence(
+                            crate::model::config::ProtocolCompatibilityConfig {
+                                signature_metadata_compat: enabled,
+                                enabled_key_ids: ids,
+                                ..Default::default()
+                            },
+                            |_| Ok(()),
+                        )
+                        .unwrap();
+                    let request = json!({"model":"claude-opus-5-5","max_tokens":128,"stream":streaming,
+                        "thinking":{"type":"enabled","budget_tokens":1024},
+                        "messages":[{"role":"user","content":"fixture question"}]});
+                    let response = compatibility_request(f.state.clone(), cc, request).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                    if streaming {
+                        let wire = std::str::from_utf8(&bytes).unwrap();
+                        let events: Vec<serde_json::Value> = wire
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .map(|line| serde_json::from_str(line).unwrap())
+                            .collect();
+                        let signatures: Vec<_> = events
+                            .iter()
+                            .filter(|event| event["delta"]["type"] == "signature_delta")
+                            .collect();
+                        assert_eq!(signatures.len(), 1);
+                        assert_eq!(signatures[0]["delta"]["signature"], expected.as_str());
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| event["type"] == "message_stop")
+                                .count(),
+                            1
+                        );
+                        assert!(
+                            events
+                                .iter()
+                                .any(|event| event["delta"]["text"] == "fixture answer")
+                        );
+                    } else {
+                        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(message["content"][0]["signature"], expected.as_str());
+                        assert_eq!(
+                            message["content"][0]["thinking"],
+                            if only { "" } else { "fixture reasoning" }
+                        );
+                        assert_eq!(message["content"][1]["text"], "fixture answer");
+                    }
+                    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -668,13 +754,18 @@ fn execution_request(streaming: bool) -> serde_json::Value {
 }
 
 fn enable_execution_bridge(state: &AppState) {
-    state.protocol_compatibility.update_with_persistence(
-        crate::model::config::ProtocolCompatibilityConfig {
-            code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
-            search_incremental_streaming: true,
-            enabled_key_ids: vec![],
-        }, |_| Ok(())
-    ).unwrap();
+    state
+        .protocol_compatibility
+        .update_with_persistence(
+            crate::model::config::ProtocolCompatibilityConfig {
+                code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
+                search_incremental_streaming: true,
+                signature_metadata_compat: false,
+                enabled_key_ids: vec![],
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
 }
 
 #[tokio::test]
@@ -713,13 +804,26 @@ async fn gateway_execution_declaration_does_not_invent_calls_and_scope_is_enforc
     assert_eq!(response.status(),StatusCode::OK);
     let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
     assert!(!String::from_utf8_lossy(&bytes).contains("server_tool_use"));
-    assert_eq!(f.calls.load(Ordering::Relaxed),1);
-    f.state.protocol_compatibility.update_with_persistence(crate::model::config::ProtocolCompatibilityConfig {
-        code_execution_mode:crate::model::config::CodeExecutionMode::Bridge,
-        search_incremental_streaming:false,enabled_key_ids:vec![u64::MAX],
-    },|_|Ok(())).unwrap();
-    assert_eq!(compatibility_request(f.state.clone(),false,execution_request(false)).await.status(),StatusCode::BAD_REQUEST);
-    assert_eq!(f.calls.load(Ordering::Relaxed),1);
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    f.state
+        .protocol_compatibility
+        .update_with_persistence(
+            crate::model::config::ProtocolCompatibilityConfig {
+                code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
+                search_incremental_streaming: false,
+                enabled_key_ids: vec![u64::MAX],
+                signature_metadata_compat: false,
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        compatibility_request(f.state.clone(), false, execution_request(false))
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

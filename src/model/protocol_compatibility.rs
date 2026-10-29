@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::config::ProtocolCompatibilityConfig;
 
-pub const MODULE_VERSION: &str = "1";
+pub const MODULE_VERSION: &str = "2";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolCompatibilitySnapshot {
@@ -77,6 +77,7 @@ mod tests {
         let candidate = ProtocolCompatibilityConfig {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
+            signature_metadata_compat: true,
             enabled_key_ids: vec![7],
         };
         assert!(
@@ -95,6 +96,7 @@ mod tests {
         let candidate = ProtocolCompatibilityConfig {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
+            signature_metadata_compat: true,
             enabled_key_ids: vec![9, 7, 9],
         };
         let saved = runtime
@@ -113,6 +115,7 @@ mod tests {
             CodeExecutionMode::Bridge
         );
         assert!(reader.for_key(9).search_incremental_streaming);
+        assert!(reader.for_key(9).signature_metadata_compat);
         assert_eq!(reader.for_key(8), ProtocolCompatibilityConfig::default());
         runtime
             .update_with_persistence(
@@ -124,5 +127,6 @@ mod tests {
             )
             .unwrap();
         assert!(reader.for_key(8).search_incremental_streaming);
+        assert!(!reader.for_key(8).signature_metadata_compat);
     }
 }

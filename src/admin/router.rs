@@ -317,6 +317,7 @@ mod protocol_compatibility_tests {
         let initial: Value = auth_get().send().await.unwrap().json().await.unwrap();
         assert_eq!(initial["codeExecutionMode"], "reject");
         assert_eq!(initial["searchIncrementalStreaming"], false);
+        assert_eq!(initial["signatureMetadataCompat"], false);
         assert_eq!(initial["enabledKeyIds"], json!([]));
         assert_eq!(initial["diagnostics"]["codeExecutionBackend"], "unavailable");
         assert_eq!(initial["diagnostics"]["systemTransport"], "conversation_history");
@@ -325,6 +326,7 @@ mod protocol_compatibility_tests {
         let candidate = json!({
             "codeExecutionMode":"bridge",
             "searchIncrementalStreaming":true,
+            "signatureMetadataCompat":true,
             "enabledKeyIds":[7,3,7]
         });
         let response = client
@@ -339,14 +341,55 @@ mod protocol_compatibility_tests {
         assert_eq!(runtime.for_key(7).code_execution_mode, CodeExecutionMode::Bridge);
         assert!(runtime.for_key(3).search_incremental_streaming);
         assert!(!runtime.for_key(8).search_incremental_streaming);
+        assert!(runtime.for_key(7).signature_metadata_compat);
+        assert!(!runtime.for_key(8).signature_metadata_compat);
         let persisted = Config::load(&file.0).unwrap();
         assert_eq!(persisted.region, "eu-central-1");
         assert_eq!(persisted.protocol_compatibility.enabled_key_ids, vec![3,7]);
         let restarted = MultiTokenManager::new(persisted, Vec::new(), None, None, false).unwrap();
-        assert_eq!(restarted.protocol_compatibility().for_key(7), runtime.for_key(7));
-        for invalid in [json!({}), json!({"codeExecutionMode":"fake","searchIncrementalStreaming":true,"enabledKeyIds":[]})] {
-            assert_eq!(client.put(&url).header("x-api-key", "fixture-admin-key").json(&invalid)
-                .send().await.unwrap().status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            restarted.protocol_compatibility().for_key(7),
+            runtime.for_key(7)
+        );
+        assert_eq!(
+            client
+                .put(&url)
+                .header("x-api-key", "fixture-admin-key")
+                .json(
+                    &json!({"codeExecutionMode":"bridge","searchIncrementalStreaming":true,
+                "signatureMetadataCompat":true,"enabledKeyIds":[]})
+                )
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            auth_get()
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap(),
+            saved
+        );
+        for invalid in [
+            json!({}),
+            json!({"codeExecutionMode":"fake","searchIncrementalStreaming":true,"enabledKeyIds":[]}),
+        ] {
+            assert_eq!(
+                client
+                    .put(&url)
+                    .header("x-api-key", "fixture-admin-key")
+                    .json(&invalid)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
         }
         std::fs::write(&file.0, "invalid json").unwrap();
         let response = client.put(&url).header("x-api-key", "fixture-admin-key")
@@ -369,6 +412,7 @@ mod protocol_compatibility_tests {
         let request = super::super::types::SetProtocolCompatibilityRequest {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
+            signature_metadata_compat: false,
             enabled_key_ids: Vec::new(),
         };
         assert!(service.set_protocol_compatibility(request).is_err());

@@ -633,6 +633,8 @@ pub struct LogGovernanceConfigResponse {
 pub struct SetProtocolCompatibilityRequest {
     pub code_execution_mode: crate::model::config::CodeExecutionMode,
     pub search_incremental_streaming: bool,
+    #[serde(default)]
+    pub signature_metadata_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
 
@@ -641,6 +643,7 @@ impl From<SetProtocolCompatibilityRequest> for crate::model::config::ProtocolCom
         Self {
             code_execution_mode: value.code_execution_mode,
             search_incremental_streaming: value.search_incremental_streaming,
+            signature_metadata_compat: value.signature_metadata_compat,
             enabled_key_ids: value.enabled_key_ids,
         }
     }

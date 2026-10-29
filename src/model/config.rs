@@ -70,6 +70,8 @@ pub enum CodeExecutionMode {
 pub struct ProtocolCompatibilityConfig {
     pub code_execution_mode: CodeExecutionMode,
     pub search_incremental_streaming: bool,
+    /// Experimental envelope presentation; requires an explicit key scope.
+    pub signature_metadata_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
 
@@ -81,7 +83,11 @@ impl ProtocolCompatibilityConfig {
 
     pub fn for_key(&self, key_id: u64) -> Self {
         if self.enabled_key_ids.is_empty() || self.enabled_key_ids.contains(&key_id) {
-            self.clone()
+            let mut effective = self.clone();
+            if self.enabled_key_ids.is_empty() {
+                effective.signature_metadata_compat = false;
+            }
+            effective
         } else {
             Self::default()
         }

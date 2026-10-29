@@ -1041,6 +1041,9 @@ pub(super) async fn post_messages_inner(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            state
+                .protocol_compatibility_for_key(key_ctx.key_id)
+                .signature_metadata_compat,
         )
         .await
     } else {
@@ -1070,6 +1073,9 @@ pub(super) async fn post_messages_inner(
             tracer,
             key_ctx.group.clone(),
             super::structured_output::format(&payload).cloned(),
+            state
+                .protocol_compatibility_for_key(key_ctx.key_id)
+                .signature_metadata_compat,
         )
         .await
     }
@@ -1088,6 +1094,7 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    signature_metadata_compat: bool,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider
@@ -1121,6 +1128,7 @@ async fn handle_stream_request(
         known_tool_names,
     );
     ctx.cache_usage = cache_usage;
+    ctx.signature_metadata_compat = signature_metadata_compat;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1446,6 +1454,7 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
     output_format: Option<serde_json::Value>,
+    signature_metadata_compat: bool,
 ) -> Response {
     match execute_non_stream_request_with_format(
         provider,
@@ -1462,7 +1471,10 @@ async fn handle_non_stream_request(
     )
     .await
     {
-        Ok(response_body) => (StatusCode::OK, Json(response_body)).into_response(),
+        Ok(mut response_body) => {
+            super::signature_compat::present_message(&mut response_body, signature_metadata_compat);
+            (StatusCode::OK, Json(response_body)).into_response()
+        }
         Err(NonStreamExecutionError::Provider(error)) => map_provider_error(error),
         Err(NonStreamExecutionError::Response(response)) => response,
     }
@@ -2275,6 +2287,9 @@ pub(super) async fn post_messages_cc_inner(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            state
+                .protocol_compatibility_for_key(key_ctx.key_id)
+                .signature_metadata_compat,
         )
         .await
     } else {
@@ -2301,6 +2316,9 @@ pub(super) async fn post_messages_cc_inner(
             tracer,
             key_ctx.group.clone(),
             super::structured_output::format(&payload).cloned(),
+            state
+                .protocol_compatibility_for_key(key_ctx.key_id)
+                .signature_metadata_compat,
         )
         .await
     }
@@ -2320,6 +2338,7 @@ async fn handle_cc_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    signature_metadata_compat: bool,
 ) -> Response {
     handle_stream_request(
         provider,
@@ -2333,6 +2352,7 @@ async fn handle_cc_stream_request(
         cache_usage,
         tracer,
         group,
+        signature_metadata_compat,
     )
     .await
 }

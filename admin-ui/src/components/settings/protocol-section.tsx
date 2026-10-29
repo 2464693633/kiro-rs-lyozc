@@ -18,6 +18,7 @@ const QUERY_KEY = ['protocol-compatibility']
 interface Draft {
   codeExecutionMode: ProtocolCompatibilityConfig['codeExecutionMode']
   searchIncrementalStreaming: boolean
+  signatureMetadataCompat: boolean
   scope: 'all' | 'selected'
   keyIds: string
 }
@@ -26,6 +27,7 @@ function toDraft(config: ProtocolCompatibilityConfig): Draft {
   return {
     codeExecutionMode: config.codeExecutionMode,
     searchIncrementalStreaming: config.searchIncrementalStreaming,
+    signatureMetadataCompat: config.signatureMetadataCompat ?? false,
     scope: config.enabledKeyIds.length ? 'selected' : 'all',
     keyIds: config.enabledKeyIds.join(', '),
   }
@@ -81,7 +83,7 @@ export function ProtocolSection() {
   const parsedIds = parseKeyIds(draft?.keyIds ?? '')
   const scopeError = draft?.scope === 'selected'
     ? parsedIds.error || (!parsedIds.ids.length ? '请至少选择或输入一个 Key ID。' : '')
-    : ''
+    : draft?.signatureMetadataCompat ? '签名元数据实验需要选择指定 Key。' : ''
   const disabled = !actual || !draft || mutation.isPending
 
   const save = async () => {
@@ -92,6 +94,7 @@ export function ProtocolSection() {
       const returned = await mutation.mutateAsync({
         codeExecutionMode: draft.codeExecutionMode,
         searchIncrementalStreaming: draft.searchIncrementalStreaming,
+        signatureMetadataCompat: draft.signatureMetadataCompat,
         enabledKeyIds: draft.scope === 'all' ? [] : parsedIds.ids,
       })
       queryClient.setQueryData<ProtocolCompatibilityResponse>(QUERY_KEY, returned)
@@ -180,6 +183,17 @@ export function ProtocolSection() {
             />
           </SettingRow>
           <SettingRow
+            label="签名元数据实验"
+            hint="按已观察到的对照样本调整签名外层格式，用于比较检测得分。仅支持指定 Key；未知格式原样返回，关闭后恢复透传。此实验不验证签名真实性。"
+          >
+            <Switch
+              checked={draft?.signatureMetadataCompat ?? false}
+              onCheckedChange={(value) => edit({ signatureMetadataCompat: value, ...(value ? { scope: 'selected' as const } : {}) })}
+              disabled={disabled}
+              aria-label="签名元数据实验"
+            />
+          </SettingRow>
+          <SettingRow
             label="应用范围"
             hint="选择指定 Key 可先做小范围测试。范围外的请求保持默认策略；这里仅显示 Key 名称和 ID。"
           >
@@ -190,7 +204,7 @@ export function ProtocolSection() {
             >
               <SelectTrigger aria-label="协议兼容应用范围" className="w-full sm:w-64"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="all">全部客户端 Key</SelectItem>
+                <SelectItem value="all" disabled={draft?.signatureMetadataCompat}>全部客户端 Key</SelectItem>
                 <SelectItem value="selected">仅指定 Key</SelectItem>
               </SelectContent>
             </Select>
@@ -253,6 +267,7 @@ export function ProtocolSection() {
           <dl className="grid gap-3 py-3 text-xs sm:grid-cols-2">
             <div><dt className="text-muted-foreground">代码执行模式</dt><dd className="mt-1 font-medium">{modeLabel(actual.codeExecutionMode)}</dd></div>
             <div><dt className="text-muted-foreground">搜索增量流式输出</dt><dd className="mt-1 font-medium">{actual.searchIncrementalStreaming ? '开启' : '关闭'}</dd></div>
+            <div><dt className="text-muted-foreground">签名元数据实验</dt><dd className="mt-1 font-medium">{actual.signatureMetadataCompat && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭（原样透传）'}</dd></div>
             <div className="sm:col-span-2"><dt className="text-muted-foreground">应用范围</dt><dd className="mt-1 break-all font-medium">{scopeLabel(actual.enabledKeyIds, keys)}</dd></div>
             {updatedAt && !Number.isNaN(updatedAt.getTime()) && <div className="sm:col-span-2"><dt className="text-muted-foreground">服务器更新时间</dt><dd className="mt-1">{updatedAt.toLocaleString()}</dd></div>}
           </dl>

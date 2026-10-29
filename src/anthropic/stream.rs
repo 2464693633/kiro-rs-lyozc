@@ -1440,6 +1440,8 @@ pub struct StreamContext {
     pub fence_scan_partial: String,
     /// thinking 是否启用
     pub thinking_enabled: bool,
+    /// Explicitly scoped presentation experiment; upstream provenance is unchanged.
+    pub signature_metadata_compat: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
     /// invoke 文本嗅探缓冲区（用于从明文流里嗅探字面 `<invoke>` 工具调用块）
@@ -1549,6 +1551,7 @@ impl StreamContext {
             code_fence_open: false,
             fence_scan_partial: String::new(),
             thinking_enabled,
+            signature_metadata_compat: false,
             thinking_buffer: String::new(),
             invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
@@ -2356,6 +2359,7 @@ impl StreamContext {
     }
 
     fn create_signature_delta_event_with(&self, index: i32, signature: &str) -> SseEvent {
+        let signature = super::signature_compat::present(signature, self.signature_metadata_compat);
         SseEvent::new(
             "content_block_delta",
             json!({
