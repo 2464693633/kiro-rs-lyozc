@@ -3269,6 +3269,48 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_final_zero_input_overwrites_initial_usage() {
+        let mut context = ResponsesStreamContext::new(
+            "gpt-5.6-sol".into(),
+            ToolKindMap::new(),
+            ResponsesResponseConfig::default(),
+        );
+        context.handle_anthropic_event(
+            "message_start",
+            json!({
+                "message": {"usage": {
+                    "input_tokens": 18228,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }}
+            }),
+        );
+        context.handle_anthropic_event(
+            "message_delta",
+            json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 4,
+                    "cache_read_input_tokens": 18224,
+                    "output_tokens": 5
+                }
+            }),
+        );
+        let usage = context.usage();
+        assert_eq!(context.input_tokens, 0);
+        assert_eq!(usage["input_tokens"], json!(18228));
+        assert_eq!(usage["input_tokens_details"]["cached_tokens"], json!(18224));
+        assert_eq!(usage["output_tokens"], json!(5));
+        assert_eq!(usage["total_tokens"], json!(18233));
+        let completed = event_text(context.handle_anthropic_event("message_stop", json!({})));
+        assert!(completed.contains("event: response.completed"));
+        assert!(completed.contains("\"input_tokens\":18228"));
+        assert!(completed.contains("\"total_tokens\":18233"));
+    }
+
+    #[test]
     fn hosted_web_search_thinking_becomes_a_responses_reasoning_item() {
         let mut context = ResponsesStreamContext::new(
             "gpt-5.6-sol".into(),

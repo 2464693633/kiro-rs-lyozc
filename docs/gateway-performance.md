@@ -36,8 +36,13 @@ depend on upstream keepalive and network conditions.
 ## Changes
 
 - CC uses the existing live Messages stream instead of collecting the entire
-  answer. Initial token usage is estimated; final `message_delta` reports the
-  provider usage when available.
+  answer. Current live streams report zero token usage in `message_start` while
+  upstream usage is unknown. Final `message_delta.usage` is an absolute snapshot
+  that replaces earlier values, including a valid `input_tokens: 0`; consumers
+  must not add it to the opening usage. Exact provider usage takes precedence,
+  with existing context/local estimates used only when provider usage is absent.
+  Buffered structured-output SSE is an exception: the final input/cache values
+  are already known when `message_start` is emitted.
 - Chat Completions translates incoming Messages events immediately, including
   fragmented tool arguments and final usage. A failed stream emits an error
   without a successful finish or `[DONE]` marker.

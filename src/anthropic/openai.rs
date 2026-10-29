@@ -1126,6 +1126,52 @@ mod tests {
     }
 
     #[test]
+    fn chat_stream_final_zero_input_overwrites_initial_usage() {
+        let mut context = ChatStreamContext {
+            id: "chatcmpl_usage_test".into(),
+            created: 0,
+            model: "gpt-5.6-sol".into(),
+            tools: BTreeMap::new(),
+            usage: serde_json::Map::new(),
+            stop_reason: "end_turn".into(),
+            terminal: false,
+        };
+        context.handle(
+            "message_start",
+            json!({
+                "message": {"usage": {
+                    "input_tokens": 18228,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 1
+                }}
+            }),
+        );
+        context.handle(
+            "message_delta",
+            json!({
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 4,
+                    "cache_read_input_tokens": 18224,
+                    "output_tokens": 5
+                }
+            }),
+        );
+        let chunks = context.handle("message_stop", json!({}));
+        let final_chunk = std::str::from_utf8(&chunks[0]).unwrap();
+        let value: Value =
+            serde_json::from_str(final_chunk.strip_prefix("data: ").unwrap().trim()).unwrap();
+        assert_eq!(context.usage["input_tokens"], json!(0));
+        assert_eq!(value["usage"]["prompt_tokens"], json!(18228));
+        assert_eq!(context.usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(context.usage["cache_read_input_tokens"], json!(18224));
+        assert_eq!(value["usage"]["completion_tokens"], json!(5));
+        assert_eq!(value["usage"]["total_tokens"], json!(18233));
+    }
+
+    #[test]
     fn parse_anthropic_message_preserves_upstream_stop_reason() {
         for reason in ["max_tokens", "model_context_window_exceeded"] {
             let anthropic = json!({

@@ -53,7 +53,10 @@ enum Mode {
     SlowHeaders,
     SlowErrorBody,
     Structured(&'static str),
+    StructuredWithReasoning(&'static str),
     Search,
+    HiddenReasoning,
+    CachedUsage,
     MetadataFirst,
     Active,
     /// 上游内容过滤拦截：只有 reasoning，`metadataEvent.stopReason = CONTENT_FILTERED`，
@@ -159,8 +162,21 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
-            if let Mode::Structured(text) = mode {
-                let mut bytes = frame("assistantResponseEvent", json!({"content":text})).to_vec();
+            if matches!(mode, Mode::HiddenReasoning | Mode::CachedUsage) {
+                let mut bytes = Vec::new();
+                if matches!(mode, Mode::HiddenReasoning) {
+                    bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"I'm being asked about my training cutoff; hidden reasoning.","signature":"upstream-signature"})));
+                }
+                bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":"2025-01"})));
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":0,"outputTokens":17,"cacheReadInputTokens":18224,"cacheWriteInputTokens":4}})));
+                return Response::new(Body::from(bytes));
+            }
+            if let Mode::Structured(text) | Mode::StructuredWithReasoning(text) = mode {
+                let mut bytes = Vec::new();
+                if matches!(mode, Mode::StructuredWithReasoning(_)) {
+                    bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"private structured reasoning","signature":"private-structured-signature"})));
+                }
+                bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":text})));
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
                 return Response::new(Body::from(bytes));
             }
@@ -345,6 +361,58 @@ fn structured_request(stream: bool) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn gateway_disabled_thinking_keeps_reasoning_out_of_every_api() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::HiddenReasoning).await;
+            let response = request(f.state.clone(), endpoint, streaming).await;
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint}");
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8_lossy(&body);
+            assert!(wire.contains("2025-01"), "{endpoint}: {wire}");
+            assert!(!wire.contains("hidden reasoning"), "{endpoint}: {wire}");
+            assert!(!wire.contains("upstream-signature"), "{endpoint}: {wire}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_cached_stream_exposes_zero_initial_usage_and_one_final_snapshot() {
+    for endpoint in ["messages", "cc"] {
+        let f = fixture(Mode::CachedUsage).await;
+        let response = request(f.state.clone(), endpoint, true).await;
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let wire = String::from_utf8_lossy(&body);
+        let events: Vec<serde_json::Value> = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        assert_eq!(events.iter().filter(|event| event["type"] == "message_delta").count(), 1);
+        let start = &events
+            .iter()
+            .find(|event| event["type"] == "message_start")
+            .unwrap()["message"]["usage"];
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            assert_eq!(start[field], 0, "{endpoint}: {start}");
+        }
+        let usage = &events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .unwrap()["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["cache_creation_input_tokens"], 4);
+        assert_eq!(usage["cache_read_input_tokens"], 18224);
+        assert_eq!(usage["output_tokens"], 17);
+    }
+}
+
+#[tokio::test]
 async fn gateway_structured_json_and_sse_work_on_both_routes() {
     for cc in [false, true] {
         for streaming in [false, true] {
@@ -367,6 +435,71 @@ async fn gateway_structured_json_and_sse_work_on_both_routes() {
             }
             assert_eq!(f.calls.load(Ordering::Relaxed), 1);
             assert!(f.bodies.lock()[0].to_string().contains("JSON Schema"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_structured_json_hides_reasoning_and_preserves_known_buffered_usage() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::StructuredWithReasoning(r#"{"kind":"two","count":7}"#)).await;
+            let response =
+                compatibility_request(f.state.clone(), cc, structured_request(streaming)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8_lossy(&bytes);
+            assert!(!wire.contains("private structured reasoning"));
+            assert!(!wire.contains("private-structured-signature"));
+            assert!(wire.contains("count"));
+            if streaming {
+                let events: Vec<serde_json::Value> = wire
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                let usage = &events
+                    .iter()
+                    .find(|event| event["type"] == "message_start")
+                    .unwrap()["message"]["usage"];
+                assert_eq!(usage["input_tokens"], 13, "buffered input is already known");
+                assert_eq!(usage["output_tokens"], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_cached_usage_is_converted_once_by_chat_and_responses() {
+    for endpoint in ["chat", "responses"] {
+        let f = fixture(Mode::CachedUsage).await;
+        let response = request(f.state.clone(), endpoint, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let wire = String::from_utf8_lossy(&body);
+        let events: Vec<serde_json::Value> = wire
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|data| *data != "[DONE]")
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect();
+        if endpoint == "chat" {
+            let usage = &events
+                .iter()
+                .rev()
+                .find(|event| event["usage"].is_object())
+                .unwrap()["usage"];
+            assert_eq!(usage["prompt_tokens"], 18228);
+            assert_eq!(usage["completion_tokens"], 17);
+            assert_eq!(usage["total_tokens"], 18245);
+        } else {
+            let usage = &events
+                .iter()
+                .find(|event| event["type"] == "response.completed")
+                .unwrap()["response"]["usage"];
+            assert_eq!(usage["input_tokens"], 18228);
+            assert_eq!(usage["output_tokens"], 17);
+            assert_eq!(usage["total_tokens"], 18245);
         }
     }
 }
@@ -448,7 +581,49 @@ async fn gateway_pure_search_executes_and_uses_results_for_an_answer() {
             );
             assert!(wire.contains("server_tool_use"), "{wire}");
             assert!(wire.contains("web_search_tool_result"), "{wire}");
+            let usage = if streaming {
+                wire.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                    .find(|event| event["type"] == "message_delta")
+                    .unwrap()["usage"]
+                    .clone()
+            } else {
+                serde_json::from_str::<serde_json::Value>(&wire).unwrap()["usage"].clone()
+            };
+            assert_eq!(usage["server_tool_use"]["web_search_requests"], 1);
             assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_unused_search_tool_has_zero_requests_and_hides_unrequested_reasoning() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::HiddenReasoning).await;
+            let payload = json!({"model":"gpt-5.6-sol","stream":streaming,
+                "messages":[{"role":"user","content":"Only return the date"}],
+                "tools":[{"type":"web_search_20250305","name":"web_search"}]});
+            let response = compatibility_request(f.state.clone(), cc, payload).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8_lossy(&bytes);
+            assert!(wire.contains("2025-01"));
+            assert!(!wire.contains("hidden reasoning"));
+            assert!(!wire.contains("kiro_thinking"));
+            let usage = if streaming {
+                wire.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                    .find(|event| event["type"] == "message_delta")
+                    .unwrap()["usage"]
+                    .clone()
+            } else {
+                serde_json::from_str::<serde_json::Value>(&wire).unwrap()["usage"].clone()
+            };
+            assert_eq!(usage["server_tool_use"]["web_search_requests"], 0);
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
         }
     }
 }
@@ -702,7 +877,7 @@ async fn gateway_refused_round_does_not_execute_search() {
         if status != StatusCode::OK
             || calls != 1
             || !body.contains("\"refusal\"")
-            || body.contains("server_tool_use")
+            || body.contains(r#""type":"server_tool_use""#)
             || body.contains("web_search_tool_result")
         {
             failures.push(format!(

@@ -1564,8 +1564,14 @@ impl StreamContext {
         }
     }
 
-    /// 生成 message_start 事件
+    /// Generate the initial usage snapshot. Before provider metadata arrives,
+    /// token/cache allocation is unknown, so keep estimates internal and emit 0.
+    /// message_delta later replaces all four fields with the final snapshot.
     pub fn create_message_start_event(&self) -> serde_json::Value {
+        let usage = self
+            .provider_token_usage
+            .map(|usage| usage.sanitized())
+            .unwrap_or_default();
         json!({
             "type": "message_start",
             "message": {
@@ -1577,10 +1583,10 @@ impl StreamContext {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": self.input_tokens,
-                    "output_tokens": 1,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "input_tokens": usage.uncached_input_tokens,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": usage.cache_write_input_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens
                 }
             }
         })
@@ -2243,8 +2249,16 @@ impl StreamContext {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
+                // Upstream reasoning still consumes output tokens, but a client
+                // that did not enable thinking must not receive it as answer text.
                 self.output_tokens += estimate_tokens(text);
-                return self.create_text_delta_events(text);
+            }
+            if reasoning
+                .redacted_content
+                .as_deref()
+                .is_some_and(|data| !data.is_empty())
+            {
+                self.output_tokens += 8;
             }
             return Vec::new();
         }
@@ -5210,7 +5224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_native_reasoning_text_downgrades_to_text_when_thinking_disabled() {
+    fn test_native_reasoning_is_hidden_when_thinking_disabled() {
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -5220,19 +5234,22 @@ mod tests {
         );
         let mut all_events = ctx.generate_initial_events();
 
-        all_events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+        let reasoning_events = ctx.process_kiro_event(&Event::ReasoningContent(
             crate::kiro::model::events::ReasoningContentEvent {
-                text: Some("visible reasoning fallback".to_string()),
+                text: Some("private native reasoning".to_string()),
                 signature: Some("ignored-signature".to_string()),
                 redacted_content: Some("ignored-redacted".to_string()),
             },
-        )));
+        ));
+        assert!(reasoning_events.is_empty());
+        assert_eq!(
+            ctx.output_tokens,
+            estimate_tokens("private native reasoning") + 8
+        );
+        all_events.extend(reasoning_events);
         all_events.extend(ctx.generate_final_events());
 
-        assert_eq!(
-            collect_text_content(&all_events),
-            "visible reasoning fallback"
-        );
+        assert_eq!(collect_text_content(&all_events), "");
         assert_eq!(collect_thinking_content(&all_events), "");
         assert!(!all_events.iter().any(|e| {
             e.event == "content_block_delta" && e.data["delta"]["type"] == "signature_delta"
@@ -5241,6 +5258,35 @@ mod tests {
             e.event == "content_block_start"
                 && e.data["content_block"]["type"] == "redacted_thinking"
         }));
+    }
+
+    #[test]
+    fn test_disabled_thinking_preserves_only_the_final_answer() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let mut events = ctx.generate_initial_events();
+        events.extend(ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some("I should answer with the training cutoff date.".to_string()),
+                signature: Some("private-signature".to_string()),
+                redacted_content: None,
+            },
+        )));
+        events.extend(ctx.process_assistant_response("2025-01"));
+        events.extend(ctx.generate_final_events());
+
+        assert_eq!(collect_text_content(&events), "2025-01");
+        assert_eq!(collect_thinking_content(&events), "");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.to_sse_string().contains("private-signature"))
+        );
     }
 
     #[test]
@@ -5586,7 +5632,8 @@ mod tests {
             .find(|event| event.event == "message_start")
             .unwrap()
             .data["message"]["usage"];
-        assert_eq!(start_usage["input_tokens"], json!(100));
+        assert_eq!(start_usage["input_tokens"], json!(0));
+        assert_eq!(start_usage["output_tokens"], json!(0));
         assert_eq!(start_usage["cache_creation_input_tokens"], json!(0));
         assert_eq!(start_usage["cache_read_input_tokens"], json!(0));
         let delta_usage = &events
@@ -5595,5 +5642,72 @@ mod tests {
             .unwrap()
             .data["usage"];
         assert_eq!(delta_usage["output_tokens"], json!(11));
+        assert_eq!(delta_usage["input_tokens"], json!(3));
+        assert_eq!(delta_usage["cache_creation_input_tokens"], json!(4));
+        assert_eq!(delta_usage["cache_read_input_tokens"], json!(7));
+    }
+
+    #[test]
+    fn live_stream_keeps_zero_uncached_input_and_uses_the_latest_snapshot_once() {
+        use crate::kiro::model::events::MetadataEvent;
+        let mut ctx = StreamContext::new_with_thinking(
+            "test",
+            18228,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let initial = ctx.generate_initial_events();
+        let start = &initial
+            .iter()
+            .find(|event| event.event == "message_start")
+            .unwrap()
+            .data["message"]["usage"];
+        assert_eq!(
+            start,
+            &json!({"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0})
+        );
+        for input in [18228, 0, 0] {
+            ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
+                token_usage: Some(TokenUsage {
+                    uncached_input_tokens: input,
+                    output_tokens: 9,
+                    cache_write_input_tokens: 4,
+                    cache_read_input_tokens: 18224,
+                }),
+                ..Default::default()
+            }));
+        }
+        let final_events = ctx.generate_final_events();
+        let usage = &final_events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 0);
+        assert_eq!(usage["cache_creation_input_tokens"], 4);
+        assert_eq!(usage["cache_read_input_tokens"], 18224);
+        assert_eq!(usage["output_tokens"], 9);
+        assert_eq!(ctx.resolved_usage(), (0, 4, 18224));
+    }
+
+    #[test]
+    fn live_stream_with_no_metadata_keeps_internal_fallback_input() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test",
+            18228,
+            false,
+            HashMap::new(),
+            test_known_tools(),
+        );
+        let _ = ctx.generate_initial_events();
+        let events = ctx.generate_final_events();
+        let usage = &events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .unwrap()
+            .data["usage"];
+        assert_eq!(usage["input_tokens"], 18228);
+        assert_eq!(ctx.resolved_usage(), (18228, 0, 0));
     }
 }

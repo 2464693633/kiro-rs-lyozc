@@ -1853,6 +1853,14 @@ async fn execute_non_stream_request_with_format(
     // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
     let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
+    // Visibility and metering are separate: hiding native reasoning must not
+    // remove generated tokens from the metadata-free fallback estimate.
+    let hidden_reasoning_tokens = if !thinking_enabled {
+        (token::count_tokens(&native_thinking) as i32)
+            .saturating_add((native_redacted_thinking.len() as i32).saturating_mul(8))
+    } else {
+        0
+    };
     // 构建响应内容
     let mut content = build_non_stream_content(
         thinking_enabled,
@@ -1864,7 +1872,8 @@ async fn execute_non_stream_request_with_format(
     content.extend(tool_uses);
 
     // provider 未下发 metadataEvent 时才使用本地输出估算。
-    let fallback_output_tokens = token::estimate_output_tokens(&content);
+    let fallback_output_tokens =
+        estimate_non_stream_output_tokens(&content, hidden_reasoning_tokens);
     let (final_input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
         resolve_non_stream_usage(
             input_tokens,
@@ -1947,6 +1956,20 @@ async fn execute_non_stream_request_with_format(
     Ok(response_body)
 }
 
+fn estimate_non_stream_output_tokens(
+    content: &[serde_json::Value],
+    hidden_reasoning_tokens: i32,
+) -> i32 {
+    let visible = if content.is_empty() {
+        0
+    } else {
+        token::estimate_output_tokens(content)
+    };
+    visible
+        .saturating_add(hidden_reasoning_tokens.max(0))
+        .max(1)
+}
+
 fn build_non_stream_content(
     thinking_enabled: bool,
     text_content: String,
@@ -2003,11 +2026,6 @@ fn build_non_stream_content(
         content.push(json!({
             "type": "text",
             "text": text_content
-        }));
-    } else if has_native_thinking {
-        content.push(json!({
-            "type": "text",
-            "text": native_thinking
         }));
     }
     content
@@ -2075,9 +2093,9 @@ pub async fn count_tokens(
 
 /// POST /cc/v1/messages
 ///
-/// Claude Code 兼容端点，与 /v1/messages 的区别在于：
-/// - 流式响应会等待 kiro 端返回 contextUsageEvent 后再发送 message_start
-/// - message_start 中的 input_tokens 是从 contextUsageEvent 计算的准确值
+/// Claude Code compatible endpoint, using the same live stream as /v1/messages.
+/// Unknown initial usage is zero; the final message_delta carries a replacement
+/// snapshot, with exact provider metadata taking priority over local estimates.
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
@@ -2287,8 +2305,8 @@ async fn post_messages_cc_inner(
     }
 }
 
-/// Claude Code uses the live stream too. Initial usage is an estimate;
-/// message_delta carries the final provider usage without delaying content.
+/// Claude Code uses the live stream too. Unknown initial usage is zero;
+/// message_delta supplies the final replacement snapshot without delaying content.
 async fn handle_cc_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
@@ -2322,6 +2340,19 @@ async fn handle_cc_stream_request(
 mod tests {
     use super::*;
     use crate::model::config::ToolCompatibilityMode;
+
+    #[test]
+    fn hidden_non_stream_reasoning_remains_in_metadata_free_output_estimate() {
+        let reasoning = "This generated reasoning remains billable when hidden.";
+        let hidden = token::count_tokens(reasoning) as i32 + 8;
+        let visible = vec![json!({"type":"text","text":"2025-01"})];
+        assert_eq!(estimate_non_stream_output_tokens(&[], hidden), hidden);
+        assert_eq!(
+            estimate_non_stream_output_tokens(&visible, hidden),
+            token::estimate_output_tokens(&visible) + hidden
+        );
+        assert_eq!(estimate_non_stream_output_tokens(&[], 0), 1);
+    }
 
     #[test]
     fn thinking_alias_preserves_the_clients_output_schema_and_effort() {
@@ -2846,18 +2877,29 @@ mod tests {
     }
 
     #[test]
-    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+    fn non_stream_native_thinking_is_hidden_when_thinking_disabled() {
         let content = build_non_stream_content(
             false,
             String::new(),
-            "native thinking fallback".to_string(),
+            "private native thinking".to_string(),
             Some("ignored-signature".to_string()),
             vec!["ignored-redacted".to_string()],
         );
 
-        assert_eq!(content.len(), 1);
-        assert_eq!(content[0]["type"], "text");
-        assert_eq!(content[0]["text"], "native thinking fallback");
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn non_stream_disabled_thinking_preserves_only_the_final_answer() {
+        let content = build_non_stream_content(
+            false,
+            "2025-01".to_string(),
+            "I should answer with the training cutoff date.".to_string(),
+            Some("private-signature".to_string()),
+            vec!["private-redacted".to_string()],
+        );
+
+        assert_eq!(content, vec![json!({"type": "text", "text": "2025-01"})]);
     }
 
     #[test]

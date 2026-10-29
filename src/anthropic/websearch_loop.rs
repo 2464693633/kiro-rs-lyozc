@@ -1067,6 +1067,7 @@ impl WebSearchSseEmitter {
         token_usage: TokenUsage,
         thinking: &str,
         metering: Option<&MeteringEvent>,
+        web_search_requests: u32,
     ) {
         let content = without_web_search_presentation(content);
         let (mut events, next_index) = build_sse_content_events(&content, self.next_block_index);
@@ -1093,6 +1094,7 @@ impl WebSearchSseEmitter {
             "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
             "cache_read_input_tokens": token_usage.cache_read_input_tokens
         });
+        usage["server_tool_use"] = json!({"web_search_requests": web_search_requests});
         if let Some(metering) = metering {
             usage["credit_usage"] = json!(metering.usage);
             usage["credit_unit"] = json!(metering.unit);
@@ -1161,7 +1163,7 @@ where
     result
 }
 
-fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
+fn initial_stream_event(model: &str) -> SseEvent {
     let message_id = format!("msg_{}", &Uuid::new_v4().to_string().replace('-', "")[..24]);
     SseEvent::new(
         "message_start",
@@ -1176,10 +1178,13 @@ fn initial_stream_event(model: &str, input_tokens: i32) -> SseEvent {
                 "stop_reason": null,
                 "stop_sequence": null,
                 "usage": {
-                    "input_tokens": input_tokens.max(0),
+                    // Upstream cache allocation is unknown until final usage.
+                    // Do not mislabel an estimate as authoritative uncached input.
+                    "input_tokens": 0,
                     "output_tokens": 0,
                     "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0
+                    "cache_read_input_tokens": 0,
+                    "server_tool_use": {"web_search_requests": 0}
                 }
             }
         }),
@@ -1272,6 +1277,7 @@ async fn execute_web_search(
     group: Option<&str>,
     final_round: bool,
     emitter: &mut Option<&mut WebSearchSseEmitter>,
+    web_search_requests: &mut u32,
 ) -> anyhow::Result<Option<WebSearchResults>> {
     let query = tool_query(tool_use);
     let pending = if let Some(emitter) = emitter.as_deref_mut() {
@@ -1283,6 +1289,10 @@ async fn execute_web_search(
     let result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
+        // Count one logical server-tool invocation, including an empty result.
+        // Provider retries are part of that invocation; malformed inputs never
+        // call MCP and therefore must not increase this counter.
+        *web_search_requests = web_search_requests.saturating_add(1);
         match websearch::call_mcp_api(provider, &mcp_request, Some(tracer), group).await {
             Ok(response) => websearch::parse_search_results(&response),
             Err(error) if websearch::is_no_results_mcp_error(&error) => {
@@ -1377,13 +1387,7 @@ pub(super) async fn run_web_search_loop(
         .await;
     }
 
-    let initial_input_tokens = token::count_all_tokens(
-        payload.model.clone(),
-        payload.system.clone(),
-        payload.messages.clone(),
-        payload.tools.clone(),
-    ) as i32;
-    let initial_event = initial_stream_event(&payload.model, initial_input_tokens);
+    let initial_event = initial_stream_event(&payload.model);
     let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
     tokio::spawn(async move {
         let receiver_guard = sender.clone();
@@ -1451,6 +1455,11 @@ async fn run_web_search_loop_inner(
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
+    let mut web_search_requests = 0u32;
+    let expose_thinking = payload
+        .thinking
+        .as_ref()
+        .is_some_and(|thinking| thinking.is_enabled());
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let mut empty_retries = 0usize;
@@ -1581,6 +1590,7 @@ async fn run_web_search_loop_inner(
                     group.as_deref(),
                     false,
                     &mut emitter,
+                    &mut web_search_requests,
                 )
                 .await
                 {
@@ -1625,6 +1635,7 @@ async fn run_web_search_loop_inner(
                     group.as_deref(),
                     true,
                     &mut emitter,
+                    &mut web_search_requests,
                 )
                 .await
                 {
@@ -1683,6 +1694,11 @@ async fn run_web_search_loop_inner(
                 .into_response();
         }
         settlement.finish("success", "success", None, None);
+        let visible_thinking = if expose_thinking {
+            all_thinking.as_str()
+        } else {
+            ""
+        };
 
         return if let Some(emitter) = emitter.as_deref_mut() {
             emitter
@@ -1690,19 +1706,21 @@ async fn run_web_search_loop_inner(
                     content,
                     &stop_reason,
                     final_usage,
-                    &all_thinking,
+                    visible_thinking,
                     final_metering.as_ref(),
+                    web_search_requests,
                 )
                 .await;
             StatusCode::OK.into_response()
         } else {
-            render_json(
+            render_json_with_search_usage(
                 &payload.model,
                 content,
                 &stop_reason,
                 final_usage,
-                &all_thinking,
+                visible_thinking,
                 final_metering.as_ref(),
+                Some(web_search_requests),
             )
         };
     }
@@ -1731,6 +1749,7 @@ async fn run_web_search_loop_inner(
 /// unknown top-level fields and thus never replay an unsigned thinking block
 /// upstream, while the Responses translator picks it up for codex's
 /// reasoning-summary display.
+#[cfg(test)]
 pub(crate) fn render_json(
     model: &str,
     content: Vec<Value>,
@@ -1739,6 +1758,26 @@ pub(crate) fn render_json(
     thinking: &str,
     metering: Option<&MeteringEvent>,
 ) -> Response {
+    render_json_with_search_usage(
+        model,
+        content,
+        stop_reason,
+        token_usage,
+        thinking,
+        metering,
+        None,
+    )
+}
+
+fn render_json_with_search_usage(
+    model: &str,
+    content: Vec<Value>,
+    stop_reason: &str,
+    token_usage: TokenUsage,
+    thinking: &str,
+    metering: Option<&MeteringEvent>,
+    web_search_requests: Option<u32>,
+) -> Response {
     let token_usage = token_usage.sanitized();
     let mut usage = json!({
         "input_tokens": token_usage.uncached_input_tokens,
@@ -1746,6 +1785,9 @@ pub(crate) fn render_json(
         "cache_creation_input_tokens": token_usage.cache_write_input_tokens,
         "cache_read_input_tokens": token_usage.cache_read_input_tokens
     });
+    if let Some(count) = web_search_requests {
+        usage["server_tool_use"] = json!({"web_search_requests": count});
+    }
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro 后端口径
     // 一致的计费元数据；只在收到过 meteringEvent 时才追加。
     if let Some(m) = metering {
@@ -1846,11 +1888,18 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
         match btype {
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                // Preserve supplied citation objects verbatim. This adapter
+                // never invents an encrypted citation index from a URL/snippet.
+                let citations = block.get("citations").and_then(Value::as_array);
+                let mut start_block = json!({"type": "text", "text": ""});
+                if citations.is_some() {
+                    start_block["citations"] = json!([]);
+                }
                 events.push(SseEvent::new(
                     "content_block_start",
                     json!({
                         "type": "content_block_start", "index": index,
-                        "content_block": {"type": "text", "text": ""}
+                        "content_block": start_block
                     }),
                 ));
                 events.push(SseEvent::new(
@@ -1860,6 +1909,17 @@ fn build_sse_content_events(content: &[Value], start_index: i32) -> (Vec<SseEven
                         "delta": {"type": "text_delta", "text": text}
                     }),
                 ));
+                if let Some(citations) = citations {
+                    for citation in citations {
+                        events.push(SseEvent::new(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta", "index": index,
+                                "delta": {"type": "citations_delta", "citation": citation}
+                            }),
+                        ));
+                    }
+                }
                 events.push(SseEvent::new(
                     "content_block_stop",
                     json!({
@@ -1984,6 +2044,69 @@ mod tests {
         assert_eq!(tool_query(&tu_with_input(json!({"other": true}))), None);
     }
 
+    #[tokio::test]
+    async fn final_search_usage_agrees_in_json_and_sse_with_zero_or_multiple_calls() {
+        for count in [0, 2] {
+            // A declared tool alone does not imply execution; the caller supplies
+            // its completed loop's actual invocation count, including zero.
+            let response = render_json_with_search_usage(
+                "claude-opus-4-7",
+                vec![json!({"type":"text","text":"answer"})],
+                "end_turn",
+                token_usage(10, 5),
+                "",
+                None,
+                Some(count),
+            );
+            let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["usage"]["server_tool_use"]["web_search_requests"],
+                json!(count)
+            );
+            let (sender, mut receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
+            let mut emitter = WebSearchSseEmitter::new(sender);
+            emitter
+                .finish(
+                    vec![json!({"type":"text","text":"answer"})],
+                    "end_turn",
+                    token_usage(10, 5),
+                    "",
+                    None,
+                    count,
+                )
+                .await;
+            let events = drain_sse(&mut receiver);
+            let delta = events
+                .iter()
+                .find(|(event, _)| event == "message_delta")
+                .unwrap();
+            assert_eq!(delta.1["usage"], body["usage"]);
+        }
+    }
+
+    #[test]
+    fn sse_preserves_supplied_citations_before_closing_the_text_block() {
+        let citation = json!({"type":"web_search_result_location","url":"https://example.test/source",
+            "title":"Source", "encrypted_index":"upstream-opaque-value", "cited_text":"Original source text"});
+        let block = json!({"type":"text","text":"An answer.","citations":[citation.clone()]});
+        let (events, next_index) = build_sse_content_events(&[block], 4);
+        assert_eq!(next_index, 5);
+        assert_eq!(events[0].data["content_block"]["citations"], json!([]));
+        assert_eq!(events[1].data["delta"]["type"], "text_delta");
+        assert_eq!(events[2].data["delta"]["type"], "citations_delta");
+        assert_eq!(events[2].data["delta"]["citation"], citation);
+        assert_eq!(events[3].event, "content_block_stop");
+        assert!(events.iter().all(|event| event.data["index"] == 4));
+        let (uncited, _) =
+            build_sse_content_events(&[json!({"type":"text","text":"No source supplied"})], 0);
+        assert!(
+            uncited
+                .iter()
+                .all(|event| event.data["delta"]["type"] != "citations_delta")
+        );
+    }
+
     #[test]
     fn no_results_mcp_error_is_nonfatal() {
         assert!(websearch::is_no_results_mcp_error(&anyhow::anyhow!(
@@ -1997,7 +2120,7 @@ mod tests {
     #[tokio::test]
     async fn channel_response_exposes_message_start_before_background_progress() {
         let (sender, receiver) = mpsc::channel(WEB_SEARCH_PROGRESS_CAPACITY);
-        let response = render_channel_sse(initial_stream_event("gpt-5.6-sol", 17), receiver);
+        let response = render_channel_sse(initial_stream_event("gpt-5.6-sol"), receiver);
         let mut body = response.into_body().into_data_stream();
 
         let first = tokio::time::timeout(Duration::from_millis(100), body.next())
@@ -2007,7 +2130,16 @@ mod tests {
             .unwrap();
         let (event, data) = decode_sse(first);
         assert_eq!(event, "message_start");
-        assert_eq!(data["message"]["usage"]["input_tokens"], json!(17));
+        assert_eq!(data["message"]["usage"]["input_tokens"], json!(0));
+        assert_eq!(data["message"]["usage"]["output_tokens"], json!(0));
+        assert_eq!(
+            data["message"]["usage"]["cache_creation_input_tokens"],
+            json!(0)
+        );
+        assert_eq!(
+            data["message"]["usage"]["cache_read_input_tokens"],
+            json!(0)
+        );
 
         // Keep the sender alive through the assertion: the event came from the
         // response prefix rather than from progress-channel completion.
@@ -2066,6 +2198,7 @@ mod tests {
                 },
                 "search reasoning",
                 Some(&metering),
+                1,
             )
             .await;
         events.extend(drain_sse(&mut receiver));
@@ -2134,6 +2267,10 @@ mod tests {
         assert_eq!(delta["usage"]["cache_creation_input_tokens"], json!(4));
         assert_eq!(delta["usage"]["cache_read_input_tokens"], json!(7));
         assert_eq!(delta["usage"]["credit_usage"], json!(0.75));
+        assert_eq!(
+            delta["usage"]["server_tool_use"]["web_search_requests"],
+            json!(1)
+        );
         let reasoning_carrier = events
             .iter()
             .find(|(_, data)| data["kiro_thinking"] == "search reasoning")
