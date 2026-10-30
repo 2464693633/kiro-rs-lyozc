@@ -667,12 +667,15 @@ async fn gateway_identity_request_metadata_is_scoped_and_only_reaches_generation
                 let bodies = f.bodies.lock();
                 let generation = bodies.last().unwrap().to_string();
                 assert_eq!(generation.contains("Gateway request metadata:"), expected);
+                assert_eq!(generation.contains("reliable_knowledge_cutoff=2026-06"), expected);
+                assert_eq!(generation.contains("training_data_cutoff=2026-06"), expected);
                 assert!(generation.contains("Keep the client task and quoted Fable examples."));
                 assert!(generation.contains("What is your knowledge cutoff?"));
                 if expected {
                     assert!(generation.contains("not verification of the underlying model"));
                     assert_eq!(generation.matches("Gateway request metadata:").count(), 1);
                     assert!(!bodies[0].to_string().contains("Gateway request metadata:"));
+                    assert!(!bodies[0].to_string().contains("Published knowledge-cutoff metadata"));
                 }
             }
         }

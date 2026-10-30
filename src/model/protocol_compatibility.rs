@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::config::ProtocolCompatibilityConfig;
 
-pub const MODULE_VERSION: &str = "12";
+pub const MODULE_VERSION: &str = "13";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolCompatibilitySnapshot {

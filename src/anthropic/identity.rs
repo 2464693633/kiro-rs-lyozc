@@ -291,7 +291,11 @@ pub(super) fn apply_request_model_context(payload: &mut MessagesRequest, enabled
     {
         return;
     }
-    let text = REQUEST_MODEL_CONTEXT.replace("{{model}}", &json!(payload.model).to_string());
+    let text = format!(
+        "{}\n{}",
+        REQUEST_MODEL_CONTEXT.replace("{{model}}", &json!(payload.model).to_string()),
+        super::model_metadata::knowledge_context(&payload.model)
+    );
     let system = payload.system.get_or_insert_with(Vec::new);
     if !system.iter().any(|message| message.text == text) {
         system.push(SystemMessage {
