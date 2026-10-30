@@ -49,7 +49,13 @@ enum Mode {
     InvalidFrame,
     Empty,
     Tools,
-    Execution { client_tool: bool },
+    Execution {
+        client_tool: bool,
+    },
+    ExecutionRateLimit {
+        failures: usize,
+        retry_after: &'static str,
+    },
     ExecutionSchema,
     ExecutionSearch,
     Stalled,
@@ -243,7 +249,13 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 bytes.extend_from_slice(&frame("metadataEvent",json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
                 return Response::new(Body::from(bytes));
             }
-            if matches!(mode, Mode::Execution { .. } | Mode::ExecutionSchema) {
+            if matches!(mode, Mode::Execution { .. } | Mode::ExecutionSchema | Mode::ExecutionRateLimit { .. }) {
+                if let Mode::ExecutionRateLimit { failures, retry_after } = mode {
+                    if request.to_string().contains("No command was run.") && calls.load(Ordering::Relaxed) <= failures + 1 {
+                        return Response::builder().status(429).header("retry-after",retry_after)
+                            .body(Body::from(r#"{"message":"Too many requests","reason":"USER_REQUEST_RATE_EXCEEDED"}"#)).unwrap();
+                    }
+                }
                 let client_tool=matches!(mode, Mode::Execution { client_tool:true });
                 let mut bytes = if request.to_string().contains("No command was run.") {
                     frame("assistantResponseEvent", json!({"content":if matches!(mode,Mode::ExecutionSchema) { "{\"ok\":true}" } else { "The execution backend is unavailable; no command was run." }})).to_vec()
@@ -1083,6 +1095,149 @@ fn enable_execution_bridge(state: &AppState) {
             |_| Ok(()),
         )
         .unwrap();
+}
+
+async fn rate_limited_execution_fixture(failures: usize, retry_after: &'static str) -> Fixture {
+    let mut config = Config::default();
+    config.account_throttle_failover = false;
+    config.model_api_429_retry_enabled = false;
+    let fixture = fixture_with_config(
+        Mode::ExecutionRateLimit {
+            failures,
+            retry_after,
+        },
+        config,
+    )
+    .await;
+    enable_execution_bridge(&fixture.state);
+    fixture
+}
+
+#[tokio::test]
+async fn gateway_execution_continuation_rate_limit_recovers_without_repeating_tool_calls() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = rate_limited_execution_fixture(1, "1").await;
+            let response =
+                compatibility_request(f.state.clone(), cc, execution_request(streaming)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let wire = String::from_utf8(bytes.to_vec()).unwrap();
+            let blocks: Vec<serde_json::Value> = if streaming {
+                let events: Vec<serde_json::Value> = wire
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["type"] == "message_start")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event["type"] == "message_stop")
+                        .count(),
+                    1
+                );
+                assert!(events.iter().all(|event| event["type"] != "error"));
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "content_block_start")
+                    .enumerate()
+                    .map(|(index, event)| {
+                        assert_eq!(event["index"], index);
+                        event["content_block"].clone()
+                    })
+                    .collect()
+            } else {
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["content"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            };
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "server_tool_use")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|block| block["type"] == "bash_code_execution_tool_result")
+                    .count(),
+                1
+            );
+            assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+            let bodies = f.bodies.lock();
+            assert_eq!(
+                bodies
+                    .iter()
+                    .filter(|body| !body.to_string().contains("No command was run."))
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_execution_stream_preserves_completed_tools_when_retry_after_exceeds_deadline() {
+    let f = rate_limited_execution_fixture(10, "120").await;
+    let response = compatibility_request(f.state.clone(), false, execution_request(true)).await;
+    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let events: Vec<serde_json::Value> = String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    let result = events
+        .iter()
+        .position(|event| event["content_block"]["type"] == "bash_code_execution_tool_result")
+        .unwrap();
+    let failure = events
+        .iter()
+        .position(|event| event["type"] == "error")
+        .unwrap();
+    assert!(result < failure);
+    assert_eq!(events[failure]["error"]["type"], "rate_limit_error");
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "message_stop" && event["type"] != "message_delta")
+    );
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn gateway_execution_disconnect_during_backoff_stops_retries() {
+    let f = rate_limited_execution_fixture(10, "1").await;
+    let response = compatibility_request(f.state.clone(), false, execution_request(true)).await;
+    let mut body = response.into_body().into_data_stream();
+    let mut saw_result = false;
+    while let Some(chunk) = body.next().await {
+        if String::from_utf8_lossy(&chunk.unwrap()).contains("bash_code_execution_tool_result") {
+            saw_result = true;
+            break;
+        }
+    }
+    assert!(saw_result);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while f.calls.load(Ordering::Relaxed) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(body);
+    tokio::time::sleep(Duration::from_millis(1250)).await;
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
 }
 
 #[tokio::test]

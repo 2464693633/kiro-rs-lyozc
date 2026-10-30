@@ -1,7 +1,13 @@
 //! Server-tool compatibility bridge. No commands are run by this process.
 //! A selected execution tool produces an explicit unavailable error and is
 //! returned to the model; ordinary client tools remain client-owned.
-use std::{collections::HashSet, convert::Infallible, panic::AssertUnwindSafe, time::Duration};
+use std::{
+    collections::HashSet,
+    convert::Infallible,
+    panic::AssertUnwindSafe,
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
+    time::Duration,
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -28,6 +34,57 @@ const EDITOR: &str = "__kiro_server_text_editor_execution";
 const MAX_ROUNDS: usize = 4;
 const MAX_BODY: usize = 8 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_CONTINUATION_RETRIES: usize = 2;
+
+struct Progress {
+    sender: mpsc::Sender<Bytes>,
+    emitted: Arc<AtomicUsize>,
+}
+
+impl Progress {
+    async fn publish(&self, content: &[Value]) -> Result<(), ()> {
+        let offset = self.emitted.load(Ordering::Acquire);
+        for event in structured_output::content_events(&content[offset..], offset) {
+            self.sender
+                .send(Bytes::from(event.to_sse_string()))
+                .await
+                .map_err(|_| ())?;
+        }
+        self.emitted.store(content.len(), Ordering::Release);
+        Ok(())
+    }
+}
+
+fn continuation_retry_delay(
+    response: &Response,
+    retry: usize,
+    elapsed: Duration,
+) -> Option<Duration> {
+    if response.status() != StatusCode::TOO_MANY_REQUESTS || retry >= MAX_CONTINUATION_RETRIES {
+        return None;
+    }
+    let seconds = match response.headers().get(header::RETRY_AFTER) {
+        Some(value) => {
+            let value = value.to_str().ok()?;
+            match value.parse::<u64>() {
+                Ok(seconds) => seconds,
+                Err(_) => {
+                    let time = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+                    time.timestamp()
+                        .saturating_sub(chrono::Utc::now().timestamp())
+                        .max(0) as u64
+                }
+            }
+        }
+        None => 5 * (1 << retry),
+    };
+    let delay = Duration::from_secs(seconds.max(1));
+    // Never shorten an upstream Retry-After to fit the bridge deadline.
+    TIMEOUT
+        .checked_sub(elapsed)
+        .filter(|remaining| remaining.as_secs() > delay.as_secs().saturating_add(1))?;
+    Some(delay)
+}
 
 #[derive(Clone)]
 pub(super) struct Plan;
@@ -233,7 +290,9 @@ async fn run_rounds(
     mut payload: MessagesRequest,
     cc: bool,
     _plan: Plan,
+    progress: Option<Progress>,
 ) -> Response {
+    let started = tokio::time::Instant::now();
     payload.stream = false;
     let mut presentation = Vec::new();
     let mut usage = json!({});
@@ -263,12 +322,33 @@ async fn run_rounds(
                 tool.max_uses = Some(limit.saturating_sub(searches_used).max(0));
             }
         }
-        let response = if cc {
-            handlers::post_messages_cc_inner(state.clone(), key.clone(), round_payload).await
-        } else {
-            handlers::post_messages_inner(state.clone(), key.clone(), round_payload).await
+        let mut retry = 0;
+        let response = loop {
+            let response = if cc {
+                handlers::post_messages_cc_inner(state.clone(), key.clone(), round_payload.clone())
+                    .await
+            } else {
+                handlers::post_messages_inner(state.clone(), key.clone(), round_payload.clone())
+                    .await
+            };
+            if round > 0
+                && let Some(delay) = continuation_retry_delay(&response, retry, started.elapsed())
+            {
+                retry += 1;
+                tracing::warn!(
+                    round,
+                    retry,
+                    delay_secs = delay.as_secs(),
+                    "execution bridge continuation rate limited; waiting before retry"
+                );
+                drop(response);
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            break response;
         };
         if !response.status().is_success() {
+            tracing::warn!(round, status=%response.status(), completed_blocks=presentation.len(), "execution bridge upstream round failed");
             return response;
         }
         let bytes = match to_bytes(response.into_body(), MAX_BODY).await {
@@ -331,6 +411,21 @@ async fn run_rounds(
                 client_tools = true;
             }
             presentation.push(block.clone());
+        }
+        if selected {
+            tracing::info!(
+                round,
+                server_tools = feedback.len(),
+                "execution bridge completed tool round"
+            );
+        }
+        if let Some(progress) = progress.as_ref() {
+            if progress.publish(&presentation).await.is_err() {
+                return error(
+                    StatusCode::BAD_GATEWAY,
+                    "Execution bridge client disconnected",
+                );
+            }
         }
         if !selected || client_tools {
             message["content"] = json!(presentation);
@@ -409,7 +504,8 @@ pub(super) async fn run(
     plan: Plan,
 ) -> Response {
     if !payload.stream {
-        return match tokio::time::timeout(TIMEOUT, run_rounds(state, key, payload, cc, plan)).await
+        return match tokio::time::timeout(TIMEOUT, run_rounds(state, key, payload, cc, plan, None))
+            .await
         {
             Ok(response) => response,
             Err(_) => error(
@@ -422,15 +518,24 @@ pub(super) async fn run(
     let initial = json!({"type":"message_start","message":{"id":format!("msg_{}",Uuid::new_v4().simple()),"type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}});
     let (sender, receiver) = mpsc::channel::<Bytes>(16);
     tokio::spawn(async move {
+        let emitted = Arc::new(AtomicUsize::new(0));
+        // A structured answer may still need rewriting/validation at the end;
+        // preserve its buffered path so no unvalidated JSON is emitted.
+        let progress = structured_output::format(&payload)
+            .is_none()
+            .then(|| Progress {
+                sender: sender.clone(),
+                emitted: emitted.clone(),
+            });
         let work = AssertUnwindSafe(tokio::time::timeout(
             TIMEOUT,
-            run_rounds(state, key, payload, cc, plan),
+            run_rounds(state, key, payload, cc, plan, progress),
         ))
         .catch_unwind();
         tokio::pin!(work);
         let mut interval = tokio::time::interval_at(
-            tokio::time::Instant::now() + Duration::from_secs(25),
-            Duration::from_secs(25),
+            tokio::time::Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(10),
         );
         let response = loop {
             tokio::select! {
@@ -449,6 +554,12 @@ pub(super) async fn run(
                 Some(message) => structured_output::sse_events(&message)
                     .into_iter()
                     .skip(1)
+                    .filter(|event| {
+                        !event.event.starts_with("content_block_")
+                            || event.data["index"].as_u64().is_some_and(|index| {
+                                index as usize >= emitted.load(Ordering::Acquire)
+                            })
+                    })
                     .collect(),
                 None => vec![SseEvent::new(
                     "error",
@@ -493,6 +604,65 @@ pub(super) async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn continuation_backoff_honors_headers_retry_count_and_total_deadline() {
+        let limited = Response::builder()
+            .status(429)
+            .header(header::RETRY_AFTER, "3")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            continuation_retry_delay(&limited, 0, Duration::ZERO),
+            Some(Duration::from_secs(3))
+        );
+        assert!(continuation_retry_delay(&limited, 2, Duration::ZERO).is_none());
+        assert!(continuation_retry_delay(&limited, 0, Duration::from_secs(117)).is_none());
+        let missing = Response::builder().status(429).body(Body::empty()).unwrap();
+        assert_eq!(
+            continuation_retry_delay(&missing, 0, Duration::ZERO),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            continuation_retry_delay(&missing, 1, Duration::ZERO),
+            Some(Duration::from_secs(10))
+        );
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(10))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let dated = Response::builder()
+            .status(429)
+            .header(header::RETRY_AFTER, future)
+            .body(Body::empty())
+            .unwrap();
+        assert!(
+            (8..=10).contains(
+                &continuation_retry_delay(&dated, 0, Duration::ZERO)
+                    .unwrap()
+                    .as_secs()
+            )
+        );
+        for status in [400, 401, 403, 500, 503] {
+            assert!(
+                continuation_retry_delay(
+                    &Response::builder()
+                        .status(status)
+                        .body(Body::empty())
+                        .unwrap(),
+                    0,
+                    Duration::ZERO
+                )
+                .is_none()
+            );
+        }
+        for header in ["invalid", "120", "18446744073709551615"] {
+            let response = Response::builder()
+                .status(429)
+                .header(header::RETRY_AFTER, header)
+                .body(Body::empty())
+                .unwrap();
+            assert!(continuation_retry_delay(&response, 0, Duration::ZERO).is_none());
+        }
+    }
     fn request() -> MessagesRequest {
         serde_json::from_value(json!({"model":"claude-opus-5-5","messages":[{"role":"user","content":"Run a calculation"}],"tools":[{"type":"code_execution_20250825","name":"code_execution"}]})).unwrap()
     }

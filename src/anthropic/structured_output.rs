@@ -363,6 +363,51 @@ pub(super) async fn as_sse(response: Response) -> Response {
     response
 }
 
+pub(super) fn content_events(blocks: &[Value], offset: usize) -> Vec<SseEvent> {
+    let mut events = Vec::new();
+    for (local_index, block) in blocks.iter().enumerate() {
+        let index = offset + local_index;
+        let mut start = block.clone();
+        let mut deltas = Vec::new();
+        match block["type"].as_str() {
+            Some("text") => {
+                start["text"] = json!("");
+                deltas.push(json!({"type":"text_delta","text":block["text"]}));
+            }
+            Some("tool_use" | "server_tool_use") => {
+                start["input"] = json!({});
+                deltas.push(
+                    json!({"type":"input_json_delta","partial_json":block["input"].to_string()}),
+                );
+            }
+            Some("thinking") => {
+                start["thinking"] = json!("");
+                start["signature"] = json!("");
+                deltas.push(json!({"type":"thinking_delta","thinking":block["thinking"]}));
+                if let Some(signature) = block.get("signature") {
+                    deltas.push(json!({"type":"signature_delta","signature":signature}));
+                }
+            }
+            _ => {}
+        }
+        events.push(SseEvent::new(
+            "content_block_start",
+            json!({"type":"content_block_start","index":index,"content_block":start}),
+        ));
+        for delta in deltas {
+            events.push(SseEvent::new(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":index,"delta":delta}),
+            ));
+        }
+        events.push(SseEvent::new(
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":index}),
+        ));
+    }
+    events
+}
+
 pub(super) fn sse_events(message: &Value) -> Vec<SseEvent> {
     let mut start = message.clone();
     start["content"] = json!([]);
@@ -374,43 +419,7 @@ pub(super) fn sse_events(message: &Value) -> Vec<SseEvent> {
         json!({"type":"message_start","message":start}),
     )];
     if let Some(blocks) = message["content"].as_array() {
-        for (index, block) in blocks.iter().enumerate() {
-            let mut start = block.clone();
-            let mut deltas = Vec::new();
-            match block["type"].as_str() {
-                Some("text") => {
-                    start["text"] = json!("");
-                    deltas.push(json!({"type":"text_delta","text":block["text"]}));
-                }
-                Some("tool_use" | "server_tool_use") => {
-                    start["input"] = json!({});
-                    deltas.push(json!({"type":"input_json_delta","partial_json":block["input"].to_string()}));
-                }
-                Some("thinking") => {
-                    start["thinking"] = json!("");
-                    start["signature"] = json!("");
-                    deltas.push(json!({"type":"thinking_delta","thinking":block["thinking"]}));
-                    if let Some(signature) = block.get("signature") {
-                        deltas.push(json!({"type":"signature_delta","signature":signature}));
-                    }
-                }
-                _ => {}
-            }
-            events.push(SseEvent::new(
-                "content_block_start",
-                json!({"type":"content_block_start","index":index,"content_block":start}),
-            ));
-            for delta in deltas {
-                events.push(SseEvent::new(
-                    "content_block_delta",
-                    json!({"type":"content_block_delta","index":index,"delta":delta}),
-                ));
-            }
-            events.push(SseEvent::new(
-                "content_block_stop",
-                json!({"type":"content_block_stop","index":index}),
-            ));
-        }
+        events.extend(content_events(blocks, 0));
     }
     events.push(SseEvent::new("message_delta", json!({"type":"message_delta",
         "delta":{"stop_reason":message["stop_reason"],"stop_sequence":message["stop_sequence"]},"usage":message["usage"]})));
