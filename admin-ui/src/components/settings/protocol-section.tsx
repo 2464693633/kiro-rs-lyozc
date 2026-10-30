@@ -213,7 +213,7 @@ export function ProtocolSection() {
           </SettingRow>
           <SettingRow
             label="搜索上下文封装"
-            hint="为实际搜索结果生成可回传的上下文，支持后续追问；上下文有效期 24 小时并绑定当前 Key。旧版明文结果需要重新搜索。"
+            hint="为真实搜索结果生成可回传的上下文并绑定当前 Key。超过 24 小时仍可作为历史资料追问，会提示资料可能过时；旧版明文结果需要重新搜索。"
           >
             <Switch
               checked={draft?.searchContextCompat ?? false}

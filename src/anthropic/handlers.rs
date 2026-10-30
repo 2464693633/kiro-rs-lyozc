@@ -856,25 +856,28 @@ async fn post_compatible_messages(
         return super::code_execution::run(state, key_ctx, payload, cc, plan).await;
     }
     let buffered_sse = structured && payload.stream;
+    let response_model = payload.model.clone();
     let identity_format = super::structured_output::format(&payload).cloned();
     if buffered_sse {
         payload.stream = false;
     }
-    let response = if cc {
-        post_messages_cc_inner(state, key_ctx, payload).await
-    } else {
-        post_messages_inner(state, key_ctx, payload).await
+    let response = async move {
+        let response = if cc {
+            post_messages_cc_inner(state, key_ctx, payload).await
+        } else {
+            post_messages_inner(state, key_ctx, payload).await
+        };
+        super::structured_output::present_identity_response(
+            response,
+            identity_format.as_ref(),
+            compatibility.structured_identity_compat,
+        )
+        .await
     };
-    let response = super::structured_output::present_identity_response(
-        response,
-        identity_format.as_ref(),
-        compatibility.structured_identity_compat,
-    )
-    .await;
     if buffered_sse {
-        super::structured_output::as_sse(response).await
+        super::structured_output::with_keepalive(response_model, response).await
     } else {
-        response
+        response.await
     }
 }
 

@@ -9,7 +9,126 @@ use axum::{
     http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
+use bytes::Bytes;
+use futures::{FutureExt, StreamExt, stream};
 use serde_json::{Value, json};
+use std::{convert::Infallible, future::Future, panic::AssertUnwindSafe, time::Duration};
+use tokio::sync::mpsc;
+
+/// Preserve HTTP errors for promptly completed requests. Long-running requests
+/// open SSE after a short grace period and keep it alive until validation ends.
+pub(super) async fn with_keepalive(
+    model: String,
+    response: impl Future<Output = Response> + Send + 'static,
+) -> Response {
+    buffered_stream(
+        model,
+        response,
+        Duration::from_secs(1),
+        Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn buffered_stream(
+    model: String,
+    response: impl Future<Output = Response> + Send + 'static,
+    grace: Duration,
+    heartbeat: Duration,
+) -> Response {
+    let mut work = Box::pin(AssertUnwindSafe(response).catch_unwind());
+    match tokio::time::timeout(grace, &mut work).await {
+        Ok(Ok(response)) => return as_sse(response).await,
+        Ok(Err(_)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::new(
+                    "api_error",
+                    "Structured response failed",
+                )),
+            )
+                .into_response();
+        }
+        Err(_) => {}
+    }
+    let initial = json!({"type":"message_start","message":{
+        "id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant",
+        "model":model,"content":[],"stop_reason":null,"stop_sequence":null,
+        "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+    }});
+    let (sender, receiver) = mpsc::channel::<Bytes>(16);
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval_at(tokio::time::Instant::now() + heartbeat, heartbeat);
+        let response = loop {
+            tokio::select! {
+                biased;
+                _ = sender.closed() => return,
+                result = &mut work => break result,
+                _ = interval.tick() => {
+                    if sender.send(Bytes::from(SseEvent::new("ping",json!({"type":"ping"})).to_sse_string())).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        };
+        let events = match response {
+            Ok(response) => {
+                let status = response.status();
+                let body = tokio::select! {
+                    biased;
+                    _ = sender.closed() => return,
+                    body = to_bytes(response.into_body(), 8 * 1024 * 1024) => body,
+                }
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                match body {
+                    Some(message) if status.is_success() && message["content"].is_array() => {
+                        sse_events(&message).into_iter().skip(1).collect()
+                    }
+                    body => vec![SseEvent::new(
+                        "error",
+                        json!({"type":"error","error":body
+                        .and_then(|message|message.get("error").cloned())
+                        .unwrap_or_else(||json!({"type":"api_error","message":"Invalid structured response"}))}),
+                    )],
+                }
+            }
+            Err(_) => vec![SseEvent::new(
+                "error",
+                json!({"type":"error","error":{
+                    "type":"api_error","message":"Structured response failed"
+                }}),
+            )],
+        };
+        for event in events {
+            if sender
+                .send(Bytes::from(event.to_sse_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    let initial = stream::once(async move {
+        Ok::<_, Infallible>(Bytes::from(
+            SseEvent::new("message_start", initial).to_sse_string(),
+        ))
+    });
+    let rest = stream::unfold(receiver, |mut receiver| async {
+        receiver
+            .recv()
+            .await
+            .map(|bytes| (Ok::<_, Infallible>(bytes), receiver))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(initial.chain(rest)))
+        .unwrap()
+}
 
 pub(super) fn format(payload: &MessagesRequest) -> Option<&Value> {
     payload.output_config.as_ref()?.format.as_ref()
@@ -305,6 +424,174 @@ pub(super) fn sse_events(message: &Value) -> Vec<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn collect_events(
+        mut body: impl futures::Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+    ) -> Vec<Value> {
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn keepalive_precedes_validated_output_and_preserves_terminal_events() {
+        let (finish, completed) = tokio::sync::oneshot::channel();
+        let message = json!({"type":"message","id":"upstream-id","role":"assistant","model":"claude-opus-5-5",
+            "content":[{"type":"thinking","thinking":"","signature":"opaque-original"},{"type":"text","text":"{\"ok\":true}"}],
+            "stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":13,"output_tokens":17}});
+        let response = buffered_stream(
+            "claude-opus-5-5".into(),
+            async move {
+                completed.await.unwrap();
+                Json(message).into_response()
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        let first = String::from_utf8(first.to_vec()).unwrap();
+        assert!(first.contains("message_start"));
+        assert!(!first.contains("opaque-original"));
+        let ping = tokio::time::timeout(Duration::from_secs(1), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&ping).contains("event: ping"));
+        finish.send(()).unwrap();
+        let events = collect_events(body).await;
+        assert!(events.iter().all(|event| event["type"] != "message_start"));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_stop")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_delta")
+                .count(),
+            1
+        );
+        let delta = events
+            .iter()
+            .find(|event| event["type"] == "message_delta")
+            .unwrap();
+        assert_eq!(delta["usage"]["input_tokens"], 13);
+        assert_eq!(delta["delta"]["stop_reason"], "end_turn");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["delta"]["signature"] == "opaque-original")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["delta"]["text"] == "{\"ok\":true}")
+        );
+    }
+
+    #[tokio::test]
+    async fn keepalive_preserves_fast_http_errors_and_late_errors_have_no_success_end() {
+        let failure = || {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse::new(
+                    "upstream_output_schema_error",
+                    "Schema mismatch",
+                )),
+            )
+                .into_response()
+        };
+        let response = buffered_stream(
+            "model".into(),
+            async move { failure() },
+            Duration::from_secs(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let (finish, completed) = tokio::sync::oneshot::channel();
+        let response = buffered_stream(
+            "model".into(),
+            async move {
+                completed.await.unwrap();
+                failure()
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        finish.send(()).unwrap();
+        let events = collect_events(response.into_body().into_data_stream()).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "message_start")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event["error"]["type"] == "upstream_output_schema_error")
+        );
+        assert!(events.iter().all(|event| !matches!(
+            event["type"].as_str(),
+            Some("content_block_start" | "content_block_delta" | "message_stop" | "message_delta")
+        )));
+    }
+
+    #[tokio::test]
+    async fn keepalive_disconnect_cancels_pending_generation() {
+        struct OnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (cancelled, wait_cancelled) = tokio::sync::oneshot::channel();
+        let guard = OnDrop(Some(cancelled));
+        let response = buffered_stream(
+            "model".into(),
+            async move {
+                let _guard = guard;
+                futures::future::pending::<Response>().await
+            },
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+        )
+        .await;
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(1), wait_cancelled)
+            .await
+            .expect("Generation continued after disconnect")
+            .unwrap();
+    }
+
     fn identity_format() -> Value {
         json!({"type":"json_schema","schema":{"type":"object","properties":{
             "identity_platform":{"type":"string","enum":["claude_code","kiro","other"]},

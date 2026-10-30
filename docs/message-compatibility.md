@@ -23,7 +23,7 @@
 - 非法/不支持的 Schema：400。
 - 上游最终答案不是合法 JSON 或不符合 Schema：502，`upstream_output_schema_error`；请求链路记为失败，并保留实际消耗用量。
 - `tool_use`、拒答、`max_tokens` 等停止原因保持原语义，不能按正常完成的结构化答案使用。
-- 流式请求先缓冲并校验，再输出 Anthropic SSE，首个内容事件会等待模型完成。保持工具参数、上游签名和用量。
+- 流式请求先缓冲并校验，正文会等待模型完成；等待超过 1 秒时提前发送 `message_start`，每 10 秒发送 `ping`。流内失败发送 `error` 并结束，不发送成功结束事件。参见 [协议兼容](protocol-compatibility.md) 的等待与保活说明。
 - 不自动重试、不伪造字段、不改写模型身份；Schema 适配仍消耗正常模型用量。
 - 仅支持本地片段引用，不下载 HTTP/file Schema。
 

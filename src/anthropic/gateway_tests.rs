@@ -56,6 +56,7 @@ enum Mode {
     SlowHeaders,
     SlowErrorBody,
     Structured(&'static str),
+    SlowStructured(&'static str),
     StructuredWithReasoning(&'static str),
     StructuredWithSignatureOnly(&'static str),
     Signature {
@@ -187,7 +188,8 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":0,"outputTokens":17,"cacheReadInputTokens":18224,"cacheWriteInputTokens":4}})));
                 return Response::new(Body::from(bytes));
             }
-            if let Mode::Structured(text) | Mode::StructuredWithReasoning(text) | Mode::StructuredWithSignatureOnly(text) = mode {
+            if let Mode::Structured(text) | Mode::SlowStructured(text) | Mode::StructuredWithReasoning(text) | Mode::StructuredWithSignatureOnly(text) = mode {
+                if matches!(mode, Mode::SlowStructured(_)) { tokio::time::sleep(Duration::from_secs(2)).await; }
                 let mut bytes = Vec::new();
                 if matches!(mode, Mode::StructuredWithReasoning(_)) {
                     bytes.extend_from_slice(&frame("reasoningContentEvent", json!({"text":"private structured reasoning","signature":"private-structured-signature"})));
@@ -617,6 +619,112 @@ async fn gateway_search_context_roundtrips_without_repeating_search_and_checks_s
             }
         }
     }
+}
+
+#[tokio::test]
+async fn gateway_historical_search_context_survives_a_month_and_restart() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let mut config = Config::default();
+            config.admin_api_key = Some("fixture-context-secret".into());
+            let history = super::search_context::historical_fixture(&config, 0);
+            // A separately created runtime has no cache from the original search.
+            let f = fixture_with_config(Mode::Search, config).await;
+            f.state
+                .protocol_compatibility
+                .update_with_persistence(
+                    crate::model::config::ProtocolCompatibilityConfig {
+                        search_context_compat: true,
+                        enabled_key_ids: vec![0],
+                        ..Default::default()
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+            let request = json!({"model":"claude-opus-5-5","max_tokens":128,"stream":streaming,
+                "messages":[{"role":"user","content":"Previous search"},
+                    {"role":"assistant","content":history},
+                    {"role":"user","content":"Continue using our previous sources"}]});
+            let message = parsed_protocol_message(
+                compatibility_request(f.state.clone(), cc, request).await,
+                streaming,
+            )
+            .await;
+            assert_eq!(
+                message["content"][0]["text"],
+                "Synthesized answer using search evidence."
+            );
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+            let sent = f.bodies.lock()[0].to_string();
+            assert!(sent.contains("historical; may be outdated"));
+            assert!(!sent.contains("encrypted_content"));
+            assert!(f.bodies.lock().iter().all(|body| body["jsonrpc"] != "2.0"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_slow_structured_identity_opens_stream_before_completion() {
+    let f = fixture(Mode::SlowStructured(
+        "{\"identity_platform\":\"kiro\",\"desc\":\"I am Kiro\"}",
+    ))
+    .await;
+    f.state
+        .protocol_compatibility
+        .update_with_persistence(
+            crate::model::config::ProtocolCompatibilityConfig {
+                structured_identity_compat: true,
+                enabled_key_ids: vec![0],
+                ..Default::default()
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_millis(1800),
+        compatibility_request(f.state.clone(), true, identity_request(true)),
+    )
+    .await
+    .expect("Headers waited for the complete answer");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_millis(200), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+    assert!(!String::from_utf8_lossy(&first).contains("identity_platform"));
+    let mut wire = first.to_vec();
+    while let Some(chunk) = body.next().await {
+        wire.extend_from_slice(&chunk.unwrap());
+    }
+    let events: Vec<serde_json::Value> = String::from_utf8(wire)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|data| serde_json::from_str(data).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "message_stop")
+            .count(),
+        1
+    );
+    let text: String = events
+        .iter()
+        .filter_map(|event| event["delta"]["text"].as_str())
+        .collect();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["identity_platform"], "claude_code");
 }
 
 #[tokio::test]
