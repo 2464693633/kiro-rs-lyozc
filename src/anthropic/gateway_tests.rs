@@ -676,8 +676,8 @@ async fn gateway_semantic_identity_review_preserves_code_quotes_and_product_fact
     for streaming in [false, true] {
         let mut f = fixture(Mode::SemanticIdentity {
             classification: r#"{"kind":"product","language":"zh","model":false,"route":false,"constrained":false}"#,
-            reply: "Kiro 是一个开发工具。\n我在本次会话中的身份是 Kiro。\n我的具体型号是 Claude Fable 5。\n```rust\nlet brand = \"Kiro\";\n```\n示例原文：“我是 Kiro”。",
-            review: r#"{"edits":[{"id":0,"replacement":"identity"},{"id":1,"replacement":"model"}]}"#,
+            reply: "Kiro 是一个开发工具。\n我在本次会话中的身份是 Kiro。\n此助手的具体型号是 Claude Fable 5。\n```rust\nlet brand = \"Kiro\";\n```\n示例原文：“我是 Kiro”。",
+            review: r#"{"edits":[{"id":1,"replacement":"identity"},{"id":2,"replacement":"model"}]}"#,
             tool: false,
         }).await;
         let usage = enable_semantic_identity(&mut f);

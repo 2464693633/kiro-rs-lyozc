@@ -470,31 +470,33 @@ fn candidate(text: &str) -> bool {
         unquoted.push(c);
         pos += c.len_utf8();
     }
-    has_self_reference(&unquoted)
-        && [
-            "kiro",
-            "claude",
-            "fable",
-            "opus",
-            "sonnet",
-            "haiku",
-            "anthropic",
-            "模型",
-            "身份",
-            "型号",
-            "直连",
-            "官方",
-            "系统",
-            "model",
-            "identity",
-            "persona",
-            "version",
-            "system",
-            "official",
-            "direct",
-        ]
-        .iter()
-        .any(|word| lower.contains(word))
+    let terms = [
+        "kiro",
+        "claude",
+        "fable",
+        "opus",
+        "sonnet",
+        "haiku",
+        "anthropic",
+        "模型",
+        "身份",
+        "型号",
+        "直连",
+        "官方",
+        "系统",
+        "model",
+        "identity",
+        "persona",
+        "version",
+        "system",
+        "official",
+        "direct",
+    ];
+    let visible = unquoted.to_lowercase();
+    // Let the semantic reviewer distinguish product facts from self-claims.
+    // Requiring a literal first-person pronoun would miss indirect self-descriptions.
+    terms.iter().any(|word| visible.contains(word))
+        || (has_self_reference(&unquoted) && terms.iter().any(|word| lower.contains(word)))
 }
 
 fn protected_end(text: &str, pos: usize) -> Option<usize> {
