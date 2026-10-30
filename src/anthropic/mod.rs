@@ -27,6 +27,7 @@ mod code_execution;
 mod converter;
 mod documents;
 mod handlers;
+mod identity;
 mod middleware;
 mod observation;
 mod openai;

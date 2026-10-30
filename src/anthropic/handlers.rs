@@ -806,6 +806,24 @@ async fn post_compatible_messages(
     cc: bool,
 ) -> Response {
     let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
+    if let Some(response) =
+        super::identity::local_response(&payload, compatibility.plain_identity_compat)
+    {
+        let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+        let tracer = RequestTracer::new(
+            &state,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+            },
+        );
+        hook.record(0, 0, 0, 0, 0, 0.0, "success");
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+        tracing::info!(key_id = hook.key_id, model = %payload.model,
+            "local model identity introduction returned");
+        return response;
+    }
     if compatibility.search_context_compat
         && payload.messages.iter().any(|message| {
             message.role == "assistant"

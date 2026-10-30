@@ -170,6 +170,7 @@ export interface ProtocolCompatibilityConfig {
   searchIncrementalStreaming: boolean
   signatureMetadataCompat: boolean
   structuredIdentityCompat: boolean
+  plainIdentityCompat: boolean
   searchContextCompat: boolean
   /** 空数组应用于全部客户端 Key；非空时仅应用于这些 Key ID。 */
   enabledKeyIds: number[]

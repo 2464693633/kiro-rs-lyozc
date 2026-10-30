@@ -638,6 +638,8 @@ pub struct SetProtocolCompatibilityRequest {
     #[serde(default)]
     pub structured_identity_compat: bool,
     #[serde(default)]
+    pub plain_identity_compat: bool,
+    #[serde(default)]
     pub search_context_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
@@ -649,6 +651,7 @@ impl From<SetProtocolCompatibilityRequest> for crate::model::config::ProtocolCom
             search_incremental_streaming: value.search_incremental_streaming,
             signature_metadata_compat: value.signature_metadata_compat,
             structured_identity_compat: value.structured_identity_compat,
+            plain_identity_compat: value.plain_identity_compat,
             search_context_compat: value.search_context_compat,
             enabled_key_ids: value.enabled_key_ids,
         }

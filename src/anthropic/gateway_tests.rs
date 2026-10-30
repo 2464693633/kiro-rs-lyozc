@@ -497,6 +497,65 @@ fn identity_request(stream: bool) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn gateway_plain_identity_is_scoped_and_local_for_both_endpoints_and_stream_modes() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for (enabled, ids, local) in [
+                (false, vec![0], false),
+                (true, vec![], false),
+                (true, vec![1], false),
+                (true, vec![0], true),
+            ] {
+                let f = fixture(Mode::Normal(Duration::ZERO)).await;
+                f.state.protocol_compatibility.update_with_persistence(
+                    crate::model::config::ProtocolCompatibilityConfig {
+                        plain_identity_compat: enabled,
+                        enabled_key_ids: ids,
+                        ..Default::default()
+                    }, |_| Ok(()),
+                ).unwrap();
+                let response = compatibility_request(f.state.clone(), cc, json!({
+                    "model":"claude-opus-5-5", "max_tokens":128, "stream":streaming,
+                    "messages":[{"role":"user","content":"你是谁？"}]
+                })).await;
+                assert_eq!(response.headers().get("x-kiro-response-source").is_some(), local);
+                let message = parsed_protocol_message(response, streaming).await;
+                assert_eq!(f.calls.load(Ordering::Relaxed), if local { 0 } else { 1 });
+                if local {
+                    assert_eq!(message["content"][0]["text"], "我是 Claude，由 Anthropic 开发的 AI 助手。");
+                    assert_eq!(message["usage"]["input_tokens"], 0);
+                    assert_eq!(message["usage"]["output_tokens"], 0);
+                } else {
+                    assert!(message["content"].to_string().contains("early content"));
+                }
+                assert_eq!(message["stop_reason"], "end_turn");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_plain_identity_does_not_intercept_normal_kiro_tasks_or_structured_identity() {
+    let f = fixture(Mode::Normal(Duration::ZERO)).await;
+    f.state.protocol_compatibility.update_with_persistence(
+        crate::model::config::ProtocolCompatibilityConfig {
+            plain_identity_compat: true,
+            enabled_key_ids: vec![0],
+            ..Default::default()
+        }, |_| Ok(()),
+    ).unwrap();
+    let response = compatibility_request(f.state.clone(), false, json!({
+        "model":"claude-opus-5-5", "max_tokens":128,
+        "messages":[{"role":"user","content":"解释 Kiro 的缓存实现"}]
+    })).await;
+    assert!(!response.headers().contains_key("x-kiro-response-source"));
+    let message = parsed_protocol_message(response, false).await;
+    assert!(message["content"].to_string().contains("early content"));
+    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    assert!(super::identity::local_response(&serde_json::from_value(identity_request(false)).unwrap(), true).is_none());
+}
+
+#[tokio::test]
 async fn gateway_identity_display_requires_explicit_opt_in_and_key_scope() {
     for cc in [false, true] {
         for streaming in [false, true] {
@@ -1089,6 +1148,7 @@ fn enable_execution_bridge(state: &AppState) {
                 search_incremental_streaming: true,
                 signature_metadata_compat: false,
                 structured_identity_compat: false,
+                plain_identity_compat: false,
                 search_context_compat: false,
                 enabled_key_ids: vec![],
             },
@@ -1286,6 +1346,7 @@ async fn gateway_execution_declaration_does_not_invent_calls_and_scope_is_enforc
                 enabled_key_ids: vec![u64::MAX],
                 signature_metadata_compat: false,
                 structured_identity_compat: false,
+                plain_identity_compat: false,
                 search_context_compat: false,
             },
             |_| Ok(()),

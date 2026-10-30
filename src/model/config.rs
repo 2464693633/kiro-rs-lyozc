@@ -73,6 +73,9 @@ pub struct ProtocolCompatibilityConfig {
     /// Experimental envelope presentation; requires an explicit key scope.
     pub signature_metadata_compat: bool,
     pub structured_identity_compat: bool,
+    /// Local introductions for standalone identity questions on Claude models.
+    /// Requires an explicit key scope; does not change upstream routing.
+    pub plain_identity_compat: bool,
     pub search_context_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
@@ -89,6 +92,7 @@ impl ProtocolCompatibilityConfig {
             if self.enabled_key_ids.is_empty() {
                 effective.signature_metadata_compat = false;
                 effective.structured_identity_compat = false;
+                effective.plain_identity_compat = false;
                 effective.search_context_compat = false;
             }
             effective

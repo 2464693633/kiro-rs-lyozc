@@ -11,13 +11,14 @@
     "searchIncrementalStreaming": true,
     "signatureMetadataCompat": false,
     "structuredIdentityCompat": false,
+    "plainIdentityCompat": false,
     "searchContextCompat": false,
     "enabledKeyIds": [1]
   }
 }
 ```
 
-示例仅对客户端 Key ID 1 启用。空 `enabledKeyIds` 可将工具桥接和搜索增量应用到所有已鉴权 Key；签名、身份展示、搜索上下文三个实验必须指定非空范围。未命中范围的 Key 使用默认策略。直接编辑配置文件后需要重启，后台保存无需重启。
+示例仅对客户端 Key ID 1 启用。空 `enabledKeyIds` 可将工具桥接和搜索增量应用到所有已鉴权 Key；签名、两种身份介绍和搜索上下文功能必须指定非空范围。未命中范围的 Key 使用默认策略。直接编辑配置文件后需要重启，后台保存无需重启。
 
 ## 服务端工具
 
@@ -56,6 +57,16 @@
 `structuredIdentityCompat` 默认关闭。仅匹配属性为 `identity_platform` 和 `desc`、两个字段必填、身份枚举同时允许 `claude_code` 与 `kiro` 的对象 Schema。有效的最终 JSON 会将身份展示为 `claude_code` 并给出一致的网关展示描述，然后再次验证全部 Schema 约束。业务 Schema、无格式请求、工具回合、拒绝和截断不会被改写；额外的 const、pattern 等约束不允许新值时保留原值。
 
 这是显式的输出展示覆盖，不修改模型映射，也不赋予客户端 system 更高的上游优先级。开关同时覆盖流式、非流式以及执行桥接的最终结构化结果。
+
+## 普通身份介绍
+
+`plainIdentityCompat` 默认关闭，在管理后台的同名开关中设置，仅对指定 Key 生效。它与结构化身份展示独立，适用于映射到 Claude 后端的模型。
+
+最新用户消息是独立的身份或开发商问句时，例如“你是谁？”“你是什么模型？”“谁开发了你？”或“Who are you?”，网关直接回复“我是 Claude，由 Anthropic 开发的 AI 助手。”或对应英文介绍。回复不会自行猜测 Opus、Fable 等具体型号。
+
+这是可选的网关本地介绍，不调用上游。四类 Token 用量均为 0，并通过 `x-kiro-response-source: local-identity` 响应头标明来源。请求仍记录为一次成功调用。支持 `/v1/messages` 和 `/cc/v1/messages` 的流式、非流式响应。
+
+匹配只覆盖独立问句，允许客户端附带单独的 `<system-reminder>` 文本块。引用、翻译、代码任务、接入渠道问题、图片、文档、工具结果、强制工具选择和 JSON Schema 输出继续走原有模型流程；输出预算不足 32 时也走原有流程。该开关不会更改路由，不能据此证明请求来自 Anthropic 官方 API，也不会把普通业务文本中的 Kiro 批量替换掉。
 
 ## 搜索上下文封装
 

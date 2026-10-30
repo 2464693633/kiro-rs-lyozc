@@ -713,6 +713,7 @@ pub async fn set_protocol_compatibility(
 ) -> impl IntoResponse {
     if (payload.signature_metadata_compat
         || payload.structured_identity_compat
+        || payload.plain_identity_compat
         || payload.search_context_compat)
         && payload.enabled_key_ids.is_empty()
     {

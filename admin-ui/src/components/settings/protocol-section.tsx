@@ -20,6 +20,7 @@ interface Draft {
   searchIncrementalStreaming: boolean
   signatureMetadataCompat: boolean
   structuredIdentityCompat: boolean
+  plainIdentityCompat: boolean
   searchContextCompat: boolean
   scope: 'all' | 'selected'
   keyIds: string
@@ -31,6 +32,7 @@ function toDraft(config: ProtocolCompatibilityConfig): Draft {
     searchIncrementalStreaming: config.searchIncrementalStreaming,
     signatureMetadataCompat: config.signatureMetadataCompat ?? false,
     structuredIdentityCompat: config.structuredIdentityCompat ?? false,
+    plainIdentityCompat: config.plainIdentityCompat ?? false,
     searchContextCompat: config.searchContextCompat ?? false,
     scope: config.enabledKeyIds.length ? 'selected' : 'all',
     keyIds: config.enabledKeyIds.join(', '),
@@ -85,7 +87,7 @@ export function ProtocolSection() {
   }
 
   const parsedIds = parseKeyIds(draft?.keyIds ?? '')
-  const scopedExperiment = draft?.signatureMetadataCompat || draft?.structuredIdentityCompat || draft?.searchContextCompat
+  const scopedExperiment = draft?.signatureMetadataCompat || draft?.structuredIdentityCompat || draft?.plainIdentityCompat || draft?.searchContextCompat
   const scopeError = draft?.scope === 'selected'
     ? parsedIds.error || (!parsedIds.ids.length ? '请至少选择或输入一个 Key ID。' : '')
     : scopedExperiment ? '协议实验需要选择指定 Key。' : ''
@@ -101,6 +103,7 @@ export function ProtocolSection() {
         searchIncrementalStreaming: draft.searchIncrementalStreaming,
         signatureMetadataCompat: draft.signatureMetadataCompat,
         structuredIdentityCompat: draft.structuredIdentityCompat,
+        plainIdentityCompat: draft.plainIdentityCompat,
         searchContextCompat: draft.searchContextCompat,
         enabledKeyIds: draft.scope === 'all' ? [] : parsedIds.ids,
       })
@@ -137,7 +140,7 @@ export function ProtocolSection() {
     <div className="space-y-6">
       <SettingGroup
         title="协议兼容"
-        description="设置工具结果与搜索响应的兼容策略，保存后按所选客户端 Key 范围生效。"
+        description="设置工具、搜索与身份介绍策略，保存后按所选客户端 Key 范围生效。"
       >
         <div className="flex flex-wrap items-center justify-between gap-2 py-3">
           <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
@@ -209,6 +212,17 @@ export function ProtocolSection() {
               onCheckedChange={(value) => edit({ structuredIdentityCompat: value, ...(value ? { scope: 'selected' as const } : {}) })}
               disabled={disabled}
               aria-label="结构化身份展示"
+            />
+          </SettingRow>
+          <SettingRow
+            label="普通身份介绍"
+            hint="仅对指定 Key 的 Claude 模型生效。单独询问身份或开发商时，由网关本地回复“我是 Claude，由 Anthropic 开发的 AI 助手。”，不产生上游 Token 用量。中英文问句均支持。"
+          >
+            <Switch
+              checked={draft?.plainIdentityCompat ?? false}
+              onCheckedChange={(value) => edit({ plainIdentityCompat: value, ...(value ? { scope: 'selected' as const } : {}) })}
+              disabled={disabled}
+              aria-label="普通身份介绍"
             />
           </SettingRow>
           <SettingRow
@@ -298,6 +312,7 @@ export function ProtocolSection() {
             <div><dt className="text-muted-foreground">搜索增量流式输出</dt><dd className="mt-1 font-medium">{actual.searchIncrementalStreaming ? '开启' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">签名元数据实验</dt><dd className="mt-1 font-medium">{actual.signatureMetadataCompat && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭（原样透传）'}</dd></div>
             <div><dt className="text-muted-foreground">结构化身份展示</dt><dd className="mt-1 font-medium">{actual.structuredIdentityCompat && actual.enabledKeyIds.length ? '开启（claude_code）' : '关闭'}</dd></div>
+            <div><dt className="text-muted-foreground">普通身份介绍</dt><dd className="mt-1 font-medium">{actual.plainIdentityCompat && actual.enabledKeyIds.length ? '开启（Claude / Anthropic，本地回复）' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">搜索上下文封装</dt><dd className="mt-1 font-medium">{actual.searchContextCompat && actual.enabledKeyIds.length ? '开启' : '关闭'}</dd></div>
             <div className="sm:col-span-2"><dt className="text-muted-foreground">应用范围</dt><dd className="mt-1 break-all font-medium">{scopeLabel(actual.enabledKeyIds, keys)}</dd></div>
             {updatedAt && !Number.isNaN(updatedAt.getTime()) && <div className="sm:col-span-2"><dt className="text-muted-foreground">服务器更新时间</dt><dd className="mt-1">{updatedAt.toLocaleString()}</dd></div>}
