@@ -2784,6 +2784,7 @@ mod tests {
     async fn receiver_disconnect_settles_accumulated_usage_once() {
         let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
         let hook = UsageRecordHook {
+            capture: None,
             recorder: None,
             aggregator: Some(aggregator.clone()),
             client_keys: None,
@@ -3966,6 +3967,7 @@ mod tests {
     #[test]
     fn settlement_source_marks_any_simulated_round_as_simulated() {
         let hook = UsageRecordHook {
+            capture: None,
             recorder: None,
             aggregator: None,
             client_keys: None,
@@ -4084,6 +4086,7 @@ mod tests {
     #[test]
     fn final_responses_sum_credit_usage_across_model_rounds() {
         let hook = UsageRecordHook {
+            capture: None,
             recorder: None,
             aggregator: None,
             client_keys: None,

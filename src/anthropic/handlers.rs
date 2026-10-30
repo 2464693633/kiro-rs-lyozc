@@ -56,6 +56,7 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    pub(crate) capture: Option<std::sync::Arc<super::identity_guard::UsageCapture>>,
 }
 
 impl UsageRecordHook {
@@ -67,6 +68,7 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            capture: state.usage_capture.clone(),
         }
     }
 
@@ -97,6 +99,10 @@ impl UsageRecordHook {
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
         };
+        if let Some(capture) = &self.capture {
+            capture.record(rec);
+            return;
+        }
         if let Some(r) = &self.recorder {
             r.record(&rec);
         }
@@ -802,7 +808,7 @@ pub async fn get_models(
 async fn post_compatible_messages(
     state: AppState,
     key_ctx: KeyContext,
-    mut payload: MessagesRequest,
+    payload: MessagesRequest,
     cc: bool,
 ) -> Response {
     let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
@@ -824,6 +830,21 @@ async fn post_compatible_messages(
             "local model identity introduction returned");
         return response;
     }
+    if compatibility.plain_identity_compat
+        && let Some(input) = super::identity_guard::prepare(&payload)
+    {
+        return super::identity_guard::run(state, key_ctx, payload, cc, input).await;
+    }
+    post_compatible_messages_inner(state, key_ctx, payload, cc).await
+}
+
+pub(super) async fn post_compatible_messages_inner(
+    state: AppState,
+    key_ctx: KeyContext,
+    mut payload: MessagesRequest,
+    cc: bool,
+) -> Response {
+    let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
     if compatibility.search_context_compat
         && payload.messages.iter().any(|message| {
             message.role == "assistant"

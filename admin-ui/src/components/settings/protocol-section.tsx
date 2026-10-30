@@ -216,7 +216,7 @@ export function ProtocolSection() {
           </SettingRow>
           <SettingRow
             label="普通身份介绍"
-            hint="仅对指定 Key 的 Claude 模型生效。单独询问身份或开发商时，本地回复“我是 Claude，由 Anthropic 开发的 AI 助手。”；询问型号时附上当前接口配置的模型标识。支持中英文、连续身份问句及客户端附带的环境说明，不产生上游 Token 用量。"
+            hint="仅对指定 Key 的 Claude 模型生效。固定问句本地回复，其他短文本结合近期对话做语义判断，身份相关正文检查后发送。额外判断和校验会增加等待及上游用量，并计入总用量。型号展示为接口配置标识；代码、引用和工具内容受保护。"
           >
             <Switch
               checked={draft?.plainIdentityCompat ?? false}

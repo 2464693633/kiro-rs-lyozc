@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::config::ProtocolCompatibilityConfig;
 
-pub const MODULE_VERSION: &str = "7";
+pub const MODULE_VERSION: &str = "8";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolCompatibilitySnapshot {
@@ -22,6 +22,7 @@ pub struct ProtocolCompatibilityRuntime {
     snapshot: RwLock<ProtocolCompatibilitySnapshot>,
     update_lock: Mutex<()>,
     pub(crate) native_search_contexts: Arc<crate::anthropic::search_context::NativeContextCache>,
+    pub(crate) identity_checks: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for ProtocolCompatibilityRuntime {
@@ -40,6 +41,7 @@ impl ProtocolCompatibilityRuntime {
             }),
             update_lock: Mutex::new(()),
             native_search_contexts: Arc::new(Default::default()),
+            identity_checks: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 

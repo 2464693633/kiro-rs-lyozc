@@ -52,6 +52,8 @@ pub struct AppState {
     pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
+    /// Request-local accounting for internal identity checks and generation.
+    pub(crate) usage_capture: Option<Arc<super::identity_guard::UsageCapture>>,
     /// Runtime protocol settings, shared with the Admin control plane.
     pub protocol_compatibility:
         crate::model::protocol_compatibility::SharedProtocolCompatibility,
@@ -73,6 +75,7 @@ impl AppState {
             usage_aggregator: None,
             cache_meter: None,
             trace_store: None,
+            usage_capture: None,
             protocol_compatibility: Arc::new(
                 crate::model::protocol_compatibility::ProtocolCompatibilityRuntime::default(),
             ),

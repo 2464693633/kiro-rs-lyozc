@@ -28,6 +28,7 @@ mod converter;
 mod documents;
 mod handlers;
 mod identity;
+mod identity_guard;
 mod middleware;
 mod observation;
 mod openai;

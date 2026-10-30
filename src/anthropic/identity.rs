@@ -21,7 +21,7 @@ struct IdentityIntent {
     model: bool,
 }
 
-fn strip_edge_reminders(mut text: &str) -> Option<&str> {
+pub(super) fn strip_edge_reminders(mut text: &str) -> Option<&str> {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
     for _ in 0..8 {
@@ -45,7 +45,7 @@ fn strip_edge_reminders(mut text: &str) -> Option<&str> {
     None
 }
 
-fn latest_question(payload: &MessagesRequest) -> Option<Cow<'_, str>> {
+pub(super) fn latest_question(payload: &MessagesRequest) -> Option<Cow<'_, str>> {
     // Claude Code can append environment messages after the actual user turn.
     // Only skip context roles; an assistant/tool turn must not replay an older
     // identity question as a new local reply.
@@ -71,7 +71,7 @@ fn latest_question(payload: &MessagesRequest) -> Option<Cow<'_, str>> {
         _ => return None,
     };
     let texts: Vec<_> = texts.into_iter().filter(|text| !text.is_empty()).collect();
-    if texts.is_empty() || texts.iter().map(|text| text.len()).sum::<usize>() > 1024 {
+    if texts.is_empty() || texts.iter().map(|text| text.len()).sum::<usize>() > 8192 {
         return None;
     }
     Some(if texts.len() == 1 {
@@ -257,10 +257,10 @@ fn identity_intent(text: &str) -> Option<IdentityIntent> {
     result
 }
 
-fn introduction(payload: &MessagesRequest) -> Option<Cow<'static, str>> {
+pub(super) fn unconstrained_claude(payload: &MessagesRequest) -> bool {
     // A small budget or an explicit output/tool constraint must retain its
     // normal validation and generation behavior.
-    if payload.max_tokens < 32
+    !(payload.max_tokens < 32
         || structured_output::format(payload).is_some()
         || payload.tool_choice.as_ref().is_some_and(|choice| {
             !matches!(
@@ -268,8 +268,11 @@ fn introduction(payload: &MessagesRequest) -> Option<Cow<'static, str>> {
                 Some("auto" | "none")
             )
         })
-        || !map_model(&payload.model).is_some_and(|model| model.starts_with("claude-"))
-    {
+        || !map_model(&payload.model).is_some_and(|model| model.starts_with("claude-")))
+}
+
+fn introduction(payload: &MessagesRequest) -> Option<Cow<'static, str>> {
+    if !unconstrained_claude(payload) {
         return None;
     }
     let intent = identity_intent(&latest_question(payload)?)?;
@@ -300,15 +303,7 @@ fn introduction(payload: &MessagesRequest) -> Option<Cow<'static, str>> {
 
 pub(super) fn local_response(payload: &MessagesRequest, enabled: bool) -> Option<Response> {
     let text = enabled.then(|| introduction(payload)).flatten()?;
-    let message = json!({
-        "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
-        "type": "message", "role": "assistant", "model": payload.model,
-        "content": [{"type": "text", "text": text}],
-        "stop_reason": "end_turn", "stop_sequence": null,
-        // No inference was performed, so no upstream tokens or credits exist.
-        "usage": {"input_tokens": 0, "output_tokens": 0,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
-    });
+    let message = message(payload, &text);
     let mut response = if payload.stream {
         let body: String = structured_output::sse_events(&message)
             .into_iter()
@@ -327,6 +322,18 @@ pub(super) fn local_response(payload: &MessagesRequest, enabled: bool) -> Option
         .headers_mut()
         .insert("x-kiro-response-source", "local-identity".parse().unwrap());
     Some(response)
+}
+
+pub(super) fn message(payload: &MessagesRequest, text: &str) -> Value {
+    json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
+        "type": "message", "role": "assistant", "model": payload.model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        // Local generation is free; the semantic wrapper adds its check costs.
+        "usage": {"input_tokens": 0, "output_tokens": 0,
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+    })
 }
 
 #[cfg(test)]

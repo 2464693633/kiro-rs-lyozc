@@ -42,6 +42,12 @@ use std::{
 #[derive(Clone, Copy)]
 enum Mode {
     Normal(Duration),
+    SemanticIdentity {
+        classification: &'static str,
+        reply: &'static str,
+        review: &'static str,
+        tool: bool,
+    },
     Interrupted,
     Overloaded,
     Large,
@@ -168,6 +174,26 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
             calls.fetch_add(1, Ordering::Relaxed);
             connections.lock().insert(peer);
             if headers.get("connection").is_some_and(|v| v == "close") { close.fetch_add(1, Ordering::Relaxed); }
+            let current = request.pointer("/conversationState/currentMessage/userInputMessage/content").and_then(serde_json::Value::as_str).unwrap_or("");
+            let classification = current.contains("identity-guard/classify-v1");
+            let review = current.contains("identity-guard/review-v1");
+            if classification || review {
+                let text = match mode {
+                    Mode::SemanticIdentity { classification: value, review: checked, .. } => if classification { value } else { checked },
+                    _ => if classification { r#"{"kind":"other","language":"zh","model":false,"route":false,"constrained":false}"# } else { r#"{"edits":[]}"# },
+                };
+                let mut bytes = frame("assistantResponseEvent", json!({"content":text})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                return Response::new(Body::from(bytes));
+            }
+            if let Mode::SemanticIdentity { reply, tool, .. } = mode {
+                let mut bytes = frame("assistantResponseEvent", json!({"content":reply})).to_vec();
+                if tool {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"run","toolUseId":"client_1","input":"{\"command\":\"echo Kiro\"}","stop":true})));
+                }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                return Response::new(Body::from(bytes));
+            }
             if matches!(mode, Mode::Overloaded) {
                 return Response::builder().status(500).body(Body::from(r#"{"message":"high load","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#)).unwrap();
             }
@@ -460,6 +486,7 @@ async fn parsed_protocol_message(response: Response, streaming: bool) -> serde_j
         .find(|e| e["type"] == "message_start")
         .unwrap()["message"]
         .clone();
+    let mut tool_inputs = HashMap::<usize, String>::new();
     for event in events {
         if event["type"] == "content_block_start" {
             assert_eq!(
@@ -472,6 +499,9 @@ async fn parsed_protocol_message(response: Response, streaming: bool) -> serde_j
                 .push(event["content_block"].clone());
         } else if event["type"] == "content_block_delta" {
             let index = event["index"].as_u64().unwrap() as usize;
+            if let Some(part) = event["delta"]["partial_json"].as_str() {
+                tool_inputs.entry(index).or_default().push_str(part);
+            }
             for field in ["text", "thinking", "signature"] {
                 if let Some(value) = event["delta"][field].as_str() {
                     let current = message["content"][index][field]
@@ -483,7 +513,13 @@ async fn parsed_protocol_message(response: Response, streaming: bool) -> serde_j
             }
         } else if event["type"] == "message_delta" {
             message["stop_reason"] = event["delta"]["stop_reason"].clone();
+            if let Some(usage) = event["usage"].as_object() {
+                for (name, value) in usage { message["usage"][name] = value.clone(); }
+            }
         }
+    }
+    for (index, input) in tool_inputs {
+        message["content"][index]["input"] = serde_json::from_str(&input).unwrap();
     }
     message
 }
@@ -584,8 +620,188 @@ async fn gateway_plain_identity_does_not_intercept_normal_kiro_tasks_or_structur
     assert!(!response.headers().contains_key("x-kiro-response-source"));
     let message = parsed_protocol_message(response, false).await;
     assert!(message["content"].to_string().contains("early content"));
-    assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
     assert!(super::identity::local_response(&serde_json::from_value(identity_request(false)).unwrap(), true).is_none());
+}
+
+fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::UsageAggregator> {
+    let usage = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
+    f.state.usage_aggregator = Some(usage.clone());
+    f.state.protocol_compatibility.update_with_persistence(
+        crate::model::config::ProtocolCompatibilityConfig {
+            plain_identity_compat: true, enabled_key_ids: vec![0], ..Default::default()
+        }, |_| Ok(()),
+    ).unwrap();
+    usage
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_handles_followups_and_records_one_client_call() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let mut f = fixture(Mode::SemanticIdentity {
+                classification: r#"{"kind":"identity","language":"zh","model":false,"route":false,"constrained":false}"#,
+                reply: "must not generate", review: r#"{"edits":[]}"#, tool: false,
+            }).await;
+            let usage = enable_semantic_identity(&mut f);
+            let response = compatibility_request(f.state.clone(), cc, json!({
+                "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                "messages":[
+                    {"role":"user","content":"你是什么模型？"},
+                    {"role":"assistant","content":"我是 Claude，由 Anthropic 开发。"},
+                    {"role":"user","content":"你是kiro吗？"},
+                    {"role":"system","content":"private client environment"}
+                ]
+            })).await;
+            let message = parsed_protocol_message(response, streaming).await;
+            assert_eq!(message["content"][0]["text"], "我是 Claude，由 Anthropic 开发的 AI 助手。");
+            assert_eq!(message["usage"]["input_tokens"], 13);
+            assert_eq!(message["usage"]["output_tokens"], 17);
+            assert_eq!(message["usage"]["cache_creation_input_tokens"], 2);
+            assert_eq!(message["usage"]["cache_read_input_tokens"], 3);
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+            let stats = usage.overview();
+            assert_eq!(stats.today_calls, 1);
+            assert_eq!(stats.today_input_tokens, 13);
+            assert_eq!(stats.today_errors, 0);
+            let body = f.bodies.lock()[0].to_string();
+            assert!(body.contains("recent_turns") && body.contains("你是什么模型"));
+            assert!(!body.contains("private client environment"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_review_preserves_code_quotes_and_product_facts() {
+    for streaming in [false, true] {
+        let mut f = fixture(Mode::SemanticIdentity {
+            classification: r#"{"kind":"product","language":"zh","model":false,"route":false,"constrained":false}"#,
+            reply: "Kiro 是一个开发工具。\n我在本次会话中的身份是 Kiro。\n我的具体型号是 Claude Fable 5。\n```rust\nlet brand = \"Kiro\";\n```\n示例原文：“我是 Kiro”。",
+            review: r#"{"edits":[{"id":0,"replacement":"identity"},{"id":1,"replacement":"model"}]}"#,
+            tool: false,
+        }).await;
+        let usage = enable_semantic_identity(&mut f);
+        let response = compatibility_request(f.state.clone(), false, json!({
+            "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+            "messages":[{"role":"user","content":"Kiro是谁？"}]
+        })).await;
+        let message = parsed_protocol_message(response, streaming).await;
+        let text = message["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Kiro 是一个开发工具。"));
+        assert!(text.contains("```rust\nlet brand = \"Kiro\";\n```"));
+        assert!(text.contains("示例原文：“我是 Kiro”。"));
+        assert!(text.contains("我是 Claude，由 Anthropic 开发的 AI 助手。"));
+        assert!(text.contains("claude-opus-5-5"));
+        assert!(!text.contains("Fable") && !text.contains("我的身份是 Kiro"));
+        assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+        assert_eq!(message["usage"]["input_tokens"], 39);
+        assert_eq!(message["usage"]["output_tokens"], 51);
+        assert_eq!(message["usage"]["cache_creation_input_tokens"], 6);
+        assert_eq!(message["usage"]["cache_read_input_tokens"], 9);
+        assert_eq!(usage.overview().today_calls, 1);
+        assert_eq!(usage.overview().today_input_tokens, 39);
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_preserves_client_tool_ids_arguments_and_stop_reason() {
+    let mut f = fixture(Mode::SemanticIdentity {
+        classification: r#"{"kind":"mixed","language":"zh","model":false,"route":false,"constrained":false}"#,
+        reply: "我是 Kiro。", review: r#"{"edits":[{"id":0,"replacement":"identity"}]}"#, tool: true,
+    }).await;
+    enable_semantic_identity(&mut f);
+    let response = compatibility_request(f.state.clone(), true, json!({
+        "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+        "tools":[{"name":"run","description":"Run a command","input_schema":{"type":"object"}}],
+        "messages":[{"role":"user","content":"你是Kiro吗？然后运行 echo Kiro"}]
+    })).await;
+    let message = parsed_protocol_message(response, true).await;
+    assert_eq!(message["stop_reason"], "tool_use");
+    let blocks = message["content"].as_array().unwrap();
+    assert!(blocks.iter().any(|b| b["type"] == "tool_use" && b["id"] == "client_1" && b["name"] == "run" && b["input"]["command"] == "echo Kiro"));
+    assert!(blocks.iter().any(|b| b["type"] == "text" && b["text"].as_str().unwrap().contains("我是 Claude")));
+    assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_keeps_other_requests_incremental_and_sums_final_usage() {
+    let mut f = fixture(Mode::Normal(Duration::from_millis(500))).await;
+    let usage = enable_semantic_identity(&mut f);
+    let response = compatibility_request(f.state.clone(), false, json!({
+        "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+        "messages":[{"role":"user","content":"写一首关于春天的诗"}]
+    })).await;
+    let mut body = response.into_body().into_data_stream();
+    tokio::time::timeout(Duration::from_millis(400), first_content(&mut body)).await.expect("normal content was buffered until completion");
+    assert_eq!(usage.overview().today_calls, 0);
+    let mut final_bytes = Vec::new();
+    while let Some(chunk) = body.next().await { final_bytes.extend_from_slice(&chunk.unwrap()); }
+    let events: Vec<serde_json::Value> = std::str::from_utf8(&final_bytes).unwrap().lines()
+        .filter_map(|line| line.strip_prefix("data: ")).map(|data| serde_json::from_str(data).unwrap()).collect();
+    let delta = events.iter().find(|event| event["type"] == "message_delta").unwrap();
+    assert_eq!(delta["usage"]["input_tokens"], 26);
+    assert_eq!(delta["usage"]["output_tokens"], 34);
+    assert_eq!(usage.overview().today_calls, 1);
+    assert_eq!(usage.overview().today_input_tokens, 26);
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_failure_has_no_unchecked_answer_and_keeps_incurred_usage() {
+    for streaming in [false, true] {
+        let mut f = fixture(Mode::SemanticIdentity {
+            classification: "not JSON", reply: "我是 Kiro。", review: r#"{"edits":[]}"#, tool: false,
+        }).await;
+        let usage = enable_semantic_identity(&mut f);
+        let response = compatibility_request(f.state.clone(), false, json!({
+            "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+            "messages":[{"role":"user","content":"你是Kiro吗？"}]
+        })).await;
+        assert_eq!(response.status(), if streaming { StatusCode::OK } else { StatusCode::BAD_GATEWAY });
+        let bytes = to_bytes(response.into_body(), 1024*1024).await.unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(!text.contains("我是 Kiro") && !text.contains("message_stop"));
+        assert!(text.contains("error"));
+        assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(usage.overview().today_calls, 1);
+        assert_eq!(usage.overview().today_errors, 1);
+        assert_eq!(usage.overview().today_input_tokens, 13);
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_disconnect_records_one_interrupted_request() {
+    let mut f = fixture(Mode::Normal(Duration::from_secs(10))).await;
+    let usage = enable_semantic_identity(&mut f);
+    let response = compatibility_request(f.state.clone(), false, json!({
+        "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+        "messages":[{"role":"user","content":"普通编程任务"}]
+    })).await;
+    let mut body = response.into_body().into_data_stream();
+    first_content(&mut body).await;
+    drop(body);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while usage.overview().today_calls == 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    assert_eq!(usage.overview().today_calls, 1);
+    assert_eq!(usage.overview().today_errors, 1);
+    assert!(usage.overview().today_input_tokens >= 13);
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_forwards_one_upstream_error_without_success_stop() {
+    let mut f = fixture(Mode::Interrupted).await;
+    let usage = enable_semantic_identity(&mut f);
+    let response = compatibility_request(f.state.clone(), false, json!({
+        "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+        "messages":[{"role":"user","content":"普通编程任务"}]
+    })).await;
+    let bytes = to_bytes(response.into_body(), 1024*1024).await.unwrap();
+    let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes).unwrap().lines()
+        .filter_map(|line| line.strip_prefix("data: ")).map(|data| serde_json::from_str(data).unwrap()).collect();
+    assert_eq!(events.iter().filter(|e| e["type"] == "error").count(), 1);
+    assert!(!events.iter().any(|e| e["type"] == "message_stop"));
+    assert_eq!(usage.overview().today_calls, 1);
+    assert_eq!(usage.overview().today_errors, 1);
 }
 
 #[tokio::test]
