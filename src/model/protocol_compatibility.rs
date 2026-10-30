@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::config::ProtocolCompatibilityConfig;
 
-pub const MODULE_VERSION: &str = "10";
+pub const MODULE_VERSION: &str = "11";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolCompatibilitySnapshot {
@@ -84,6 +84,7 @@ mod tests {
             signature_metadata_compat: true,
             structured_identity_compat: true,
             plain_identity_compat: true,
+            natural_style: true,
             search_context_compat: true,
             enabled_key_ids: vec![7],
         };
@@ -106,6 +107,7 @@ mod tests {
             signature_metadata_compat: true,
             structured_identity_compat: true,
             plain_identity_compat: true,
+            natural_style: true,
             search_context_compat: true,
             enabled_key_ids: vec![9, 7, 9],
         };
@@ -128,6 +130,7 @@ mod tests {
         assert!(reader.for_key(9).signature_metadata_compat);
         assert!(reader.for_key(9).structured_identity_compat);
         assert!(reader.for_key(9).plain_identity_compat);
+        assert!(reader.for_key(9).natural_style);
         assert!(reader.for_key(9).search_context_compat);
         assert_eq!(reader.for_key(8), ProtocolCompatibilityConfig::default());
         runtime
@@ -143,6 +146,7 @@ mod tests {
         assert!(!reader.for_key(8).signature_metadata_compat);
         assert!(!reader.for_key(8).structured_identity_compat);
         assert!(!reader.for_key(8).plain_identity_compat);
+        assert!(!reader.for_key(8).natural_style);
         assert!(!reader.for_key(8).search_context_compat);
     }
 }

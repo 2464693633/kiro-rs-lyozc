@@ -320,6 +320,7 @@ mod protocol_compatibility_tests {
         assert_eq!(initial["signatureMetadataCompat"], false);
         assert_eq!(initial["structuredIdentityCompat"], false);
         assert_eq!(initial["plainIdentityCompat"], false);
+        assert_eq!(initial["naturalStyle"], false);
         assert_eq!(initial["searchContextCompat"], false);
         assert_eq!(initial["enabledKeyIds"], json!([]));
         assert_eq!(initial["diagnostics"]["codeExecutionBackend"], "unavailable");
@@ -332,6 +333,7 @@ mod protocol_compatibility_tests {
             "signatureMetadataCompat":true,
             "structuredIdentityCompat":true,
             "plainIdentityCompat":true,
+            "naturalStyle":true,
             "searchContextCompat":true,
             "enabledKeyIds":[7,3,7]
         });
@@ -350,10 +352,12 @@ mod protocol_compatibility_tests {
         assert!(runtime.for_key(7).signature_metadata_compat);
         assert!(runtime.for_key(7).structured_identity_compat);
         assert!(runtime.for_key(7).plain_identity_compat);
+        assert!(runtime.for_key(7).natural_style);
         assert!(runtime.for_key(7).search_context_compat);
         assert!(!runtime.for_key(8).signature_metadata_compat);
         assert!(!runtime.for_key(8).structured_identity_compat);
         assert!(!runtime.for_key(8).plain_identity_compat);
+        assert!(!runtime.for_key(8).natural_style);
         assert!(!runtime.for_key(8).search_context_compat);
         let persisted = Config::load(&file.0).unwrap();
         assert_eq!(persisted.region, "eu-central-1");
@@ -387,7 +391,12 @@ mod protocol_compatibility_tests {
                 .unwrap(),
             saved
         );
-        for field in ["structuredIdentityCompat", "plainIdentityCompat", "searchContextCompat"] {
+        for field in [
+            "structuredIdentityCompat",
+            "plainIdentityCompat",
+            "naturalStyle",
+            "searchContextCompat",
+        ] {
             let mut unscoped = json!({"codeExecutionMode":"bridge","searchIncrementalStreaming":true,"enabledKeyIds":[]});
             unscoped[field] = json!(true);
             assert_eq!(
@@ -442,6 +451,7 @@ mod protocol_compatibility_tests {
             signature_metadata_compat: false,
             structured_identity_compat: false,
             plain_identity_compat: false,
+            natural_style: false,
             search_context_compat: false,
             enabled_key_ids: Vec::new(),
         };

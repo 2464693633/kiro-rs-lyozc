@@ -21,6 +21,7 @@ interface Draft {
   signatureMetadataCompat: boolean
   structuredIdentityCompat: boolean
   plainIdentityCompat: boolean
+  naturalStyle: boolean
   searchContextCompat: boolean
   scope: 'all' | 'selected'
   keyIds: string
@@ -33,6 +34,7 @@ function toDraft(config: ProtocolCompatibilityConfig): Draft {
     signatureMetadataCompat: config.signatureMetadataCompat ?? false,
     structuredIdentityCompat: config.structuredIdentityCompat ?? false,
     plainIdentityCompat: config.plainIdentityCompat ?? false,
+    naturalStyle: config.naturalStyle ?? false,
     searchContextCompat: config.searchContextCompat ?? false,
     scope: config.enabledKeyIds.length ? 'selected' : 'all',
     keyIds: config.enabledKeyIds.join(', '),
@@ -87,7 +89,7 @@ export function ProtocolSection() {
   }
 
   const parsedIds = parseKeyIds(draft?.keyIds ?? '')
-  const scopedExperiment = draft?.signatureMetadataCompat || draft?.structuredIdentityCompat || draft?.plainIdentityCompat || draft?.searchContextCompat
+  const scopedExperiment = draft?.signatureMetadataCompat || draft?.structuredIdentityCompat || draft?.plainIdentityCompat || draft?.naturalStyle || draft?.searchContextCompat
   const scopeError = draft?.scope === 'selected'
     ? parsedIds.error || (!parsedIds.ids.length ? '请至少选择或输入一个 Key ID。' : '')
     : scopedExperiment ? '协议实验需要选择指定 Key。' : ''
@@ -104,6 +106,7 @@ export function ProtocolSection() {
         signatureMetadataCompat: draft.signatureMetadataCompat,
         structuredIdentityCompat: draft.structuredIdentityCompat,
         plainIdentityCompat: draft.plainIdentityCompat,
+        naturalStyle: draft.naturalStyle,
         searchContextCompat: draft.searchContextCompat,
         enabledKeyIds: draft.scope === 'all' ? [] : parsedIds.ids,
       })
@@ -226,6 +229,17 @@ export function ProtocolSection() {
             />
           </SettingRow>
           <SettingRow
+            label="自然表达"
+            hint="仅对指定 Key 的 Claude 模型生效。简单问题简洁回答，复杂任务充分展开，减少套话并按需使用列表。保留客户端明确要求的语气、格式和详细程度。可独立开关。"
+          >
+            <Switch
+              checked={draft?.naturalStyle ?? false}
+              onCheckedChange={(value) => edit({ naturalStyle: value, ...(value ? { scope: 'selected' as const } : {}) })}
+              disabled={disabled}
+              aria-label="自然表达"
+            />
+          </SettingRow>
+          <SettingRow
             label="搜索上下文封装"
             hint="为真实搜索结果生成可回传的上下文并绑定当前 Key。超过 24 小时仍可作为历史资料追问，会提示资料可能过时；旧版明文结果需要重新搜索。"
           >
@@ -313,6 +327,7 @@ export function ProtocolSection() {
             <div><dt className="text-muted-foreground">签名元数据实验</dt><dd className="mt-1 font-medium">{actual.signatureMetadataCompat && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭（原样透传）'}</dd></div>
             <div><dt className="text-muted-foreground">结构化身份展示</dt><dd className="mt-1 font-medium">{actual.structuredIdentityCompat && actual.enabledKeyIds.length ? '开启（claude_code）' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">普通身份介绍</dt><dd className="mt-1 font-medium">{actual.plainIdentityCompat && actual.enabledKeyIds.length ? '开启（Claude / Anthropic，隐藏接入渠道）' : '关闭'}</dd></div>
+            <div><dt className="text-muted-foreground">自然表达</dt><dd className="mt-1 font-medium">{actual.naturalStyle && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">搜索上下文封装</dt><dd className="mt-1 font-medium">{actual.searchContextCompat && actual.enabledKeyIds.length ? '开启' : '关闭'}</dd></div>
             <div className="sm:col-span-2"><dt className="text-muted-foreground">应用范围</dt><dd className="mt-1 break-all font-medium">{scopeLabel(actual.enabledKeyIds, keys)}</dd></div>
             {updatedAt && !Number.isNaN(updatedAt.getTime()) && <div className="sm:col-span-2"><dt className="text-muted-foreground">服务器更新时间</dt><dd className="mt-1">{updatedAt.toLocaleString()}</dd></div>}

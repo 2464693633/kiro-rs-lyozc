@@ -76,6 +76,8 @@ pub struct ProtocolCompatibilityConfig {
     /// Local introductions for standalone identity questions on Claude models.
     /// Requires an explicit key scope; does not change upstream routing.
     pub plain_identity_compat: bool,
+    /// Concise, natural prose defaults. Requires an explicit key scope.
+    pub natural_style: bool,
     pub search_context_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
@@ -93,6 +95,7 @@ impl ProtocolCompatibilityConfig {
                 effective.signature_metadata_compat = false;
                 effective.structured_identity_compat = false;
                 effective.plain_identity_compat = false;
+                effective.natural_style = false;
                 effective.search_context_compat = false;
             }
             effective

@@ -30,6 +30,7 @@ mod handlers;
 mod identity;
 mod identity_guard;
 mod middleware;
+mod natural_style;
 mod observation;
 mod openai;
 mod responses;

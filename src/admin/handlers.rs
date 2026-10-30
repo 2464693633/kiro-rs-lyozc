@@ -714,6 +714,7 @@ pub async fn set_protocol_compatibility(
     if (payload.signature_metadata_compat
         || payload.structured_identity_compat
         || payload.plain_identity_compat
+        || payload.natural_style
         || payload.search_context_compat)
         && payload.enabled_key_ids.is_empty()
     {

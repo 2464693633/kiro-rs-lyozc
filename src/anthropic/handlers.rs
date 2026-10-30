@@ -845,6 +845,7 @@ pub(super) async fn post_compatible_messages_inner(
     cc: bool,
 ) -> Response {
     let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
+    super::natural_style::apply(&mut payload, compatibility.natural_style);
     if compatibility.search_context_compat
         && payload.messages.iter().any(|message| {
             message.role == "assistant"

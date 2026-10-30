@@ -636,6 +636,100 @@ fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::U
 }
 
 #[tokio::test]
+async fn gateway_natural_style_requires_opt_in_and_scope_on_both_routes() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for (enabled, ids, expected) in [
+                (false, vec![0], false),
+                (true, vec![], false),
+                (true, vec![1], false),
+                (true, vec![0], true),
+            ] {
+                let f = fixture(Mode::Normal(Duration::ZERO)).await;
+                f.state
+                    .protocol_compatibility
+                    .update_with_persistence(
+                        crate::model::config::ProtocolCompatibilityConfig {
+                            natural_style: enabled,
+                            enabled_key_ids: ids,
+                            ..Default::default()
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                let message = parsed_protocol_message(
+                    compatibility_request(
+                        f.state.clone(),
+                        cc,
+                        json!({
+                            "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                            "system":"Use three numbered points for this task.",
+                            "messages":[{"role":"user","content":"Explain HTTP."}]
+                        }),
+                    )
+                    .await,
+                    streaming,
+                )
+                .await;
+                assert_eq!(message["stop_reason"], "end_turn");
+                assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+                let body = f.bodies.lock()[0].to_string();
+                assert_eq!(body.contains("Conversational prose defaults"), expected);
+                assert!(body.contains("Use three numbered points for this task."));
+                assert!(body.contains("Explain HTTP."));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_natural_style_applies_only_to_generation_without_extra_checks() {
+    let mut f = fixture(Mode::SemanticIdentity {
+        classification: r#"{"kind":"product","language":"zh","model":false,"route":false,"constrained":false}"#,
+        reply:"Kiro 是一个开发工具。", review:r#"{"edits":[]}"#, tool:false,
+    }).await;
+    enable_semantic_identity(&mut f);
+    let mut config = f.state.protocol_compatibility.snapshot().config;
+    config.natural_style = true;
+    f.state
+        .protocol_compatibility
+        .update_with_persistence(config, |_| Ok(()))
+        .unwrap();
+    let message = parsed_protocol_message(
+        compatibility_request(
+            f.state.clone(),
+            false,
+            json!({
+                "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+                "messages":[{"role":"user","content":"Kiro是什么？"}]
+            }),
+        )
+        .await,
+        true,
+    )
+    .await;
+    assert_eq!(message["content"][0]["text"], "Kiro 是一个开发工具。");
+    assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+    let bodies = f.bodies.lock();
+    assert!(
+        !bodies[0]
+            .to_string()
+            .contains("Conversational prose defaults")
+    );
+    assert!(
+        bodies[1]
+            .to_string()
+            .contains("Conversational prose defaults")
+    );
+    assert!(
+        !bodies[2]
+            .to_string()
+            .contains("Conversational prose defaults")
+    );
+    assert_eq!(message["usage"]["input_tokens"], 39);
+}
+
+#[tokio::test]
 async fn gateway_semantic_identity_audits_client_recaps_without_losing_the_summary() {
     // Captured Claude Code recap request: word/sentence limits are prose style,
     // not a reason to bypass consistency checks as a machine-readable contract.
@@ -1563,6 +1657,7 @@ fn enable_execution_bridge(state: &AppState) {
                 signature_metadata_compat: false,
                 structured_identity_compat: false,
                 plain_identity_compat: false,
+                natural_style: false,
                 search_context_compat: false,
                 enabled_key_ids: vec![],
             },
@@ -1761,6 +1856,7 @@ async fn gateway_execution_declaration_does_not_invent_calls_and_scope_is_enforc
                 signature_metadata_compat: false,
                 structured_identity_compat: false,
                 plain_identity_compat: false,
+                natural_style: false,
                 search_context_compat: false,
             },
             |_| Ok(()),
