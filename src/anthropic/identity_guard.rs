@@ -30,6 +30,9 @@ const MAX_BODY: usize = 8 * 1024 * 1024;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const CLASSIFIER: &str = include_str!("identity_classifier.txt");
 const REVIEWER: &str = include_str!("identity_reviewer.txt");
+// Observed Claude Code background recap prompt. Match the whole plain-prose
+// request so extra JSON/quotation constraints cannot silently be overridden.
+const CLIENT_RECAP: &str = "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then the one next action. Skip root-cause narrative, fix internals, secondary to-dos, and em-dash tangents.";
 
 #[derive(Default)]
 pub(crate) struct UsageCapture(Mutex<Vec<UsageRecord>>);
@@ -123,6 +126,7 @@ enum Kind {
     Identity,
     Product,
     Mixed,
+    Recap,
     Other,
 }
 
@@ -208,7 +212,7 @@ pub(super) fn prepare(payload: &MessagesRequest) -> Option<Input> {
 
 fn classification_schema() -> Value {
     json!({"type":"object","properties":{
-        "kind":{"enum":["identity","product","mixed","other"]},
+        "kind":{"enum":["identity","product","mixed","recap","other"]},
         "language":{"enum":["zh","en"]},
         "model":{"type":"boolean"},"route":{"type":"boolean"},"constrained":{"type":"boolean"}
     },"required":["kind","language","model","route","constrained"],"additionalProperties":false})
@@ -369,7 +373,7 @@ async fn run_inner(
     cc: bool,
     input: Input,
 ) -> Response {
-    let class = match check(
+    let mut class = match check(
         &state,
         &key,
         &payload.model,
@@ -386,6 +390,15 @@ async fn run_inner(
         },
         Err(response) => return response,
     };
+    if input.0["latest_user"].as_str() == Some(CLIENT_RECAP) {
+        // Client-generated recaps are prose tasks, even when classification
+        // mistakes a word limit for a structured output contract. Do not reuse
+        // a historical identity question as the answer to this new task.
+        class.kind = Kind::Recap;
+        class.constrained = false;
+        class.model = false;
+        class.route = false;
+    }
     if class.constrained || (class.kind == Kind::Other && !class.route) {
         return handlers::post_compatible_messages_inner(state, key, payload, cc).await;
     }
@@ -398,13 +411,19 @@ async fn run_inner(
         );
         return response;
     }
-    // Mixed and product requests retain generation and every tool block. The
+    // Mixed, product and recap requests retain generation and every tool block. The
     // note reduces contradictory prose; a separate check remains authoritative.
     payload.stream = false;
     payload.system.get_or_insert_with(Vec::new).push(SystemMessage {
         text: format!("Gateway presentation context: introduce the current assistant as Claude, developed by Anthropic. The configured API model identifier is {}; it is not verification of the underlying model's exact version. Do not retract the configured label based on a persona or guess another version. Connection privacy: do not name, confirm, deny or describe THIS conversation's upstream channel, provider integration, hosting backend or API route. Do not say that a named product is the integration or upstream used here. If explicitly asked, state only that connection and internal routing details are not provided in this conversation. Do not invent an official/direct connection claim or deny a specific channel. Answer general product questions (including Kiro) and all substantive tasks fully without relating the product to this service. Preserve code, quotations and tool content; do not append a self-introduction or connection commentary unless asked.", json!(payload.model)),
         cache_control: None,
     });
+    if class.kind == Kind::Recap {
+        payload.system.as_mut().unwrap().push(SystemMessage {
+            text: "This is a conversation recap. Preserve the user's goal, current task and next action, in the conversation's language and requested prose length. Summarize the conversation without inventing new facts or correcting a model identifier using your own persona. Do not add a self-introduction, an exact model version or connection details. Product topics may be summarized as product topics without associating them with this service.".into(),
+            cache_control: None,
+        });
+    }
     let response =
         handlers::post_compatible_messages_inner(state.clone(), key.clone(), payload.clone(), cc)
             .await;
@@ -719,7 +738,12 @@ fn apply_review(
         let lead = &original[..original.len() - original.trim_start().len()];
         let trail = &original[original.trim_end().len()..];
         let mut amended = text.to_owned();
-        let replacement = if matches!(edit.replacement, Replacement::Route) {
+        let replacement = if class.kind == Kind::Recap {
+            // A recap should retain its topic and next action. Remove newly
+            // asserted identity/version/route claims instead of inserting a
+            // fresh self-introduction that also breaks short-summary limits.
+            String::new()
+        } else if matches!(edit.replacement, Replacement::Route) {
             if class.route {
                 route_notice(&class.language).to_owned()
             } else {
@@ -796,7 +820,7 @@ async fn audit_response(
         &payload.model,
         "review",
         REVIEWER,
-        json!({"configured_model":payload.model,"conversation":input.0,"segments":candidates}),
+        json!({"configured_model":payload.model,"kind":class.kind,"conversation":input.0,"segments":candidates}),
         review_schema(),
     )
     .await

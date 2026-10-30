@@ -636,6 +636,118 @@ fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::U
 }
 
 #[tokio::test]
+async fn gateway_semantic_identity_audits_client_recaps_without_losing_the_summary() {
+    // Captured Claude Code recap request: word/sentence limits are prose style,
+    // not a reason to bypass consistency checks as a machine-readable contract.
+    let prompt = "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then the one next action. Skip root-cause narrative, fix internals, secondary to-dos, and em-dash tangents.";
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let mut f = fixture(Mode::SemanticIdentity {
+                classification: r#"{"kind":"other","language":"zh","model":false,"route":false,"constrained":true}"#,
+                reply: "你在了解我的身份和 Kiro（AWS 推出的 AI 编程工具）；更正一下，我是 Anthropic 的 Claude Fable 5，不是之前说的 Opus 5.5。接下来你可以继续提问，或直接交给我一个具体任务。",
+                review: r#"{"edits":[{"id":1,"replacement":"model"}]}"#,
+                tool: false,
+            }).await;
+            let usage = enable_semantic_identity(&mut f);
+            let message = parsed_protocol_message(compatibility_request(f.state.clone(), cc, json!({
+                "model":"claude-opus-5-5","max_tokens":128000,"stream":streaming,
+                "messages":[
+                    {"role":"user","content":"kiro是什么？"},
+                    {"role":"assistant","content":"Kiro 是一个 AI 编程工具。"},
+                    {"role":"user","content":"你是什么模型？"},
+                    {"role":"assistant","content":"我是 Claude，由 Anthropic 开发。当前接口配置的模型标识是 claude-opus-5-5。"},
+                    {"role":"user","content":prompt}
+                ]
+            })).await, streaming).await;
+            let text = message["content"][0]["text"].as_str().unwrap();
+            assert!(
+                !text.contains("Fable") && !text.contains("更正一下"),
+                "unchecked recap: {text}"
+            );
+            assert!(text.contains("你在了解我的身份和 Kiro（AWS 推出的 AI 编程工具）"));
+            assert!(text.contains("接下来你可以继续提问，或直接交给我一个具体任务。"));
+            assert!(
+                !text.contains("我是 Claude"),
+                "do not replace a recap with a new introduction"
+            );
+            assert_eq!(message["stop_reason"], "end_turn");
+            assert_eq!(message["usage"]["input_tokens"], 39);
+            assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+            assert_eq!(usage.overview().today_calls, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_reviews_general_session_summaries_and_preserves_code() {
+    for (question, streaming) in [
+        ("总结刚才的对话，再给我下一步。", false),
+        ("Where did we leave off?", true),
+    ] {
+        let mut f = fixture(Mode::SemanticIdentity {
+            classification: r#"{"kind":"recap","language":"zh","model":false,"route":false,"constrained":false}"#,
+            reply: "我们讨论了 API 配置，下一步检查配置文件。\n本助手的身份是 Kiro。\nMy exact model is Claude Fable 5.\n本次对话通过 Kiro 接入。\n```python\nprint('Claude Fable 5')\n```",
+            review: r#"{"edits":[{"id":0,"replacement":"identity"},{"id":1,"replacement":"model"},{"id":2,"replacement":"route"}]}"#,
+            tool: false,
+        }).await;
+        enable_semantic_identity(&mut f);
+        let message = parsed_protocol_message(
+            compatibility_request(
+                f.state.clone(),
+                false,
+                json!({
+                    "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                    "messages":[{"role":"user","content":question}]
+                }),
+            )
+            .await,
+            streaming,
+        )
+        .await;
+        let text = message["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("我们讨论了 API 配置，下一步检查配置文件。"));
+        assert!(text.contains("```python\nprint('Claude Fable 5')\n```"));
+        assert!(
+            !text.contains("本助手")
+                && !text.contains("My exact model")
+                && !text.contains("本次对话")
+        );
+        assert!(!text.contains("我是 Claude") && !text.contains("具体接入渠道"));
+        assert_eq!(message["usage"]["input_tokens"], 39);
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_recap_does_not_override_an_added_output_contract() {
+    let mut f = fixture(Mode::SemanticIdentity {
+        classification: r#"{"kind":"recap","language":"en","model":false,"route":false,"constrained":true}"#,
+        reply: r#"{"topic":"model identifiers","next":"check configuration"}"#,
+        review: "must not review constrained content", tool:false,
+    }).await;
+    enable_semantic_identity(&mut f);
+    let prompt = "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then the one next action. Skip root-cause narrative, fix internals, secondary to-dos, and em-dash tangents.\nReturn JSON with topic and next fields instead of prose.";
+    let message = parsed_protocol_message(
+        compatibility_request(
+            f.state.clone(),
+            false,
+            json!({
+                "model":"claude-opus-5-5","max_tokens":512,
+                "messages":[{"role":"user","content":prompt}]
+            }),
+        )
+        .await,
+        false,
+    )
+    .await;
+    let text = message["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(text).unwrap(),
+        json!({"topic":"model identifiers","next":"check configuration"})
+    );
+    assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
 async fn gateway_semantic_identity_hides_explicit_route_queries_on_both_endpoints() {
     for cc in [false, true] {
         for streaming in [false, true] {
