@@ -535,6 +535,39 @@ async fn gateway_plain_identity_is_scoped_and_local_for_both_endpoints_and_strea
 }
 
 #[tokio::test]
+async fn gateway_plain_identity_handles_appended_context_without_calling_upstream() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::Normal(Duration::ZERO)).await;
+            f.state.protocol_compatibility.update_with_persistence(
+                crate::model::config::ProtocolCompatibilityConfig {
+                    plain_identity_compat: true,
+                    enabled_key_ids: vec![0],
+                    ..Default::default()
+                }, |_| Ok(()),
+            ).unwrap();
+            let response = compatibility_request(f.state.clone(), cc, json!({
+                "model":"claude-opus-5-5", "max_tokens":128000, "stream":streaming,
+                "tool_choice":null, "output_config":{"effort":"xhigh"},
+                "messages":[
+                    {"role":"user","content":"你是什么模型？"},
+                    {"role":"system","content":[{"type":"text","text":"Workspace and client context","cache_control":{"type":"ephemeral"}}]}
+                ]
+            })).await;
+            assert_eq!(response.headers()["x-kiro-response-source"], "local-identity");
+            let message = parsed_protocol_message(response, streaming).await;
+            assert_eq!(f.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(message["content"][0]["text"], "我是 Claude，由 Anthropic 开发的 AI 助手。当前接口配置的模型标识是 claude-opus-5-5。");
+            assert_eq!(message["model"], "claude-opus-5-5");
+            assert_eq!(message["stop_reason"], "end_turn");
+            for field in ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"] {
+                assert_eq!(message["usage"][field], 0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn gateway_plain_identity_does_not_intercept_normal_kiro_tasks_or_structured_identity() {
     let f = fixture(Mode::Normal(Duration::ZERO)).await;
     f.state.protocol_compatibility.update_with_persistence(
