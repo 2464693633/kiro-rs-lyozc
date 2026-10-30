@@ -1305,6 +1305,7 @@ dependencies = [
  "pdf-extract",
  "redis",
  "reqwest",
+ "ring",
  "rusqlite",
  "rust-embed",
  "serde",

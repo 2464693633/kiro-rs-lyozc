@@ -721,7 +721,7 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
                     "type": "web_search_result",
                     "title": item.title,
                     "url": item.url,
-                    "encrypted_content": item.snippet.clone().unwrap_or_default(),
+                    "encrypted_content": item.presentation_context.as_ref().or(item.snippet.as_ref()).cloned().unwrap_or_default(),
                     "page_age": page_age
                 })
             })
@@ -1461,15 +1461,17 @@ async fn execute_web_search(
     emitter: &mut Option<&mut WebSearchSseEmitter>,
     web_search_requests: &mut u32,
     max_uses: Option<u32>,
+    search_context: Option<&super::search_context::Session>,
 ) -> anyhow::Result<Option<WebSearchResults>> {
     let query = tool_query(tool_use);
+    let context_query = query.clone().unwrap_or_default();
     let pending = if let Some(emitter) = emitter.as_deref_mut() {
         Some(emitter.begin_search(query.as_deref().unwrap_or("")).await)
     } else {
         None
     };
 
-    let result = if let Some(query) = query {
+    let mut result = if let Some(query) = query {
         log_normalized_web_search_query(tool_use, &query);
         let (_, mcp_request) = websearch::create_mcp_request(&query);
         // Count one logical server-tool invocation, including an empty result.
@@ -1507,6 +1509,14 @@ async fn execute_web_search(
         None
     };
 
+    if let Some(context) = search_context
+        && let Err(message) = context.decorate(&context_query, &mut result)
+    {
+        if let (Some(emitter), Some(pending)) = (emitter.as_deref_mut(), pending) {
+            emitter.abort_search(pending).await;
+        }
+        anyhow::bail!("{message}");
+    }
     if let (Some(emitter), Some(pending)) = (emitter.as_deref_mut(), pending) {
         emitter.complete_search(pending, &result).await;
     }
@@ -1653,6 +1663,33 @@ async fn run_web_search_loop_inner(
     mut emitter: Option<&mut WebSearchSseEmitter>,
     incremental_streaming: bool,
 ) -> Response {
+    let search_context = if provider
+        .token_manager()
+        .protocol_compatibility()
+        .for_key(key_id)
+        .search_context_compat
+    {
+        match super::search_context::Session::new(
+            provider.token_manager().config(),
+            key_id,
+            provider
+                .token_manager()
+                .protocol_compatibility()
+                .native_search_contexts
+                .clone(),
+        ) {
+            Ok(context) => Some(context),
+            Err(message) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse::new("api_error", message)),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        None
+    };
     let mut presentation: Vec<Value> = Vec::new();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
@@ -1800,6 +1837,7 @@ async fn run_web_search_loop_inner(
                     &mut emitter,
                     &mut web_search_requests,
                     max_uses,
+                    search_context.as_ref(),
                 )
                 .await
                 {
@@ -1846,6 +1884,7 @@ async fn run_web_search_loop_inner(
                     &mut emitter,
                     &mut web_search_requests,
                     max_uses,
+                    search_context.as_ref(),
                 )
                 .await
                 {
@@ -3056,6 +3095,8 @@ mod tests {
                 title: "Rust 1.99".to_string(),
                 url: "https://example.com/rust".to_string(),
                 snippet: Some("Rust 1.99 released".to_string()),
+                encrypted_content: None,
+                presentation_context: None,
                 published_date: None,
                 id: None,
                 domain: None,
@@ -3165,6 +3206,8 @@ mod tests {
                 title: "T".to_string(),
                 url: "https://example.com".to_string(),
                 snippet: Some("snip".to_string()),
+                encrypted_content: None,
+                presentation_context: None,
                 published_date: None,
                 id: None,
                 domain: None,

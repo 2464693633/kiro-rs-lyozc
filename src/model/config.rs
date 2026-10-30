@@ -72,6 +72,8 @@ pub struct ProtocolCompatibilityConfig {
     pub search_incremental_streaming: bool,
     /// Experimental envelope presentation; requires an explicit key scope.
     pub signature_metadata_compat: bool,
+    pub structured_identity_compat: bool,
+    pub search_context_compat: bool,
     pub enabled_key_ids: Vec<u64>,
 }
 
@@ -86,6 +88,8 @@ impl ProtocolCompatibilityConfig {
             let mut effective = self.clone();
             if self.enabled_key_ids.is_empty() {
                 effective.signature_metadata_compat = false;
+                effective.structured_identity_compat = false;
+                effective.search_context_compat = false;
             }
             effective
         } else {

@@ -711,11 +711,15 @@ pub async fn set_protocol_compatibility(
     State(state): State<AdminState>,
     Json(payload): Json<SetProtocolCompatibilityRequest>,
 ) -> impl IntoResponse {
-    if payload.signature_metadata_compat && payload.enabled_key_ids.is_empty() {
+    if (payload.signature_metadata_compat
+        || payload.structured_identity_compat
+        || payload.search_context_compat)
+        && payload.enabled_key_ids.is_empty()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(super::types::AdminErrorResponse::invalid_request(
-                "签名元数据实验必须指定客户端 Key ID".to_string(),
+                "协议实验必须指定客户端 Key ID".to_string(),
             )),
         )
             .into_response();

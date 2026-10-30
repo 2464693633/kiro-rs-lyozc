@@ -7,7 +7,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::config::ProtocolCompatibilityConfig;
 
-pub const MODULE_VERSION: &str = "2";
+pub const MODULE_VERSION: &str = "3";
 
 #[derive(Debug, Clone)]
 pub struct ProtocolCompatibilitySnapshot {
@@ -21,6 +21,7 @@ pub type SharedProtocolCompatibility = Arc<ProtocolCompatibilityRuntime>;
 pub struct ProtocolCompatibilityRuntime {
     snapshot: RwLock<ProtocolCompatibilitySnapshot>,
     update_lock: Mutex<()>,
+    pub(crate) native_search_contexts: Arc<crate::anthropic::search_context::NativeContextCache>,
 }
 
 impl Default for ProtocolCompatibilityRuntime {
@@ -38,6 +39,7 @@ impl ProtocolCompatibilityRuntime {
                 updated_at: None,
             }),
             update_lock: Mutex::new(()),
+            native_search_contexts: Arc::new(Default::default()),
         }
     }
 
@@ -78,6 +80,8 @@ mod tests {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
             signature_metadata_compat: true,
+            structured_identity_compat: true,
+            search_context_compat: true,
             enabled_key_ids: vec![7],
         };
         assert!(
@@ -97,6 +101,8 @@ mod tests {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
             signature_metadata_compat: true,
+            structured_identity_compat: true,
+            search_context_compat: true,
             enabled_key_ids: vec![9, 7, 9],
         };
         let saved = runtime
@@ -116,6 +122,8 @@ mod tests {
         );
         assert!(reader.for_key(9).search_incremental_streaming);
         assert!(reader.for_key(9).signature_metadata_compat);
+        assert!(reader.for_key(9).structured_identity_compat);
+        assert!(reader.for_key(9).search_context_compat);
         assert_eq!(reader.for_key(8), ProtocolCompatibilityConfig::default());
         runtime
             .update_with_persistence(
@@ -128,5 +136,7 @@ mod tests {
             .unwrap();
         assert!(reader.for_key(8).search_incremental_streaming);
         assert!(!reader.for_key(8).signature_metadata_compat);
+        assert!(!reader.for_key(8).structured_identity_compat);
+        assert!(!reader.for_key(8).search_context_compat);
     }
 }

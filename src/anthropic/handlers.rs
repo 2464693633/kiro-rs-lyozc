@@ -806,6 +806,31 @@ async fn post_compatible_messages(
     cc: bool,
 ) -> Response {
     let compatibility = state.protocol_compatibility_for_key(key_ctx.key_id);
+    if compatibility.search_context_compat
+        && payload.messages.iter().any(|message| {
+            message.role == "assistant"
+                && message.content.as_array().is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block["type"] == "web_search_tool_result")
+                })
+        })
+        && let Some(provider) = state.kiro_provider.as_ref()
+    {
+        let restored = super::search_context::Session::new(
+            provider.token_manager().config(),
+            key_ctx.key_id,
+            state.protocol_compatibility.native_search_contexts.clone(),
+        )
+        .and_then(|context| context.restore_history(&mut payload));
+        if let Err(message) = restored {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse::new("invalid_request_error", message)),
+            )
+                .into_response();
+        }
+    }
     let execution = match super::code_execution::prepare(&mut payload, compatibility.code_execution_mode) {
         Ok(plan) => plan,
         Err(message) => return (StatusCode::BAD_REQUEST, Json(ErrorResponse::new("invalid_request_error", message))).into_response(),
@@ -831,6 +856,7 @@ async fn post_compatible_messages(
         return super::code_execution::run(state, key_ctx, payload, cc, plan).await;
     }
     let buffered_sse = structured && payload.stream;
+    let identity_format = super::structured_output::format(&payload).cloned();
     if buffered_sse {
         payload.stream = false;
     }
@@ -839,6 +865,12 @@ async fn post_compatible_messages(
     } else {
         post_messages_inner(state, key_ctx, payload).await
     };
+    let response = super::structured_output::present_identity_response(
+        response,
+        identity_format.as_ref(),
+        compatibility.structured_identity_compat,
+    )
+    .await;
     if buffered_sse {
         super::structured_output::as_sse(response).await
     } else {

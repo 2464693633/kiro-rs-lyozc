@@ -318,6 +318,8 @@ mod protocol_compatibility_tests {
         assert_eq!(initial["codeExecutionMode"], "reject");
         assert_eq!(initial["searchIncrementalStreaming"], false);
         assert_eq!(initial["signatureMetadataCompat"], false);
+        assert_eq!(initial["structuredIdentityCompat"], false);
+        assert_eq!(initial["searchContextCompat"], false);
         assert_eq!(initial["enabledKeyIds"], json!([]));
         assert_eq!(initial["diagnostics"]["codeExecutionBackend"], "unavailable");
         assert_eq!(initial["diagnostics"]["systemTransport"], "conversation_history");
@@ -327,6 +329,8 @@ mod protocol_compatibility_tests {
             "codeExecutionMode":"bridge",
             "searchIncrementalStreaming":true,
             "signatureMetadataCompat":true,
+            "structuredIdentityCompat":true,
+            "searchContextCompat":true,
             "enabledKeyIds":[7,3,7]
         });
         let response = client
@@ -342,7 +346,11 @@ mod protocol_compatibility_tests {
         assert!(runtime.for_key(3).search_incremental_streaming);
         assert!(!runtime.for_key(8).search_incremental_streaming);
         assert!(runtime.for_key(7).signature_metadata_compat);
+        assert!(runtime.for_key(7).structured_identity_compat);
+        assert!(runtime.for_key(7).search_context_compat);
         assert!(!runtime.for_key(8).signature_metadata_compat);
+        assert!(!runtime.for_key(8).structured_identity_compat);
+        assert!(!runtime.for_key(8).search_context_compat);
         let persisted = Config::load(&file.0).unwrap();
         assert_eq!(persisted.region, "eu-central-1");
         assert_eq!(persisted.protocol_compatibility.enabled_key_ids, vec![3,7]);
@@ -375,6 +383,21 @@ mod protocol_compatibility_tests {
                 .unwrap(),
             saved
         );
+        for field in ["structuredIdentityCompat", "searchContextCompat"] {
+            let mut unscoped = json!({"codeExecutionMode":"bridge","searchIncrementalStreaming":true,"enabledKeyIds":[]});
+            unscoped[field] = json!(true);
+            assert_eq!(
+                client
+                    .put(&url)
+                    .header("x-api-key", "fixture-admin-key")
+                    .json(&unscoped)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
         for invalid in [
             json!({}),
             json!({"codeExecutionMode":"fake","searchIncrementalStreaming":true,"enabledKeyIds":[]}),
@@ -413,6 +436,8 @@ mod protocol_compatibility_tests {
             code_execution_mode: CodeExecutionMode::Bridge,
             search_incremental_streaming: true,
             signature_metadata_compat: false,
+            structured_identity_compat: false,
+            search_context_compat: false,
             enabled_key_ids: Vec::new(),
         };
         assert!(service.set_protocol_compatibility(request).is_err());

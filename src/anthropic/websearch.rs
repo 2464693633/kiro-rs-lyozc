@@ -100,6 +100,10 @@ pub struct WebSearchResult {
     pub title: String,
     pub url: String,
     pub snippet: Option<String>,
+    #[serde(default, alias = "encryptedContent")]
+    pub encrypted_content: Option<String>,
+    #[serde(skip)]
+    pub presentation_context: Option<String>,
     #[serde(rename = "publishedDate")]
     pub published_date: Option<i64>,
     pub id: Option<String>,
@@ -1001,6 +1005,8 @@ mod tests {
                 title: "Test Result".to_string(),
                 url: "https://example.com".to_string(),
                 snippet: Some("This is a test snippet".to_string()),
+                encrypted_content: None,
+                presentation_context: None,
                 published_date: None,
                 id: None,
                 domain: None,

@@ -32,6 +32,7 @@ mod observation;
 mod openai;
 mod responses;
 mod router;
+pub(crate) mod search_context;
 mod signature_compat;
 pub mod stream;
 mod structured_output;

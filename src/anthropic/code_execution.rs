@@ -338,6 +338,15 @@ async fn run_rounds(
             if selected && !terminal_override {
                 message["stop_reason"] = json!(if client_tools { "tool_use" } else { "end_turn" });
             }
+            let stop = message["stop_reason"].as_str().unwrap_or("").to_owned();
+            structured_output::present_identity(
+                structured_output::format(&payload),
+                message["content"].as_array_mut().unwrap(),
+                &stop,
+                state
+                    .protocol_compatibility_for_key(key.key_id)
+                    .structured_identity_compat,
+            );
             if let Err(reason) = structured_output::validate(
                 structured_output::format(&payload),
                 message["content"].as_array().unwrap(),
@@ -365,6 +374,21 @@ async fn run_rounds(
             role: "user".into(),
             content: json!(feedback),
         });
+        if state
+            .protocol_compatibility_for_key(key.key_id)
+            .search_context_compat
+            && let Some(provider) = state.kiro_provider.as_ref()
+        {
+            let restored = super::search_context::Session::new(
+                provider.token_manager().config(),
+                key.key_id,
+                state.protocol_compatibility.native_search_contexts.clone(),
+            )
+            .and_then(|context| context.restore_history(&mut payload));
+            if let Err(message) = restored {
+                return error(StatusCode::BAD_GATEWAY, &message);
+            }
+        }
         normalize_history(&mut payload);
         // A forced tool choice applies to the original request, not forever
         // after the tool already returned an error.

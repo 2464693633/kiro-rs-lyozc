@@ -412,6 +412,213 @@ fn structured_request(stream: bool) -> serde_json::Value {
             "required":["kind","count"],"additionalProperties":false}}}})
 }
 
+async fn parsed_protocol_message(response: Response, streaming: bool) -> serde_json::Value {
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    if !streaming {
+        return serde_json::from_slice(&bytes).unwrap();
+    }
+    let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes)
+        .unwrap()
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "message_start")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| e["type"] == "message_stop")
+            .count(),
+        1
+    );
+    assert!(!events.iter().any(|e| e["type"] == "error"));
+    let mut message = events
+        .iter()
+        .find(|e| e["type"] == "message_start")
+        .unwrap()["message"]
+        .clone();
+    for event in events {
+        if event["type"] == "content_block_start" {
+            assert_eq!(
+                event["index"].as_u64().unwrap() as usize,
+                message["content"].as_array().unwrap().len()
+            );
+            message["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(event["content_block"].clone());
+        } else if event["type"] == "content_block_delta" {
+            let index = event["index"].as_u64().unwrap() as usize;
+            for field in ["text", "thinking", "signature"] {
+                if let Some(value) = event["delta"][field].as_str() {
+                    let current = message["content"][index][field]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_owned();
+                    message["content"][index][field] = json!(current + value);
+                }
+            }
+        } else if event["type"] == "message_delta" {
+            message["stop_reason"] = event["delta"]["stop_reason"].clone();
+        }
+    }
+    message
+}
+
+fn identity_request(stream: bool) -> serde_json::Value {
+    json!({"model":"claude-opus-5-5","max_tokens":128,"stream":stream,
+        "messages":[{"role":"user","content":"Describe your platform"}],
+        "output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{
+            "identity_platform":{"type":"string","enum":["claude_code","kiro","other"]},"desc":{"type":"string"}},
+            "required":["identity_platform","desc"],"additionalProperties":false}}}})
+}
+
+#[tokio::test]
+async fn gateway_identity_display_requires_explicit_opt_in_and_key_scope() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for (enabled, ids, expected) in [
+                (false, vec![0], "kiro"),
+                (true, vec![], "kiro"),
+                (true, vec![1], "kiro"),
+                (true, vec![0], "claude_code"),
+            ] {
+                let f = fixture(Mode::Structured(
+                    "{\"identity_platform\":\"kiro\",\"desc\":\"I am Kiro\"}",
+                ))
+                .await;
+                f.state
+                    .protocol_compatibility
+                    .update_with_persistence(
+                        crate::model::config::ProtocolCompatibilityConfig {
+                            structured_identity_compat: enabled,
+                            enabled_key_ids: ids,
+                            ..Default::default()
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                let message = parsed_protocol_message(
+                    compatibility_request(f.state.clone(), cc, identity_request(streaming)).await,
+                    streaming,
+                )
+                .await;
+                let value: serde_json::Value =
+                    serde_json::from_str(message["content"][0]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(value["identity_platform"], expected);
+                assert_eq!(message["model"], "claude-opus-5-5");
+                assert_eq!(message["stop_reason"], "end_turn");
+                assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_search_context_roundtrips_without_repeating_search_and_checks_scope() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for (enabled, ids, expected) in [
+                (false, vec![0], false),
+                (true, vec![], false),
+                (true, vec![1], false),
+                (true, vec![0], true),
+            ] {
+                let mut config = Config::default();
+                config.admin_api_key = Some("fixture-context-secret".into());
+                let f = fixture_with_config(Mode::Search, config).await;
+                f.state
+                    .protocol_compatibility
+                    .update_with_persistence(
+                        crate::model::config::ProtocolCompatibilityConfig {
+                            search_context_compat: enabled,
+                            search_incremental_streaming: true,
+                            enabled_key_ids: ids,
+                            ..Default::default()
+                        },
+                        |_| Ok(()),
+                    )
+                    .unwrap();
+                let request = json!({"model":"claude-opus-5-5","max_tokens":128,"stream":streaming,
+                    "tools":[{"type":"web_search_20250305","name":"web_search","max_uses":1}],
+                    "messages":[{"role":"user","content":"Search rust release"}]});
+                let message = parsed_protocol_message(
+                    compatibility_request(f.state.clone(), cc, request).await,
+                    streaming,
+                )
+                .await;
+                let block = message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|b| b["type"] == "web_search_tool_result")
+                    .unwrap();
+                let token = block["content"][0]["encrypted_content"].as_str().unwrap();
+                assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+                if !expected {
+                    assert_eq!(token, "search evidence");
+                    continue;
+                }
+                let bytes = STANDARD.decode(token).unwrap();
+                assert!(!bytes.windows(15).any(|part| part == b"search evidence"));
+                // Remove the answer so only successful context replay can give
+                // the fixture its source evidence on the next request.
+                let retained: Vec<_> = message["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|b| b["type"] != "text")
+                    .cloned()
+                    .collect();
+                let followup = json!({"model":"claude-opus-5-5","max_tokens":128,"stream":!streaming,
+                    "messages":[{"role":"user","content":"Earlier search"},{"role":"assistant","content":retained},
+                        {"role":"user","content":"Explain the source"}]});
+                let next = parsed_protocol_message(
+                    compatibility_request(f.state.clone(), cc, followup.clone()).await,
+                    !streaming,
+                )
+                .await;
+                assert_eq!(
+                    next["content"][0]["text"],
+                    "Synthesized answer using search evidence."
+                );
+                assert_eq!(f.calls.load(Ordering::Relaxed), 4);
+                let last = f.bodies.lock().last().unwrap().to_string();
+                assert!(last.contains("https://example.test/rust"));
+                assert!(!last.contains(token));
+                assert_eq!(
+                    f.bodies
+                        .lock()
+                        .iter()
+                        .filter(|body| body["jsonrpc"] == "2.0")
+                        .count(),
+                    1
+                );
+                let mut changed = followup;
+                changed["messages"][1]["content"][1]["content"][0]["url"] =
+                    json!("https://wrong.test");
+                assert_eq!(
+                    compatibility_request(f.state.clone(), cc, changed)
+                        .await
+                        .status(),
+                    StatusCode::BAD_REQUEST
+                );
+                assert_eq!(f.calls.load(Ordering::Relaxed), 4);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn gateway_signature_metadata_experiment_requires_opt_in_and_explicit_key_scope() {
     let original = super::signature_compat::fixture_signature();
@@ -761,6 +968,8 @@ fn enable_execution_bridge(state: &AppState) {
                 code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
                 search_incremental_streaming: true,
                 signature_metadata_compat: false,
+                structured_identity_compat: false,
+                search_context_compat: false,
                 enabled_key_ids: vec![],
             },
             |_| Ok(()),
@@ -813,6 +1022,8 @@ async fn gateway_execution_declaration_does_not_invent_calls_and_scope_is_enforc
                 search_incremental_streaming: false,
                 enabled_key_ids: vec![u64::MAX],
                 signature_metadata_compat: false,
+                structured_identity_compat: false,
+                search_context_compat: false,
             },
             |_| Ok(()),
         )
@@ -871,19 +1082,55 @@ async fn gateway_search_zero_budget_returns_tool_error_without_calling_search_ba
 
 #[tokio::test]
 async fn gateway_execution_and_search_preserve_context_and_search_budget_across_rounds() {
-    let f=fixture(Mode::ExecutionSearch).await;
-    enable_execution_bridge(&f.state);
-    let mut request=execution_request(false);
-    request["tools"].as_array_mut().unwrap().push(json!({"type":"web_search_20250305","name":"web_search","max_uses":1}));
-    let response=compatibility_request(f.state.clone(),false,request).await;
-    assert_eq!(response.status(),StatusCode::OK);
-    let message:serde_json::Value=serde_json::from_slice(&to_bytes(response.into_body(),1024*1024).await.unwrap()).unwrap();
-    let wire=message.to_string();
-    assert!(wire.contains("search evidence was preserved"),"{wire}");
-    assert!(wire.contains("bash_code_execution_tool_result_error"),"{wire}");
-    assert_eq!(message["usage"]["server_tool_use"]["web_search_requests"],1);
-    assert_eq!(f.bodies.lock().iter().filter(|body|body["jsonrpc"]=="2.0").count(),1);
-    assert_eq!(f.calls.load(Ordering::Relaxed),4);
+    for wrapped in [false, true] {
+        let mut config = Config::default();
+        config.admin_api_key = Some("fixture-search-secret".into());
+        let f = fixture_with_config(Mode::ExecutionSearch, config).await;
+        enable_execution_bridge(&f.state);
+        if wrapped {
+            f.state
+                .protocol_compatibility
+                .update_with_persistence(
+                    crate::model::config::ProtocolCompatibilityConfig {
+                        code_execution_mode: crate::model::config::CodeExecutionMode::Bridge,
+                        search_context_compat: true,
+                        enabled_key_ids: vec![0],
+                        ..Default::default()
+                    },
+                    |_| Ok(()),
+                )
+                .unwrap();
+        }
+        let mut request = execution_request(false);
+        request["tools"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"web_search_20250305","name":"web_search","max_uses":1}));
+        let response = compatibility_request(f.state.clone(), false, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let message: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+                .unwrap();
+        let wire = message.to_string();
+        assert!(wire.contains("search evidence was preserved"), "{wire}");
+        assert!(
+            wire.contains("bash_code_execution_tool_result_error"),
+            "{wire}"
+        );
+        assert_eq!(
+            message["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert_eq!(
+            f.bodies
+                .lock()
+                .iter()
+                .filter(|body| body["jsonrpc"] == "2.0")
+                .count(),
+            1
+        );
+        assert_eq!(f.calls.load(Ordering::Relaxed), 4);
+    }
 }
 
 #[tokio::test]

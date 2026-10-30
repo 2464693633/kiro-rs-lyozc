@@ -19,6 +19,8 @@ interface Draft {
   codeExecutionMode: ProtocolCompatibilityConfig['codeExecutionMode']
   searchIncrementalStreaming: boolean
   signatureMetadataCompat: boolean
+  structuredIdentityCompat: boolean
+  searchContextCompat: boolean
   scope: 'all' | 'selected'
   keyIds: string
 }
@@ -28,6 +30,8 @@ function toDraft(config: ProtocolCompatibilityConfig): Draft {
     codeExecutionMode: config.codeExecutionMode,
     searchIncrementalStreaming: config.searchIncrementalStreaming,
     signatureMetadataCompat: config.signatureMetadataCompat ?? false,
+    structuredIdentityCompat: config.structuredIdentityCompat ?? false,
+    searchContextCompat: config.searchContextCompat ?? false,
     scope: config.enabledKeyIds.length ? 'selected' : 'all',
     keyIds: config.enabledKeyIds.join(', '),
   }
@@ -81,9 +85,10 @@ export function ProtocolSection() {
   }
 
   const parsedIds = parseKeyIds(draft?.keyIds ?? '')
+  const scopedExperiment = draft?.signatureMetadataCompat || draft?.structuredIdentityCompat || draft?.searchContextCompat
   const scopeError = draft?.scope === 'selected'
     ? parsedIds.error || (!parsedIds.ids.length ? '请至少选择或输入一个 Key ID。' : '')
-    : draft?.signatureMetadataCompat ? '签名元数据实验需要选择指定 Key。' : ''
+    : scopedExperiment ? '协议实验需要选择指定 Key。' : ''
   const disabled = !actual || !draft || mutation.isPending
 
   const save = async () => {
@@ -95,6 +100,8 @@ export function ProtocolSection() {
         codeExecutionMode: draft.codeExecutionMode,
         searchIncrementalStreaming: draft.searchIncrementalStreaming,
         signatureMetadataCompat: draft.signatureMetadataCompat,
+        structuredIdentityCompat: draft.structuredIdentityCompat,
+        searchContextCompat: draft.searchContextCompat,
         enabledKeyIds: draft.scope === 'all' ? [] : parsedIds.ids,
       })
       queryClient.setQueryData<ProtocolCompatibilityResponse>(QUERY_KEY, returned)
@@ -194,6 +201,28 @@ export function ProtocolSection() {
             />
           </SettingRow>
           <SettingRow
+            label="结构化身份展示"
+            hint="针对身份枚举 Schema，将平台展示为 claude_code 并同步描述，输出仍须通过 Schema 校验。仅对指定 Key 生效。"
+          >
+            <Switch
+              checked={draft?.structuredIdentityCompat ?? false}
+              onCheckedChange={(value) => edit({ structuredIdentityCompat: value, ...(value ? { scope: 'selected' as const } : {}) })}
+              disabled={disabled}
+              aria-label="结构化身份展示"
+            />
+          </SettingRow>
+          <SettingRow
+            label="搜索上下文封装"
+            hint="为实际搜索结果生成可回传的上下文，支持后续追问；上下文有效期 24 小时并绑定当前 Key。旧版明文结果需要重新搜索。"
+          >
+            <Switch
+              checked={draft?.searchContextCompat ?? false}
+              onCheckedChange={(value) => edit({ searchContextCompat: value, ...(value ? { scope: 'selected' as const } : {}) })}
+              disabled={disabled}
+              aria-label="搜索上下文封装"
+            />
+          </SettingRow>
+          <SettingRow
             label="应用范围"
             hint="选择指定 Key 可先做小范围测试。范围外的请求保持默认策略；这里仅显示 Key 名称和 ID。"
           >
@@ -204,7 +233,7 @@ export function ProtocolSection() {
             >
               <SelectTrigger aria-label="协议兼容应用范围" className="w-full sm:w-64"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="all" disabled={draft?.signatureMetadataCompat}>全部客户端 Key</SelectItem>
+                <SelectItem value="all" disabled={scopedExperiment}>全部客户端 Key</SelectItem>
                 <SelectItem value="selected">仅指定 Key</SelectItem>
               </SelectContent>
             </Select>
@@ -268,6 +297,8 @@ export function ProtocolSection() {
             <div><dt className="text-muted-foreground">代码执行模式</dt><dd className="mt-1 font-medium">{modeLabel(actual.codeExecutionMode)}</dd></div>
             <div><dt className="text-muted-foreground">搜索增量流式输出</dt><dd className="mt-1 font-medium">{actual.searchIncrementalStreaming ? '开启' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">签名元数据实验</dt><dd className="mt-1 font-medium">{actual.signatureMetadataCompat && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭（原样透传）'}</dd></div>
+            <div><dt className="text-muted-foreground">结构化身份展示</dt><dd className="mt-1 font-medium">{actual.structuredIdentityCompat && actual.enabledKeyIds.length ? '开启（claude_code）' : '关闭'}</dd></div>
+            <div><dt className="text-muted-foreground">搜索上下文封装</dt><dd className="mt-1 font-medium">{actual.searchContextCompat && actual.enabledKeyIds.length ? '开启' : '关闭'}</dd></div>
             <div className="sm:col-span-2"><dt className="text-muted-foreground">应用范围</dt><dd className="mt-1 break-all font-medium">{scopeLabel(actual.enabledKeyIds, keys)}</dd></div>
             {updatedAt && !Number.isNaN(updatedAt.getTime()) && <div className="sm:col-span-2"><dt className="text-muted-foreground">服务器更新时间</dt><dd className="mt-1">{updatedAt.toLocaleString()}</dd></div>}
           </dl>

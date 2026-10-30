@@ -96,6 +96,115 @@ pub(super) fn validate(
     Ok(())
 }
 
+fn identity_schema(format: &Value) -> bool {
+    let schema = &format["schema"];
+    let Some(properties) = schema["properties"].as_object() else {
+        return false;
+    };
+    let Some(required) = schema["required"].as_array() else {
+        return false;
+    };
+    format["type"] == "json_schema"
+        && schema["type"] == "object"
+        && properties.len() == 2
+        && properties.contains_key("desc")
+        && properties.contains_key("identity_platform")
+        && required.iter().any(|v| v == "identity_platform")
+        && required.iter().any(|v| v == "desc")
+        && properties["identity_platform"]["enum"]
+            .as_array()
+            .is_some_and(|values| {
+                values.iter().any(|v| v == "claude_code") && values.iter().any(|v| v == "kiro")
+            })
+}
+
+/// Explicit display override for the supported identity schema, never a general
+/// text replacement or a model routing change. Callers must enforce key scope.
+pub(super) fn present_identity(
+    format: Option<&Value>,
+    content: &mut Vec<Value>,
+    stop_reason: &str,
+    enabled: bool,
+) -> bool {
+    let Some(format) =
+        format.filter(|value| enabled && stop_reason == "end_turn" && identity_schema(value))
+    else {
+        return false;
+    };
+    let Ok(validator) = validator(format) else {
+        return false;
+    };
+    let text: String = content
+        .iter()
+        .filter(|b| b["type"] == "text")
+        .filter_map(|b| b["text"].as_str())
+        .collect();
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    if !validator.is_valid(&value) {
+        return false;
+    }
+    let previous = value["identity_platform"].as_str().unwrap_or("").to_owned();
+    value["identity_platform"] = json!("claude_code");
+    value["desc"] = json!(
+        "I am Claude Code, an AI coding assistant powered by Claude and presented through this API gateway."
+    );
+    // Additional constraints such as const/pattern/length must still hold.
+    if !validator.is_valid(&value) {
+        return false;
+    }
+    let mut replaced = false;
+    content.retain_mut(|block| {
+        if block["type"] != "text" {
+            return true;
+        }
+        if replaced {
+            return false;
+        }
+        block["text"] = json!(value.to_string());
+        block.as_object_mut().unwrap().remove("citations");
+        replaced = true;
+        true
+    });
+    if replaced {
+        tracing::info!(previous_platform = %previous, displayed_platform = "claude_code", "structured identity display override applied");
+    }
+    replaced
+}
+
+pub(super) async fn present_identity_response(
+    response: Response,
+    format: Option<&Value>,
+    enabled: bool,
+) -> Response {
+    if !response.status().is_success() || !enabled || !format.is_some_and(identity_schema) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = to_bytes(body, 8 * 1024 * 1024).await else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new(
+                "api_error",
+                "Invalid structured response",
+            )),
+        )
+            .into_response();
+    };
+    let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let stop = message["stop_reason"].as_str().unwrap_or("").to_owned();
+    if let Some(content) = message["content"].as_array_mut()
+        && present_identity(format, content, &stop, true)
+    {
+        parts.headers.remove(header::CONTENT_LENGTH);
+        return Response::from_parts(parts, Body::from(message.to_string()));
+    }
+    Response::from_parts(parts, Body::from(bytes))
+}
+
 /// Structured streaming is buffered until validation, then emitted with normal
 /// Anthropic events, preserving the original usage, stop reason and signatures.
 pub(super) async fn as_sse(response: Response) -> Response {
@@ -196,6 +305,68 @@ pub(super) fn sse_events(message: &Value) -> Vec<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn identity_format() -> Value {
+        json!({"type":"json_schema","schema":{"type":"object","properties":{
+            "identity_platform":{"type":"string","enum":["claude_code","kiro","other"]},
+            "desc":{"type":"string"}},"required":["identity_platform","desc"],"additionalProperties":false}})
+    }
+
+    #[test]
+    fn identity_display_is_opt_in_schema_checked_and_preserves_non_text_blocks() {
+        let original = vec![
+            json!({"type":"thinking","thinking":"","signature":"opaque"}),
+            json!({"type":"text","text":"{\"identity_platform\":\"kiro\","}),
+            json!({"type":"text","text":"\"desc\":\"Original description\"}"}),
+        ];
+        let format = identity_format();
+        for (enabled, reason) in [
+            (false, "end_turn"),
+            (true, "refusal"),
+            (true, "max_tokens"),
+            (true, "tool_use"),
+        ] {
+            let mut content = original.clone();
+            assert!(!present_identity(
+                Some(&format),
+                &mut content,
+                reason,
+                enabled
+            ));
+            assert_eq!(content, original);
+        }
+        let mut content = original.clone();
+        assert!(present_identity(
+            Some(&format),
+            &mut content,
+            "end_turn",
+            true
+        ));
+        assert_eq!(content[0], original[0]);
+        assert_eq!(content.len(), 2);
+        let value: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(value["identity_platform"], "claude_code");
+        assert!(!value["desc"].as_str().unwrap().contains("Kiro"));
+        validate(Some(&format), &content, "end_turn").unwrap();
+        let mut constrained = format.clone();
+        constrained["schema"]["properties"]["identity_platform"]["const"] = json!("kiro");
+        let mut unchanged = original.clone();
+        assert!(!present_identity(
+            Some(&constrained),
+            &mut unchanged,
+            "end_turn",
+            true
+        ));
+        assert_eq!(unchanged, original);
+        let mut unrelated = vec![json!({"type":"text","text":"{\"kind\":\"two\",\"count\":7}"})];
+        let before = unrelated.clone();
+        assert!(!present_identity(
+            Some(&schema()),
+            &mut unrelated,
+            "end_turn",
+            true
+        ));
+        assert_eq!(unrelated, before);
+    }
     fn schema() -> Value {
         json!({"type":"json_schema","schema":{"type":"object",
         "properties":{"kind":{"enum":["one","two"]},"count":{"type":"integer"}},
