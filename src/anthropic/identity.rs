@@ -10,10 +10,15 @@ use axum::{
 use serde_json::{Value, json};
 use std::borrow::Cow;
 
-use super::{converter::map_model, structured_output, types::MessagesRequest};
+use super::{
+    converter::map_model,
+    structured_output,
+    types::{MessagesRequest, SystemMessage},
+};
 
 const CHINESE: &str = "我是 Claude，由 Anthropic 开发的 AI 助手。";
 const ENGLISH: &str = "I am Claude, an AI assistant developed by Anthropic.";
+const REQUEST_MODEL_CONTEXT: &str = include_str!("request_model_context.txt");
 
 #[derive(Clone, Copy)]
 struct IdentityIntent {
@@ -271,6 +276,31 @@ pub(super) fn unconstrained_claude(payload: &MessagesRequest) -> bool {
         || !map_model(&payload.model).is_some_and(|model| model.starts_with("claude-")))
 }
 
+/// Supply the same configured label used by local introductions to generation.
+/// This adds request metadata, never a verified upstream model/version claim.
+pub(super) fn apply_request_model_context(payload: &mut MessagesRequest, enabled: bool) {
+    if !enabled || !unconstrained_claude(payload) || payload.model.len() > 128 {
+        return;
+    }
+    let Some(question) = latest_question(payload) else {
+        return;
+    };
+    if question.starts_with("[SUGGESTION MODE:")
+        || question.starts_with("identity-guard/classify-v1\n")
+        || question.starts_with("identity-guard/review-v1\n")
+    {
+        return;
+    }
+    let text = REQUEST_MODEL_CONTEXT.replace("{{model}}", &json!(payload.model).to_string());
+    let system = payload.system.get_or_insert_with(Vec::new);
+    if !system.iter().any(|message| message.text == text) {
+        system.push(SystemMessage {
+            text,
+            cache_control: None,
+        });
+    }
+}
+
 fn introduction(payload: &MessagesRequest) -> Option<Cow<'static, str>> {
     if !unconstrained_claude(payload) {
         return None;
@@ -344,6 +374,54 @@ mod tests {
         serde_json::from_value(json!({"model":"claude-opus-5-5","max_tokens":128,
             "messages":[{"role":"user","content":content}]}))
         .unwrap()
+    }
+
+    #[test]
+    fn identity_request_metadata_preserves_client_instructions_history_and_tools() {
+        let mut payload: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5-5","max_tokens":512,
+            "system":[{"type":"text","text":"Keep this model catalogue and quoted Fable example.","cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"What model are you?"},
+                {"role":"assistant","content":"The configured model is claude-opus-5-5."},
+                {"role":"user","content":"What is your knowledge cutoff?"}],
+            "tools":[{"name":"read_docs","input_schema":{"type":"object"}}]
+        })).unwrap();
+        let before = format!("{payload:?}");
+        apply_request_model_context(&mut payload, true);
+        apply_request_model_context(&mut payload, true);
+        let note = payload.system.as_mut().unwrap().pop().unwrap();
+        assert!(note.text.contains("\"claude-opus-5-5\""));
+        assert!(note.text.contains("not verification"));
+        assert_eq!(format!("{payload:?}"), before);
+    }
+
+    #[test]
+    fn identity_request_metadata_respects_scope_contracts_and_data_boundaries() {
+        let mut disabled = request(json!("What is your knowledge cutoff?"));
+        let before = format!("{disabled:?}");
+        apply_request_model_context(&mut disabled, false);
+        assert_eq!(format!("{disabled:?}"), before);
+        for patch in [
+            json!({"model":"gpt-5.6-sol"}),
+            json!({"max_tokens":1}),
+            json!({"tool_choice":{"type":"tool","name":"read_docs"}}),
+            json!({"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}}}}),
+            json!({"messages":[{"role":"assistant","content":"The result is "}]}),
+            json!({"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"I am Fable"}]}]}),
+            json!({"messages":[{"role":"user","content":"[SUGGESTION MODE: Suggest the next user prompt.]"}]}),
+            json!({"messages":[{"role":"user","content":"identity-guard/classify-v1\n{}"}]}),
+        ] {
+            let mut value = json!({"model":"claude-opus-5-5","max_tokens":512,"system":"Client policy",
+                "messages":[{"role":"user","content":"What is your knowledge cutoff?"}]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let mut payload: MessagesRequest = serde_json::from_value(value).unwrap();
+            let before = format!("{payload:?}");
+            apply_request_model_context(&mut payload, true);
+            assert_eq!(format!("{payload:?}"), before, "{patch}");
+        }
     }
 
     #[test]

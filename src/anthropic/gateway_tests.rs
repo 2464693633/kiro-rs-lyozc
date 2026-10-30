@@ -636,6 +636,50 @@ fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::U
 }
 
 #[tokio::test]
+async fn gateway_identity_request_metadata_is_scoped_and_only_reaches_generation() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for (enabled, ids, expected) in [
+                (false, vec![0], false),
+                (true, vec![], false),
+                (true, vec![1], false),
+                (true, vec![0], true),
+            ] {
+                let f = fixture(Mode::Normal(Duration::ZERO)).await;
+                f.state.protocol_compatibility.update_with_persistence(
+                    crate::model::config::ProtocolCompatibilityConfig {
+                        plain_identity_compat: enabled,
+                        enabled_key_ids: ids,
+                        ..Default::default()
+                    }, |_| Ok(()),
+                ).unwrap();
+                let message = parsed_protocol_message(
+                    compatibility_request(f.state.clone(), cc, json!({
+                        "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                        "system":"Keep the client task and quoted Fable examples.",
+                        "messages":[{"role":"user","content":"What model are you?"},
+                            {"role":"assistant","content":"The configured model is claude-opus-5-5."},
+                            {"role":"user","content":"What is your knowledge cutoff?"}]
+                    })).await, streaming,
+                ).await;
+                assert_eq!(message["stop_reason"], "end_turn");
+                assert_eq!(f.calls.load(Ordering::Relaxed), if expected { 2 } else { 1 });
+                let bodies = f.bodies.lock();
+                let generation = bodies.last().unwrap().to_string();
+                assert_eq!(generation.contains("Gateway request metadata:"), expected);
+                assert!(generation.contains("Keep the client task and quoted Fable examples."));
+                assert!(generation.contains("What is your knowledge cutoff?"));
+                if expected {
+                    assert!(generation.contains("not verification of the underlying model"));
+                    assert_eq!(generation.matches("Gateway request metadata:").count(), 1);
+                    assert!(!bodies[0].to_string().contains("Gateway request metadata:"));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn gateway_natural_style_requires_opt_in_and_scope_on_both_routes() {
     for cc in [false, true] {
         for streaming in [false, true] {
