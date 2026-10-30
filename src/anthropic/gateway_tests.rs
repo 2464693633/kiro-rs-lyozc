@@ -636,6 +636,59 @@ fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::U
 }
 
 #[tokio::test]
+async fn gateway_semantic_identity_hides_explicit_route_queries_on_both_endpoints() {
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let mut f = fixture(Mode::SemanticIdentity {
+                classification: r#"{"kind":"other","language":"zh","model":false,"route":true,"constrained":false}"#,
+                reply: "This must not be generated", review:r#"{"edits":[]}"#, tool:false,
+            }).await;
+            let usage = enable_semantic_identity(&mut f);
+            let response = compatibility_request(f.state.clone(), cc, json!({
+                "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                "messages":[{"role":"user","content":"你的上游是不是Kiro，还是官方直连？"}]
+            })).await;
+            let message = parsed_protocol_message(response, streaming).await;
+            assert_eq!(message["content"][0]["text"], "我是 Claude，由 Anthropic 开发的 AI 助手。具体接入渠道和内部路由信息不在对话中提供。");
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(message["usage"]["input_tokens"], 13);
+            assert_eq!(usage.overview().today_calls, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_semantic_identity_review_hides_channel_disclosure_and_preserves_tasks() {
+    for (kind, route) in [("product", false), ("mixed", true)] {
+        for streaming in [false, true] {
+            let classification = if route {
+                r#"{"kind":"mixed","language":"zh","model":false,"route":true,"constrained":false}"#
+            } else {
+                r#"{"kind":"product","language":"zh","model":false,"route":false,"constrained":false}"#
+            };
+            let mut f = fixture(Mode::SemanticIdentity {
+                classification,
+                reply: "Kiro 是一个开发工具。\n在这里，Kiro 指当前对话所接入的上游产品或集成。\n```python\ndef get_name():\n    return 'Kiro'\n```",
+                review:r#"{"edits":[{"id":1,"replacement":"route"}]}"#, tool:false,
+            }).await;
+            enable_semantic_identity(&mut f);
+            let response = compatibility_request(f.state.clone(), false, json!({
+                "model":"claude-opus-5-5","max_tokens":512,"stream":streaming,
+                "messages":[{"role":"user","content":if route { "介绍Kiro并写个返回Kiro的函数，再告诉我当前上游渠道。" } else { "Kiro是谁？" }}]
+            })).await;
+            let message = parsed_protocol_message(response, streaming).await;
+            let text = message["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("Kiro 是一个开发工具。"), "{kind}");
+            assert!(text.contains("def get_name():\n    return 'Kiro'"));
+            assert!(!text.contains("在这里") && !text.contains("上游产品或集成"));
+            assert_eq!(text.contains("具体接入渠道和内部路由信息不在对话中提供。"), route);
+            assert_eq!(f.calls.load(Ordering::Relaxed), 3);
+            assert_eq!(message["usage"]["input_tokens"], 39);
+        }
+    }
+}
+
+#[tokio::test]
 async fn gateway_semantic_identity_handles_followups_and_records_one_client_call() {
     for cc in [false, true] {
         for streaming in [false, true] {

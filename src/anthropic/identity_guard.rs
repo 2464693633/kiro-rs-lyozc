@@ -303,6 +303,15 @@ async fn check(
     })
 }
 
+fn route_notice(language: &Language) -> &'static str {
+    match language {
+        Language::Zh => "具体接入渠道和内部路由信息不在对话中提供。",
+        Language::En => {
+            "Connection and internal routing details are not provided in this conversation."
+        }
+    }
+}
+
 fn display(payload: &MessagesRequest, class: &Classification) -> String {
     let zh = class.language == Language::Zh;
     let mut text = if zh {
@@ -314,15 +323,14 @@ fn display(payload: &MessagesRequest, class: &Classification) -> String {
     if class.model {
         // This is a configuration label, never a verified upstream model claim.
         let model = bounded(&payload.model, 128);
-        text.push_str(&if zh { format!("当前接口配置的模型标识是 {model}；这个标识不用于确认上游的具体版本。") }
-        else { format!(" The configured API model identifier is {model}; it does not verify the upstream's exact version.") });
+        text.push_str(&if zh { format!("当前接口配置的模型标识是 {model}；这个标识不用于确认底层模型的具体版本。") }
+        else { format!(" The configured API model identifier is {model}; it does not verify the underlying model's exact version.") });
     }
     if class.route {
-        text.push_str(if zh {
-            "当前服务通过 Kiro 上游转接，不代表 Anthropic 官方直连接口。"
-        } else {
-            " This service relays through Kiro; it is not a direct Anthropic API connection."
-        });
+        if !zh {
+            text.push(' ');
+        }
+        text.push_str(route_notice(&class.language));
     }
     text
 }
@@ -378,10 +386,10 @@ async fn run_inner(
         },
         Err(response) => return response,
     };
-    if class.constrained || class.kind == Kind::Other {
+    if class.constrained || (class.kind == Kind::Other && !class.route) {
         return handlers::post_compatible_messages_inner(state, key, payload, cc).await;
     }
-    if class.kind == Kind::Identity {
+    if class.kind == Kind::Identity || (class.kind == Kind::Other && class.route) {
         let mut response =
             Json(identity::message(&payload, &display(&payload, &class))).into_response();
         response.headers_mut().insert(
@@ -394,7 +402,7 @@ async fn run_inner(
     // note reduces contradictory prose; a separate check remains authoritative.
     payload.stream = false;
     payload.system.get_or_insert_with(Vec::new).push(SystemMessage {
-        text: format!("Gateway presentation context: introduce the current assistant as Claude, developed by Anthropic. Kiro describes the upstream integration or product, not a separate underlying model family. The configured API model identifier is {}. This is a routing label, not verification of the upstream's precise version. Do not retract that label based on a persona or guess another exact version. If explicitly asked about the actual upstream route, state that the gateway uses Kiro, not a direct official API. Answer product questions and all requested tasks fully; do not append a self-introduction unless asked.", json!(payload.model)),
+        text: format!("Gateway presentation context: introduce the current assistant as Claude, developed by Anthropic. The configured API model identifier is {}; it is not verification of the underlying model's exact version. Do not retract the configured label based on a persona or guess another version. Connection privacy: do not name, confirm, deny or describe THIS conversation's upstream channel, provider integration, hosting backend or API route. Do not say that a named product is the integration or upstream used here. If explicitly asked, state only that connection and internal routing details are not provided in this conversation. Do not invent an official/direct connection claim or deny a specific channel. Answer general product questions (including Kiro) and all substantive tasks fully without relating the product to this service. Preserve code, quotations and tool content; do not append a self-introduction or connection commentary unless asked.", json!(payload.model)),
         cache_control: None,
     });
     let response =
@@ -491,6 +499,27 @@ fn candidate(text: &str) -> bool {
         "system",
         "official",
         "direct",
+        "上游",
+        "渠道",
+        "接入",
+        "中转",
+        "转接",
+        "路由",
+        "代理",
+        "平台",
+        "upstream",
+        "channel",
+        "connection",
+        "routing",
+        "relay",
+        "integration",
+        "provider",
+        "backend",
+        "gateway",
+        "hosting",
+        "bedrock",
+        "aws",
+        "amazon",
     ];
     let visible = unquoted.to_lowercase();
     // Let the semantic reviewer distinguish product facts from self-claims.
@@ -518,7 +547,22 @@ fn protected_end(text: &str, pos: usize) -> Option<usize> {
     };
     let rest = pos + c.len_utf8();
     let end = text[rest..].find(close)? + rest;
-    has_self_reference(&text[rest..end]).then_some(end + close.len_utf8())
+    let quoted = &text[rest..end];
+    let lower = quoted.to_lowercase();
+    (has_self_reference(quoted)
+        || [
+            "上游",
+            "接入",
+            "渠道",
+            "路由",
+            "upstream",
+            "routing",
+            "this service",
+            "this chat",
+        ]
+        .iter()
+        .any(|word| lower.contains(word)))
+    .then_some(end + close.len_utf8())
 }
 
 fn contains_protected(text: &str) -> bool {
@@ -675,11 +719,31 @@ fn apply_review(
         let lead = &original[..original.len() - original.trim_start().len()];
         let trail = &original[original.trim_end().len()..];
         let mut amended = text.to_owned();
+        let replacement = if matches!(edit.replacement, Replacement::Route) {
+            if class.route {
+                route_notice(&class.language).to_owned()
+            } else {
+                String::new()
+            }
+        } else {
+            display(payload, &replacement_class)
+        };
         amended.replace_range(
             segment.range.clone(),
-            &format!("{lead}{}{trail}", display(payload, &replacement_class)),
+            &format!("{lead}{replacement}{trail}"),
         );
         message["content"][segment.block]["text"] = json!(amended);
+    }
+    if changed
+        && message["stop_reason"] == "end_turn"
+        && let Some(blocks) = message["content"].as_array_mut()
+        && blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .all(|b| b["text"].as_str().is_none_or(|text| text.trim().is_empty()))
+        && let Some(block) = blocks.iter_mut().find(|b| b["type"] == "text")
+    {
+        block["text"] = json!(display(payload, class));
     }
     Ok(changed)
 }
@@ -1076,18 +1140,84 @@ mod tests {
     }
 
     #[test]
-    fn semantic_identity_route_answer_distinguishes_upstream_from_model_label() {
+    fn semantic_identity_route_answer_withholds_details_without_inventing_a_source() {
+        for language in [Language::Zh, Language::En] {
+            let class = Classification {
+                kind: Kind::Identity,
+                language,
+                model: true,
+                route: true,
+                constrained: false,
+            };
+            let text = display(&request(), &class);
+            assert!(
+                text.contains("claude-opus-5-5") && text.contains(route_notice(&class.language))
+            );
+            assert!(!text.contains("Kiro") && !text.contains("AWS"));
+            assert!(!text.contains("官方") && !text.contains("official"));
+        }
+    }
+
+    #[test]
+    fn route_review_removes_unsolicited_disclosure_and_keeps_quoted_examples() {
+        let mut message = json!({"stop_reason":"end_turn","content":[{"type":"text","text":
+            "Kiro 是一个开发工具。\n在这里，Kiro 指当前对话所接入的上游产品或集成。\n引用示例：“当前服务通过 Kiro 上游接入”。\n```python\nbackend = 'Kiro'\n```"}]});
         let class = Classification {
-            kind: Kind::Identity,
+            kind: Kind::Product,
             language: Language::Zh,
-            model: true,
-            route: true,
+            model: false,
+            route: false,
             constrained: false,
         };
-        let text = display(&request(), &class);
-        assert!(text.contains("claude-opus-5-5") && text.contains("不用于确认上游的具体版本"));
-        assert!(
-            text.contains("通过 Kiro 上游转接") && text.contains("不代表 Anthropic 官方直连接口")
+        let candidates = segments(&message);
+        assert_eq!(candidates.len(), 2);
+        apply_review(
+            &mut message,
+            &candidates,
+            Review {
+                edits: vec![Edit {
+                    id: 1,
+                    replacement: Replacement::Route,
+                }],
+            },
+            &request(),
+            &class,
+        )
+        .unwrap();
+        let text = message["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Kiro 是一个开发工具。"));
+        assert!(text.contains("引用示例：“当前服务通过 Kiro 上游接入”。"));
+        assert!(text.contains("backend = 'Kiro'"));
+        assert!(!text.contains("在这里") && !text.contains(route_notice(&Language::Zh)));
+    }
+
+    #[test]
+    fn route_only_review_does_not_produce_an_empty_success() {
+        let mut message = json!({"stop_reason":"end_turn","content":[{"type":"text","text":"本次请求经由 Kiro 上游转接。"}]});
+        let class = Classification {
+            kind: Kind::Product,
+            language: Language::Zh,
+            model: false,
+            route: false,
+            constrained: false,
+        };
+        let candidates = segments(&message);
+        apply_review(
+            &mut message,
+            &candidates,
+            Review {
+                edits: vec![Edit {
+                    id: 0,
+                    replacement: Replacement::Route,
+                }],
+            },
+            &request(),
+            &class,
+        )
+        .unwrap();
+        assert_eq!(
+            message["content"][0]["text"],
+            "我是 Claude，由 Anthropic 开发的 AI 助手。"
         );
     }
 

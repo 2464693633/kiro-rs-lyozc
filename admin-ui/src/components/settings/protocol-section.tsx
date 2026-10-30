@@ -216,7 +216,7 @@ export function ProtocolSection() {
           </SettingRow>
           <SettingRow
             label="普通身份介绍"
-            hint="仅对指定 Key 的 Claude 模型生效。固定问句本地回复，其他短文本结合近期对话做语义判断，身份相关正文检查后发送。额外判断和校验会增加等待及上游用量，并计入总用量。型号展示为接口配置标识；代码、引用和工具内容受保护。"
+            hint="仅对指定 Key 的 Claude 模型生效。固定问句本地回复，其他短文本结合近期对话做语义判断，身份相关正文检查后发送。对话中隐藏当前接入渠道，直接追问时统一说明不提供路由信息，不声称官方直连。额外判断和校验会增加等待及用量。型号展示为接口配置标识；产品知识、代码、引用和工具内容受保护。"
           >
             <Switch
               checked={draft?.plainIdentityCompat ?? false}
@@ -312,7 +312,7 @@ export function ProtocolSection() {
             <div><dt className="text-muted-foreground">搜索增量流式输出</dt><dd className="mt-1 font-medium">{actual.searchIncrementalStreaming ? '开启' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">签名元数据实验</dt><dd className="mt-1 font-medium">{actual.signatureMetadataCompat && actual.enabledKeyIds.length ? '开启（仅指定 Key）' : '关闭（原样透传）'}</dd></div>
             <div><dt className="text-muted-foreground">结构化身份展示</dt><dd className="mt-1 font-medium">{actual.structuredIdentityCompat && actual.enabledKeyIds.length ? '开启（claude_code）' : '关闭'}</dd></div>
-            <div><dt className="text-muted-foreground">普通身份介绍</dt><dd className="mt-1 font-medium">{actual.plainIdentityCompat && actual.enabledKeyIds.length ? '开启（Claude / Anthropic，本地回复）' : '关闭'}</dd></div>
+            <div><dt className="text-muted-foreground">普通身份介绍</dt><dd className="mt-1 font-medium">{actual.plainIdentityCompat && actual.enabledKeyIds.length ? '开启（Claude / Anthropic，隐藏接入渠道）' : '关闭'}</dd></div>
             <div><dt className="text-muted-foreground">搜索上下文封装</dt><dd className="mt-1 font-medium">{actual.searchContextCompat && actual.enabledKeyIds.length ? '开启' : '关闭'}</dd></div>
             <div className="sm:col-span-2"><dt className="text-muted-foreground">应用范围</dt><dd className="mt-1 break-all font-medium">{scopeLabel(actual.enabledKeyIds, keys)}</dd></div>
             {updatedAt && !Number.isNaN(updatedAt.getTime()) && <div className="sm:col-span-2"><dt className="text-muted-foreground">服务器更新时间</dt><dd className="mt-1">{updatedAt.toLocaleString()}</dd></div>}
