@@ -32,7 +32,7 @@ use super::{
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        UpdateRefreshTokenRequest,
+        UpdateProxyRequest, UpdateRefreshTokenRequest,
         SetCustomModelsRequest,
         SetProtocolCompatibilityRequest,
     },
@@ -445,14 +445,55 @@ pub async fn get_proxy_pool(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
+/// 后台探测新建或改过地址的代理（出口 IP、延迟），不阻塞保存；限制并发避免批量导入时连接激增。
+fn spawn_proxy_checks(state: &AdminState, ids: Vec<u64>) {
+    if ids.is_empty() {
+        return;
+    }
+    let service = Arc::clone(&state.service);
+    tokio::spawn(async move {
+        futures::stream::iter(ids)
+            .for_each_concurrent(8, |id| {
+                let service = Arc::clone(&service);
+                async move {
+                    if let Err(e) = service.check_proxy(id).await {
+                        tracing::debug!("后台探测代理 #{} 失败: {}", id, e);
+                    }
+                }
+            })
+            .await;
+    });
+}
+
 /// POST /api/admin/proxy-pool
 /// 添加代理到池中
 pub async fn add_proxy(
     State(state): State<AdminState>,
     Json(payload): Json<AddProxyRequest>,
 ) -> impl IntoResponse {
-    match state.service.add_proxy(payload.url, payload.label) {
-        Ok(entry) => Json(entry).into_response(),
+    match state.service.add_proxy(payload) {
+        Ok(entry) => {
+            spawn_proxy_checks(&state, vec![entry.id]);
+            Json(entry).into_response()
+        }
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PUT /api/admin/proxy-pool/:id
+/// 编辑代理；地址或认证变化时同步到所有关联账号并重新探测
+pub async fn update_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<UpdateProxyRequest>,
+) -> impl IntoResponse {
+    match state.service.update_proxy(id, payload) {
+        Ok((entry, endpoint_changed)) => {
+            if endpoint_changed {
+                spawn_proxy_checks(&state, vec![id]);
+            }
+            Json(entry).into_response()
+        }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -464,12 +505,41 @@ pub async fn batch_add_proxies(
     Json(payload): Json<BatchAddProxyRequest>,
 ) -> impl IntoResponse {
     let (added, errors) = state.service.batch_add_proxies(payload);
+    spawn_proxy_checks(&state, added.iter().map(|e| e.id).collect());
     Json(serde_json::json!({
         "added": added.len(),
         "errors": errors.len(),
         "proxies": added,
         "errorMessages": errors
     }))
+}
+
+/// GET /api/admin/proxy-pool/:id/credentials
+/// 列出关联该代理的账号
+pub async fn list_proxy_credentials(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.list_proxy_credentials(id) {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/:id/set-global
+/// 把该代理设为全局代理
+pub async fn set_proxy_as_global(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.set_proxy_as_global(id) {
+        Ok(()) => Json(SuccessResponse::new(format!(
+            "已将代理 #{} 设为全局代理",
+            id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
 }
 
 /// DELETE /api/admin/proxy-pool/:id

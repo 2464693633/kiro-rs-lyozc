@@ -380,9 +380,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           account.idp?.trim() ||
           (isExternalIdp ? 'AzureAD' : undefined)
 
-        // KAM 账号无 proxyUrl 字段，无代理时从池中随机分配一个
-        const proxyUrl = enabledProxies.length > 0
-          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].url
+        // KAM 账号没有代理字段：IP 管理中有可用代理时随机关联一个
+        const proxyId = enabledProxies.length > 0
+          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].id
           : undefined
 
         toImport.push({
@@ -404,7 +404,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             scopes: cred.scopes?.trim() || undefined,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
-            proxyUrl,
+            proxyId,
           },
         })
       }

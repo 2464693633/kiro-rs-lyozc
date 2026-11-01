@@ -27,6 +27,15 @@ pub enum AdminServiceError {
 
     /// 凭据无效（验证失败）
     InvalidCredential(String),
+
+    /// 代理池中不存在该代理
+    ProxyNotFound { id: u64 },
+
+    /// 请求参数无效
+    BadRequest(String),
+
+    /// 与现有数据冲突（如重复的代理、删除仍被使用的代理）
+    Conflict(String),
 }
 
 impl fmt::Display for AdminServiceError {
@@ -39,6 +48,10 @@ impl fmt::Display for AdminServiceError {
             AdminServiceError::RateLimited { .. } => write!(f, "上游请求过于频繁，请稍后重试"),
             AdminServiceError::InternalError(msg) => write!(f, "内部错误: {}", msg),
             AdminServiceError::InvalidCredential(msg) => write!(f, "凭据无效: {}", msg),
+            AdminServiceError::ProxyNotFound { id } => write!(f, "代理不存在: {}", id),
+            AdminServiceError::BadRequest(msg) | AdminServiceError::Conflict(msg) => {
+                write!(f, "{}", msg)
+            }
         }
     }
 }
@@ -54,6 +67,9 @@ impl AdminServiceError {
             AdminServiceError::RateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             AdminServiceError::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             AdminServiceError::InvalidCredential(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::ProxyNotFound { .. } => StatusCode::NOT_FOUND,
+            AdminServiceError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AdminServiceError::Conflict(_) => StatusCode::CONFLICT,
         }
     }
 
@@ -68,9 +84,13 @@ impl AdminServiceError {
             AdminServiceError::InternalError(_) => {
                 AdminErrorResponse::internal_error(self.to_string())
             }
-            AdminServiceError::InvalidCredential(_) => {
+            AdminServiceError::InvalidCredential(_) | AdminServiceError::BadRequest(_) => {
                 AdminErrorResponse::invalid_request(self.to_string())
             }
+            AdminServiceError::ProxyNotFound { .. } => {
+                AdminErrorResponse::not_found(self.to_string())
+            }
+            AdminServiceError::Conflict(_) => AdminErrorResponse::conflict(self.to_string()),
         }
     }
 

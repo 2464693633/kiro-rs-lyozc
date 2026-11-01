@@ -513,6 +513,11 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_password: Option<String>,
 
+    /// 关联的代理池条目 ID（IP 管理）。设置时 `proxy_url` 等字段是代理池配置的副本，
+    /// 由 Admin 层在编辑代理时同步；未设置表示全局代理、直连或未入池的自定义代理。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+
     /// 凭据是否被禁用（默认为 false）
     #[serde(default)]
     pub disabled: bool,
@@ -623,6 +628,7 @@ impl std::fmt::Debug for KiroCredentials {
             .field("proxy_url", &self.proxy_url)
             .field("proxy_username", &self.proxy_username)
             .field("proxy_password", &fmt_redacted(&self.proxy_password))
+            .field("proxy_id", &self.proxy_id)
             .field("disabled", &self.disabled)
             .field("disabled_reason", &self.disabled_reason)
             .field(
@@ -1230,6 +1236,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1507,6 +1514,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1552,6 +1560,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1680,6 +1689,7 @@ mod tests {
             proxy_url: None,
             proxy_username: None,
             proxy_password: None,
+            proxy_id: None,
             disabled: false,
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,

@@ -1,6 +1,6 @@
 //! Admin API 类型定义
 
-use crate::admin::proxy_pool::ProxyHealth;
+use crate::admin::proxy_pool::{ProxyExitInfo, ProxyHealth};
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +71,12 @@ pub struct CredentialStatusItem {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 关联的代理池条目 ID（IP 管理）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
+    /// 关联代理的名称
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_name: Option<String>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -211,6 +217,10 @@ pub struct AddCredentialRequest {
     /// 凭据级代理认证密码（可选）
     pub proxy_password: Option<String>,
 
+    /// 关联 IP 管理中的代理（可选，优先于 proxy_url）
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
+
     /// Kiro API Key（API Key 凭据必填，格式: ksk_xxxxxxxx）
     /// 设置后直接作为 Bearer Token 使用，无需 refreshToken
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -261,6 +271,9 @@ pub struct UpdateCredentialRequest {
     pub proxy_username: Option<String>,
     /// 凭据级代理认证密码
     pub proxy_password: Option<String>,
+    /// 关联 IP 管理中的代理（优先于 proxy_url；省略且 proxy_* 均省略表示不修改代理）
+    #[serde(default)]
+    pub proxy_id: Option<u64>,
     /// 账号所属分组（None 表示不修改，Some 表示整体替换）
     #[serde(default)]
     pub groups: Option<Vec<String>>,
@@ -775,21 +788,33 @@ pub struct CredentialMetadataSchemaConfig {
 
 // ============ 代理池 ============
 
-/// 代理池条目
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 代理池条目（不返回密码）
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyPoolEntry {
     /// 唯一 ID（自增）
     pub id: u64,
-    /// 代理 URL（如 socks5://user:pass@host:port）
+    /// 名称
+    pub name: String,
+    /// 不含认证信息的展示地址，如 socks5://1.2.3.4:1080
     pub url: String,
-    /// 备注标签（可选）
+    pub protocol: String,
+    pub host: String,
+    pub port: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    pub username: Option<String>,
+    /// 是否设置了密码；不回显密码本身
+    pub has_password: bool,
     /// 是否启用
     pub enabled: bool,
-    /// 使用此代理的凭据数量
+    /// 关联此代理的凭据数量
     pub credential_count: u32,
+    /// 最近一次探测到的出口信息
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ProxyExitInfo>,
+    /// 最近一次探测失败的原因
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     /// 健康状态
     pub health: ProxyHealth,
     /// 最近一次成功探测的延迟（毫秒）
@@ -812,18 +837,14 @@ pub struct ProxyPoolResponse {
     pub proxies: Vec<ProxyPoolEntry>,
 }
 
-/// 单个代理健康检查响应
+/// 关联某个代理的凭据
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProxyCheckResponse {
+pub struct ProxyCredentialItem {
     pub id: u64,
-    pub health: ProxyHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency_ms: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_checked_at: Option<String>,
-    pub enabled: bool,
-    pub auto_disabled: bool,
+    pub email: Option<String>,
+    pub disabled: bool,
 }
 
 /// 全量健康检查响应
@@ -854,13 +875,44 @@ pub struct AssignRoundRobinResponse {
     pub proxy_count: usize,
 }
 
-/// 添加代理请求
-#[derive(Debug, Deserialize)]
+/// 添加代理请求：填结构化字段，或只给完整地址 `url`（兼容旧接口，`label` 作为名称）
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddProxyRequest {
-    pub url: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+/// 编辑代理请求：省略的字段不修改；用户名或密码传空串表示清除
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateProxyRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 /// 批量导入代理请求
@@ -1352,6 +1404,10 @@ impl AdminErrorResponse {
 
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new("not_found", message)
+    }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new("conflict", message)
     }
 
     pub fn api_error(message: impl Into<String>) -> Self {

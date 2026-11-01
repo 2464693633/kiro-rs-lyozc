@@ -37,6 +37,11 @@ const GroupsPage = lazy(() =>
     default: m.GroupsPage,
   })),
 );
+const ProxiesPage = lazy(() =>
+  import("@/components/proxies-page").then((m) => ({
+    default: m.ProxiesPage,
+  })),
+);
 const SettingsPage = lazy(() =>
   import("@/components/settings-page").then((m) => ({
     default: m.SettingsPage,
@@ -50,6 +55,7 @@ function readTabFromHash(): Tab {
   const h = tabFromHash();
   if (
     h === "credentials" ||
+    h === "proxies" ||
     h === "keys" ||
     h === "groups" ||
     h === "overview" ||
@@ -202,6 +208,7 @@ function AppMain({ onLogout, tab }: { onLogout: () => void; tab: Tab }) {
     >
       {tab === "overview" && <OverviewPage />}
       {tab === "credentials" && <Dashboard onLogout={onLogout} embedded />}
+      {tab === "proxies" && <ProxiesPage />}
       {tab === "keys" && <ClientKeysPage />}
       {tab === "groups" && <GroupsPage />}
       {tab === "traces" && <TraceLogPage />}

@@ -416,19 +416,19 @@ function CredentialCardImpl({
   const clearThrottle = useClearThrottle();
   const queryClient = useQueryClient();
 
-  // 代理池健康数据，用于标记凭据专属代理是否异常（仅在凭据配置了代理时按需查询）
+  // IP 管理中的代理健康数据，用于标记关联的代理是否异常（仅在账号关联了代理时按需查询）
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],
     queryFn: getProxyPool,
     staleTime: 30_000,
-    enabled: Boolean(credential.hasProxy && credential.proxyUrl),
+    enabled: credential.proxyId != null,
   });
 
-  /** 凭据专属代理在代理池中的健康信息（仅当 proxyUrl 匹配到池内条目时有效） */
-  const proxyEntry: ProxyPoolEntry | undefined = (() => {
-    if (!credential.proxyUrl || !proxyPool?.proxies) return undefined;
-    return proxyPool.proxies.find((p) => p.url === credential.proxyUrl);
-  })();
+  /** 关联的代理在 IP 管理中的条目 */
+  const proxyEntry: ProxyPoolEntry | undefined =
+    credential.proxyId != null
+      ? proxyPool?.proxies.find((p) => p.id === credential.proxyId)
+      : undefined;
 
   const proxyUnhealthy = proxyEntry && (proxyEntry.health === 'unhealthy' || proxyEntry.autoDisabled);
 
@@ -1426,12 +1426,12 @@ function CredentialCardImpl({
                     </LedgerRow>
                   )}
                   {credential.hasProxy && (
-                    <LedgerRow label="代理地址" icon={Globe} danger={proxyUnhealthy}>
+                    <LedgerRow label="代理" icon={Globe} danger={proxyUnhealthy}>
                       <span
-                        className="font-mono text-xs"
+                        className={cn("text-xs", !credential.proxyName && "font-mono")}
                         title={maskProxyUrl(credential.proxyUrl ?? "")}
                       >
-                        {proxyDisplayLabel(credential.proxyUrl ?? "")}
+                        {credential.proxyName ?? proxyDisplayLabel(credential.proxyUrl ?? "")}
                       </span>
                       {proxyEntry && proxyUnhealthy && (
                         <span className="ml-1.5 text-[11px] font-medium text-destructive">

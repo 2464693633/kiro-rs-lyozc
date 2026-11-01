@@ -26,6 +26,7 @@ import {
   CredentialMetadataEditor,
   metadataDefaults,
 } from '@/components/credential-metadata-field'
+import { ProxySelector, proxyRequestFields, type ProxyChoice } from '@/components/proxy-selector'
 import type { CredentialMetadata, CredentialMetadataSchema } from '@/types/api'
 
 interface AddCredentialDialogProps {
@@ -48,9 +49,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
   const [issuerUrl, setIssuerUrl] = useState('')
   const [scopes, setScopes] = useState('')
   const [machineId, setMachineId] = useState('')
-  const [proxyUrl, setProxyUrl] = useState('')
-  const [proxyUsername, setProxyUsername] = useState('')
-  const [proxyPassword, setProxyPassword] = useState('')
+  const [proxyChoice, setProxyChoice] = useState<ProxyChoice>({ kind: 'global' })
   const [endpoint, setEndpoint] = useState('')
   const [groups, setGroups] = useState<string[]>([])
   const [sourceChannel, setSourceChannel] = useState('')
@@ -81,9 +80,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
     setIssuerUrl('')
     setScopes('')
     setMachineId('')
-    setProxyUrl('')
-    setProxyUsername('')
-    setProxyPassword('')
+    setProxyChoice({ kind: 'global' })
     setEndpoint('')
     setGroups([])
     setSourceChannel('')
@@ -133,9 +130,7 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
         issuerUrl: isExternalIdp ? issuerUrl.trim() || undefined : undefined,
         scopes: isExternalIdp ? scopes.trim() || undefined : undefined,
         machineId: machineId.trim() || undefined,
-        proxyUrl: proxyUrl.trim() || undefined,
-        proxyUsername: proxyUsername.trim() || undefined,
-        proxyPassword: proxyPassword.trim() || undefined,
+        ...proxyRequestFields(proxyChoice),
         endpoint: endpoint.trim() || undefined,
         groups: groups,
         sourceChannel: sourceChannel.trim() || undefined,
@@ -470,44 +465,12 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
               disabled={isPending}
             />
 
-            {/* 代理配置 */}
+            {/* 代理 */}
             <div className="space-y-2">
-              <label className="text-sm font-medium">代理配置</label>
-              <Input
-                id="proxyUrl"
-                placeholder='代理 URL（留空使用全局配置，"direct" 不使用代理）'
-                value={proxyUrl}
-                onChange={(e) => setProxyUrl(e.target.value)}
-                disabled={isPending}
-                autoComplete="off"
-                data-lpignore="true"
-                data-1p-ignore="true"
-              />
-              <div className="grid grid-cols-2 gap-2">
-                <Input
-                  id="proxyUsername"
-                  placeholder="代理用户名"
-                  value={proxyUsername}
-                  onChange={(e) => setProxyUsername(e.target.value)}
-                  disabled={isPending}
-                  autoComplete="off"
-                  data-lpignore="true"
-                  data-1p-ignore="true"
-                />
-                <Input
-                  id="proxyPassword"
-                  type="password"
-                  placeholder="代理密码"
-                  value={proxyPassword}
-                  onChange={(e) => setProxyPassword(e.target.value)}
-                  disabled={isPending}
-                  autoComplete="new-password"
-                  data-lpignore="true"
-                  data-1p-ignore="true"
-                />
-              </div>
+              <label className="text-sm font-medium">代理</label>
+              <ProxySelector value={proxyChoice} onChange={setProxyChoice} disabled={isPending} />
               <p className="text-xs text-muted-foreground">
-                留空使用全局代理。输入 "direct" 可显式不使用代理
+                从 IP 管理中选择，或使用全局代理、直连。新代理请先到 IP 管理添加。
               </p>
             </div>
           </div>

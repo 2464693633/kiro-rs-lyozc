@@ -16,6 +16,8 @@ import type {
   ProxyPoolEntry,
   ProxyPoolResponse,
   AddProxyRequest,
+  UpdateProxyRequest,
+  ProxyCredentialItem,
   BatchAddProxyRequest,
   BatchAddProxyResponse,
   AssignProxyRequest,
@@ -393,9 +395,27 @@ export async function batchAddProxies(req: BatchAddProxyRequest): Promise<BatchA
   return data
 }
 
-// 删除代理
+// 编辑代理（地址或认证变化时同步到关联账号）
+export async function updateProxy(id: number, req: UpdateProxyRequest): Promise<ProxyPoolEntry> {
+  const { data } = await api.put<ProxyPoolEntry>(`/proxy-pool/${id}`, req)
+  return data
+}
+
+// 删除代理（仍有账号关联时返回 409）
 export async function deleteProxy(id: number): Promise<SuccessResponse> {
   const { data } = await api.delete<SuccessResponse>(`/proxy-pool/${id}`)
+  return data
+}
+
+// 关联某个代理的账号
+export async function getProxyCredentials(id: number): Promise<ProxyCredentialItem[]> {
+  const { data } = await api.get<ProxyCredentialItem[]>(`/proxy-pool/${id}/credentials`)
+  return data
+}
+
+// 把代理设为全局代理
+export async function setProxyAsGlobal(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/proxy-pool/${id}/set-global`)
   return data
 }
 

@@ -175,11 +175,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           saleStatus: saleStatus as CredentialSaleStatus,
         }
 
-        // 若凭据未指定代理且代理池有可用代理，随机分配一个
-        if (!cred.proxyUrl?.trim() && enabledProxies.length > 0) {
-          const picked = enabledProxies[Math.floor(Math.random() * enabledProxies.length)]
-          cred.proxyUrl = picked.url
-        }
+        // 若凭据未指定代理且 IP 管理中有可用代理，随机关联一个
+        const proxyId = !cred.proxyUrl?.trim() && enabledProxies.length > 0
+          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].id
+          : undefined
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -212,6 +211,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
+              proxyId,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,
@@ -268,6 +268,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
+              proxyId,
               proxyUrl: cred.proxyUrl?.trim() || undefined,
               proxyUsername: cred.proxyUsername?.trim() || undefined,
               proxyPassword: cred.proxyPassword?.trim() || undefined,

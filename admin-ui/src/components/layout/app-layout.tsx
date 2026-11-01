@@ -16,6 +16,7 @@ import {
   Tags,
   Cpu,
   Globe,
+  Network,
   PackageOpen,
   ShieldCheck,
   Wrench,
@@ -34,6 +35,7 @@ import type { ThemeId, ThemeMode, ThemeSelection } from "@/lib/theme";
 export type TabKey =
   | "overview"
   | "credentials"
+  | "proxies"
   | "keys"
   | "groups"
   | "traces"
@@ -65,6 +67,12 @@ export const TABS: readonly TabItem[] = [
     label: "凭据管理",
     description: "上游提供商凭据集群、配额健康与负载均衡",
     icon: Server,
+  },
+  {
+    key: "proxies",
+    label: "IP 管理",
+    description: "保存代理 IP，添加账号时直接选择；检测出口位置与延迟",
+    icon: Network,
   },
   {
     key: "keys",

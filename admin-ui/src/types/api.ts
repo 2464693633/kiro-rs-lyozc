@@ -89,6 +89,10 @@ export interface CredentialStatusItem {
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string
+  /** 关联的 IP 管理代理 ID；未设置表示全局代理、直连或未入池的自定义代理 */
+  proxyId?: number
+  /** 关联代理的名称 */
+  proxyName?: string
   refreshFailureCount: number
   disabledReason?: string
   /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
@@ -219,6 +223,8 @@ export interface AddCredentialRequest {
   authRegion?: string
   apiRegion?: string
   machineId?: string
+  /** 关联 IP 管理中的代理（优先于 proxyUrl） */
+  proxyId?: number
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -241,6 +247,9 @@ export interface AddCredentialResponse {
 // 更新凭据请求（字段为 undefined 表示不修改，空字符串表示清除）
 export interface UpdateCredentialRequest {
   email?: string
+  /** 关联 IP 管理中的代理；与 proxyUrl 都省略表示不修改代理 */
+  proxyId?: number
+  /** 空串表示改用全局代理，"direct" 表示直连 */
   proxyUrl?: string
   proxyUsername?: string
   proxyPassword?: string
@@ -262,13 +271,33 @@ export interface UpdateRefreshTokenRequest {
 // 代理健康状态
 export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
 
-// 代理池条目
+export type ProxyProtocol = 'http' | 'https' | 'socks4' | 'socks4a' | 'socks5' | 'socks5h'
+
+// 最近一次探测到的出口信息
+export interface ProxyExitInfo {
+  ip: string
+  country?: string
+  countryCode?: string
+  region?: string
+  city?: string
+}
+
+// 代理池条目（不含密码）
 export interface ProxyPoolEntry {
   id: number
+  name: string
+  /** 不含认证信息的地址，如 socks5://1.2.3.4:1080 */
   url: string
-  label?: string
+  protocol: ProxyProtocol
+  host: string
+  port: number
+  username?: string
+  hasPassword: boolean
   enabled: boolean
+  /** 关联此代理的账号数 */
   credentialCount: number
+  exit?: ProxyExitInfo
+  lastError?: string
   health: ProxyHealth
   latencyMs?: number
   lastCheckedAt?: string
@@ -282,10 +311,32 @@ export interface ProxyPoolResponse {
   proxies: ProxyPoolEntry[]
 }
 
-// 添加代理请求
+// 添加代理请求：填结构化字段，或只给完整地址 url
 export interface AddProxyRequest {
-  url: string
-  label?: string
+  name?: string
+  protocol?: ProxyProtocol
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+  url?: string
+}
+
+// 编辑代理请求：省略的字段不修改；用户名或密码传空串表示清除
+export interface UpdateProxyRequest {
+  name?: string
+  protocol?: ProxyProtocol
+  host?: string
+  port?: number
+  username?: string
+  password?: string
+}
+
+// 关联某个代理的账号
+export interface ProxyCredentialItem {
+  id: number
+  email?: string
+  disabled: boolean
 }
 
 // 批量添加代理请求
@@ -306,15 +357,8 @@ export interface BatchAddProxyResponse {
   errorMessages: string[]
 }
 
-// 单个代理健康检查响应
-export interface ProxyCheckResponse {
-  id: number
-  health: ProxyHealth
-  latencyMs?: number
-  lastCheckedAt?: string
-  enabled: boolean
-  autoDisabled: boolean
-}
+// 单个代理健康检查响应：探测后的完整条目
+export type ProxyCheckResponse = ProxyPoolEntry
 
 // 全量健康检查响应
 export interface ProxyCheckAllResponse {

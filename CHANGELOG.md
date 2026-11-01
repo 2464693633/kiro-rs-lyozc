@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 🌐 IP 管理
+
+- 新增侧边栏「IP 管理」页，取代原「代理池」弹窗：代理按协议、主机、端口、用户名、密码分字段保存，支持 HTTP / HTTPS / SOCKS5 / SOCKS5H / SOCKS4 / SOCKS4A；可单个添加，也可批量粘贴地址（每行一个，提交前逐行预检格式与重复）。
+- 连通性检测会记录出口 IP、国家 / 城市与延迟；新增或改了地址的代理在后台自动检测。原有的 5 分钟定时检查与连续 3 次失败自动禁用保持不变，自动禁用的代理重新检测通过后需手动启用。
+- 添加和编辑账号时直接从下拉框选择 IP 管理中的代理（也可选全局代理或直连），下拉框内可搜索、查看健康状态并逐个测试；账号记录 `proxyId` 与代理配置副本，编辑代理会同步到所有关联账号。仍有账号在用的代理不能删除，列表可查看每个代理关联的账号。
+- 启动时自动对齐：账号里手填的自定义代理收进 IP 管理并关联（账号原有代理字段不变），关联代理配置不一致的账号以 IP 管理为准同步。通过 API 添加或编辑账号时提交的自定义 `proxyUrl` 同样会自动收进 IP 管理。
+- 旧格式的 `proxy_pool.json` 首次加载时自动转换，并先备份为 `proxy_pool.json.bak-时间戳`；新文件仍保留 `url` / `label` 字段，回退旧版本可继续读取。
+- Admin API：新增 `PUT /api/admin/proxy-pool/{id}`（编辑）、`GET /api/admin/proxy-pool/{id}/credentials`（关联账号）、`POST /api/admin/proxy-pool/{id}/set-global`（设为全局代理）；`POST /api/admin/credentials` 与 `PUT /api/admin/credentials/{id}` 接受可选的 `proxyId`；`POST /api/admin/proxy-pool/{id}/check` 返回检测后的完整条目。
+- 兼容性变化：代理列表的 `url` 不再包含认证信息（认证改由 `username` / `hasPassword` 表示，密码不回显），`label` 改名为 `name`；`POST /api/admin/proxy-pool` 仍接受旧的 `{url, label}` 请求。
+
 ### 📊 Key 级缓存计量开关
 
 - 客户端 Key 新增「模拟缓存计量」开关。关闭后该 Key 的请求不读写本地 CacheMeter，输入 Token 全部计入 `input_tokens`，`cache_creation_input_tokens` 与 `cache_read_input_tokens` 为 0；上游下发的真实用量仍原样上报。

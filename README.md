@@ -61,7 +61,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
 - 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
-- 代理能力：全局代理、凭据级代理、代理池、健康检查、轮询分配。
+- 代理能力：全局代理、凭据级代理、IP 管理（保存代理后在账号中直接选择）、出口位置与健康检查、轮询分配。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
 - **多平台发布**：GitHub Release 构建 Windows、Linux、macOS 和 Docker Hub 多架构镜像。
 
@@ -323,7 +323,7 @@ codex
 | `/api/admin/client-keys` | 客户端 Key 管理 |
 | `/api/admin/stats/*` | 用量统计 |
 | `/api/admin/traces` | 请求链路追踪查询 |
-| `/api/admin/proxy-pool` | 代理池 |
+| `/api/admin/proxy-pool` | IP 管理：代理增删改、连通性检测、关联账号、设为全局代理、轮询分配 |
 | `/api/admin/config/*` | 运行时配置（含 `GET/PUT /api/admin/config/api-domain` 上游域名） |
 | `/api/admin/auth/*` | Social / IdC 登录流程 |
 | `/api/admin/system/update/*` | 在线更新、回退、版本检查 |
@@ -366,7 +366,7 @@ Admin API 鉴权同样支持：
 | `defaultEndpoint` | `ide` | 凭据未指定 endpoint 时使用的端点 |
 | `apiDomain` | `amazonaws` | 对话 / MCP 上游域名：`amazonaws` → `q.{region}.amazonaws.com`，`kiro` → `runtime.{region}.kiro.dev`。见[上游域名](#api-domain) |
 | `tlsBackend` | `rustls` | `rustls` 或 `native-tls` |
-| `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://` |
+| `proxyUrl` | 无 | 全局代理，支持 `http://`、`https://`、`socks5://`、`socks5h://`、`socks4://`、`socks4a://` |
 | `proxyUsername` / `proxyPassword` | 无 | 全局代理认证 |
 | `loadBalancingMode` | `priority` | `priority` 或 `balanced` |
 | `accountThrottleFailover` | `true` | 账号级 429 是否冷却并切换凭据；覆盖 USER/CREDIT 请求限流和 suspicious activity |
@@ -520,6 +520,7 @@ KIRO_API_KEY=ksk_xxx ./kiro-rs
 | `email` / `subscriptionTitle` | Admin 查询后回填的展示信息 |
 | `proxyUrl` | 凭据级代理；填 `direct` 表示绕过全局代理 |
 | `proxyUsername` / `proxyPassword` | 凭据级代理认证 |
+| `proxyId` | 关联的 IP 管理代理，由 Admin 写入；此时 `proxyUrl` 是该代理的配置副本（含认证），编辑代理时自动同步 |
 | `disabled` | 是否禁用 |
 | `kiroApiKey` | `ksk_*` Kiro API Key |
 | `endpoint` | `ide` 或 `cli`，未填使用 `config.defaultEndpoint` |
@@ -710,7 +711,7 @@ data/
 - `client_api_keys.json`：系统 Key 和 Admin 生成的 `sk-...` 客户端 Key，明文存储，用于鉴权。
 - `kiro_stats.json`：凭据成功 / 失败 / 额度 / 冷却等统计。
 - `kiro_balance_cache.json`：凭据订阅、额度、邮箱等缓存。
-- `proxy_pool.json`：代理池与健康状态。
+- `proxy_pool.json`：IP 管理中的代理、健康状态与出口信息；旧格式首次加载时自动转换，并备份为 `proxy_pool.json.bak-时间戳`。
 - `cache_metering.json`：prompt cache 计量快照，**默认不再读写**（需显式 `cacheMeteringPersistEnabled: true`）。
 - `traces.db`：SQLite 请求链路追踪数据库，WAL 模式。
 - `usage_log.*.jsonl`：按日滚动请求用量日志。
@@ -804,7 +805,8 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 启用 `adminApiKey` 后访问 `/admin`。当前页面：
 
 - 概览：整体请求量、token、模型分布、凭据贡献。
-- 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理绑定。
+- 凭据管理：添加、登录、重登、删除、禁用、优先级、余额、模型列表、超额开关、代理选择。
+- IP 管理：单个或批量保存代理，检测连通性、出口 IP、位置与延迟，查看关联账号；添加或编辑账号时直接选择。
 - 客户端 Key：创建、编辑、禁用、轮换、删除、分组绑定和重置统计；系统 Key 不可删除但可轮换。
 - 请求日志：查询 `traces.db`，查看失败原因、状态码、凭据尝试链路和 token 用量。
 - 内容观察：在「请求日志 → 内容观察」选择检测专用 Key 并开启，即可查看原始请求、特征标签与响应 / SSE，支持复制和导出；详见 [使用说明](docs/request-observation.md)。
@@ -860,11 +862,14 @@ credential.proxyUrl -> config.proxyUrl -> direct
 
 凭据级 `proxyUrl` 填 `direct` 表示即使配置了全局代理也直连。
 
+在 Admin「IP 管理」中保存的代理，可在添加或编辑账号时直接选择：账号记录 `proxyId`，并把含认证的代理配置写入自己的 `proxyUrl`；编辑代理会同步到所有关联账号，仍有账号在用的代理不能删除。启动时，账号里手填的自定义代理会自动收进 IP 管理并关联。「设为全局」把代理的地址与认证写入全局代理配置，之后再编辑该代理不会改动全局代理，需要重新设置一次。
+
 支持：
 
 - `http://host:port`
 - `https://host:port`
-- `socks5://host:port`
+- `socks5://host:port`、`socks5h://host:port`（由代理解析域名）
+- `socks4://host:port`、`socks4a://host:port`
 
 如果 `rustls` 环境下代理或证书行为异常，可以在 `config.json` 中切到：
 

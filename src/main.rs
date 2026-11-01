@@ -376,6 +376,8 @@ async fn main() {
                         Some(usage_recorder.clone()),
                     )
                     .with_cache_meter(cache_meter.clone());
+            // 账号的代理与 IP 管理对齐：未入池的自定义代理收进代理池并关联
+            admin_service.migrate_credential_proxies();
             let admin_state = admin::AdminState::new(
                 admin_key,
                 admin_service,

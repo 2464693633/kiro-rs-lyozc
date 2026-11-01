@@ -34,20 +34,18 @@ use crate::kiro::token_manager::{
 use crate::model::config::Config;
 
 use super::error::AdminServiceError;
-use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::proxy_pool::ProxyPoolManager;
 use super::types::{
     AccountRpmLimitConfigResponse, AccountThrottleConfigResponse, AddCredentialRequest,
-    AddCredentialResponse, ApiDomainConfig, AssignProxyRequest, AssignRoundRobinResponse,
-    AvailableModelItem,
-    AvailableModelsResponse, BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
+    AddCredentialResponse, ApiDomainConfig, AvailableModelItem,
+    AvailableModelsResponse, BalanceResponse, BatchImportEvent,
     CacheMeteringConfigResponse, CacheMeteringStatsResponse, CheckRateLimitRequest,
     CredentialMetadataDetail, CredentialMetadataSchemaConfig, CredentialStatusItem,
     CredentialsExportResponse, CredentialsStatusResponse, CustomModelItem,
     CustomModelsConfigResponse, EnableOverageAllResult, ExportedAccount, ExportedCredentials,
     GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
     LogGovernanceConfigResponse, ModelApiRetryConfigResponse, ModelSelectionMode, ModelTestRequest,
-    ModelTestResponse, PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse,
-    ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
+    ModelTestResponse, PollIdcLoginResponse, QuotaExceededResult, QuotaResetRecoveryConfigResponse,
     SelfHealConfigResponse, SessionAffinityConfigResponse, SetAccountRpmLimitConfigRequest,
     SetAccountThrottleConfigRequest, SetCacheMeteringConfigRequest, SetCustomModelsRequest,
     SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetModelApiRetryConfigRequest,
@@ -58,6 +56,11 @@ use super::types::{
     ProtocolCompatibilityConfigResponse, ProtocolCompatibilityDiagnostics,
     SetProtocolCompatibilityRequest,
 };
+
+mod proxy;
+mod proxy_link;
+#[cfg(test)]
+mod proxy_tests;
 
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
@@ -859,6 +862,7 @@ impl AdminService {
             cache.clone()
         };
         let now_ts = Utc::now().timestamp() as f64;
+        let proxy_names = self.proxy_names();
 
         let mut credentials: Vec<CredentialStatusItem> = snapshot
             .entries
@@ -892,6 +896,8 @@ impl AdminService {
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
+                    proxy_id: entry.proxy_id,
+                    proxy_name: entry.proxy_id.and_then(|id| proxy_names.get(&id).cloned()),
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
@@ -1574,6 +1580,16 @@ impl AdminService {
             }
         }
 
+        // 代理：关联 IP 管理中的代理、全局代理、直连，或自定义地址（入库后收进代理池）
+        let proxy = self.resolve_proxy_setting(
+            req.proxy_id,
+            req.proxy_url.as_deref(),
+            req.proxy_username.as_deref(),
+            req.proxy_password.as_deref(),
+            None,
+        )?;
+        let proxy_binding = proxy.binding(0);
+
         // 构建凭据对象
         let email = req.email.clone();
         let new_cred = KiroCredentials {
@@ -1597,9 +1613,10 @@ impl AdminService {
             machine_id: req.machine_id,
             email: req.email,
             subscription_title: None, // 将在首次获取使用额度时自动更新
-            proxy_url: req.proxy_url,
-            proxy_username: req.proxy_username,
-            proxy_password: req.proxy_password,
+            proxy_url: proxy_binding.proxy_url,
+            proxy_username: proxy_binding.proxy_username,
+            proxy_password: proxy_binding.proxy_password,
+            proxy_id: proxy_binding.proxy_id,
             disabled: false, // 新添加的凭据默认启用
             disabled_reason: None,
             self_heal_consecutive_rounds: 0,
@@ -1621,6 +1638,16 @@ impl AdminService {
             .add_credential(new_cred)
             .await
             .map_err(|e| self.classify_add_error(e))?;
+
+        if let Some(endpoint) = proxy.adopt {
+            if let Err(e) = self.adopt_custom_proxy(credential_id, endpoint) {
+                tracing::warn!(
+                    "凭据 #{} 的代理加入 IP 管理失败，下次启动时重试: {}",
+                    credential_id,
+                    e
+                );
+            }
+        }
 
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
@@ -1728,22 +1755,56 @@ impl AdminService {
             validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
                 .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
         }
+        // 代理字段全部省略表示不修改代理；只传用户名或密码时沿用当前地址，留空的认证字段沿用当前值
+        let proxy = if req.proxy_id.is_some()
+            || req.proxy_url.is_some()
+            || req.proxy_username.is_some()
+            || req.proxy_password.is_some()
+        {
+            let current = self
+                .token_manager
+                .proxy_bindings()
+                .into_iter()
+                .find(|b| b.credential_id == id)
+                .ok_or(AdminServiceError::NotFound { id })?;
+            let keep =
+                |new: Option<String>, old: Option<String>| new.filter(|s| !s.is_empty()).or(old);
+            let url = req.proxy_url.clone().or(current.proxy_url.clone());
+            let setting = self.resolve_proxy_setting(
+                req.proxy_id,
+                url.as_deref(),
+                keep(req.proxy_username.clone(), current.proxy_username).as_deref(),
+                keep(req.proxy_password.clone(), current.proxy_password).as_deref(),
+                current.proxy_id,
+            )?;
+            Some(setting)
+        } else {
+            None
+        };
         self.token_manager
             .update_credential(
                 id,
                 req.email.map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_url
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_username
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
-                req.proxy_password
-                    .map(|v| if v.is_empty() { None } else { Some(v) }),
+                None,
+                None,
+                None,
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.metadata,
             )
-            .map_err(|e| self.classify_error(e, id))
+            .map_err(|e| self.classify_error(e, id))?;
+        if let Some(setting) = proxy {
+            self.token_manager
+                .set_credential_proxy(setting.binding(id))
+                .map_err(|e| self.classify_error(e, id))?;
+            if let Some(endpoint) = setting.adopt {
+                if let Err(e) = self.adopt_custom_proxy(id, endpoint) {
+                    tracing::warn!("凭据 #{} 的代理加入 IP 管理失败，下次启动时重试: {}", id, e);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// 删除凭据
@@ -2977,237 +3038,6 @@ impl AdminService {
             }
             Err(e) => tracing::warn!("序列化余额缓存失败: {}", e),
         }
-    }
-
-    // ============ 代理池管理 ============
-
-    /// 获取代理池列表（含凭据引用计数）
-    pub fn get_proxy_pool(&self) -> ProxyPoolResponse {
-        let proxies = self.proxy_pool.list();
-        let credentials = {
-            let snapshot = self.token_manager.snapshot();
-            snapshot.entries
-        };
-
-        let pool: Vec<ProxyPoolEntry> = proxies
-            .into_iter()
-            .map(|p| {
-                let count = credentials
-                    .iter()
-                    .filter(|c| c.proxy_url.as_deref().map(|u| u == p.url).unwrap_or(false))
-                    .count() as u32;
-                ProxyPoolEntry {
-                    id: p.id,
-                    url: p.url,
-                    label: p.label,
-                    enabled: p.enabled,
-                    credential_count: count,
-                    health: p.health,
-                    latency_ms: p.latency_ms,
-                    last_checked_at: p.last_checked_at,
-                    consecutive_failures: p.consecutive_failures,
-                    auto_disabled: p.auto_disabled,
-                }
-            })
-            .collect();
-
-        ProxyPoolResponse {
-            total: pool.len(),
-            proxies: pool,
-        }
-    }
-
-    /// 添加代理到池中
-    pub fn add_proxy(
-        &self,
-        url: String,
-        label: Option<String>,
-    ) -> Result<ProxyPoolEntry, AdminServiceError> {
-        let entry = self
-            .proxy_pool
-            .add(url, label)
-            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
-        Ok(ProxyPoolEntry {
-            id: entry.id,
-            url: entry.url,
-            label: entry.label,
-            enabled: entry.enabled,
-            credential_count: 0,
-            health: entry.health,
-            latency_ms: entry.latency_ms,
-            last_checked_at: entry.last_checked_at,
-            consecutive_failures: entry.consecutive_failures,
-            auto_disabled: entry.auto_disabled,
-        })
-    }
-
-    /// 批量添加代理
-    pub fn batch_add_proxies(
-        &self,
-        req: BatchAddProxyRequest,
-    ) -> (Vec<ProxyPoolEntry>, Vec<String>) {
-        let (added, errors) = self.proxy_pool.batch_add(req.urls);
-        let result = added
-            .into_iter()
-            .map(|e| ProxyPoolEntry {
-                id: e.id,
-                url: e.url,
-                label: e.label,
-                enabled: e.enabled,
-                credential_count: 0,
-                health: e.health,
-                latency_ms: e.latency_ms,
-                last_checked_at: e.last_checked_at,
-                consecutive_failures: e.consecutive_failures,
-                auto_disabled: e.auto_disabled,
-            })
-            .collect();
-        (result, errors)
-    }
-
-    /// 删除代理池中的代理
-    pub fn delete_proxy(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.proxy_pool.delete(id).map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("不存在") {
-                AdminServiceError::NotFound { id }
-            } else {
-                AdminServiceError::InternalError(msg)
-            }
-        })
-    }
-
-    /// 设置代理启用/禁用状态
-    pub fn set_proxy_enabled(&self, id: u64, enabled: bool) -> Result<(), AdminServiceError> {
-        self.proxy_pool
-            .set_enabled(id, enabled)
-            .map_err(|_| AdminServiceError::NotFound { id })
-    }
-
-    /// 将代理池中的代理分配给指定凭据
-    pub fn assign_proxy_to_credential(
-        &self,
-        credential_id: u64,
-        req: AssignProxyRequest,
-    ) -> Result<(), AdminServiceError> {
-        let proxy_url = match req.proxy_id {
-            Some(proxy_id) => {
-                let url = match self.proxy_pool.get_url(proxy_id) {
-                    GetUrlResult::Ok(url) => url,
-                    GetUrlResult::NotFound => {
-                        return Err(AdminServiceError::NotFound { id: proxy_id });
-                    }
-                    GetUrlResult::Disabled => {
-                        return Err(AdminServiceError::InvalidCredential(format!(
-                            "代理 #{} 已被禁用，请先启用后再分配",
-                            proxy_id
-                        )));
-                    }
-                };
-                Some(url)
-            }
-            None => None, // 清除代理
-        };
-
-        self.token_manager
-            .update_credential(
-                credential_id,
-                None,            // email 不修改
-                Some(proxy_url), // 设置或清除 proxy_url（Some(None) = 清除，Some(Some(url)) = 设置）
-                None,            // proxy_username 不修改
-                None,            // proxy_password 不修改
-                None,            // groups 不修改
-                None,            // source_channel 不修改
-                None,            // metadata 不修改
-            )
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("不存在") {
-                    AdminServiceError::NotFound { id: credential_id }
-                } else {
-                    AdminServiceError::InternalError(msg)
-                }
-            })
-    }
-
-    /// 即时探测单个代理的连通性（供 UI「测试」按钮调用）
-    pub async fn check_proxy(&self, id: u64) -> Result<ProxyCheckResponse, AdminServiceError> {
-        let entry = self
-            .proxy_pool
-            .check_one(id)
-            .await
-            .map_err(|_| AdminServiceError::NotFound { id })?;
-        Ok(ProxyCheckResponse {
-            id: entry.id,
-            health: entry.health,
-            latency_ms: entry.latency_ms,
-            last_checked_at: entry.last_checked_at,
-            enabled: entry.enabled,
-            auto_disabled: entry.auto_disabled,
-        })
-    }
-
-    /// 触发全部代理的健康检查
-    pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
-        let summary = self.proxy_pool.check_all().await;
-        ProxyCheckAllResponse {
-            healthy: summary.healthy,
-            unhealthy: summary.unhealthy,
-            auto_disabled: summary.auto_disabled,
-        }
-    }
-
-    /// 将可用代理（已启用且非 Unhealthy）按轮询方式批量分配给凭据
-    ///
-    /// - `credential_ids` 为 None 时对全部凭据分配
-    /// - 无可用代理时返回错误
-    pub fn assign_proxies_round_robin(
-        &self,
-        credential_ids: Option<Vec<u64>>,
-    ) -> Result<AssignRoundRobinResponse, AdminServiceError> {
-        let urls = self.proxy_pool.assignable_urls();
-        if urls.is_empty() {
-            return Err(AdminServiceError::InvalidCredential(
-                "没有可用代理（需已启用且健康检查未失败）".to_string(),
-            ));
-        }
-
-        let target_ids: Vec<u64> = match credential_ids {
-            Some(ids) if !ids.is_empty() => ids,
-            _ => self
-                .token_manager
-                .snapshot()
-                .entries
-                .iter()
-                .map(|c| c.id)
-                .collect(),
-        };
-
-        let mut assigned = 0;
-        for (i, cred_id) in target_ids.iter().enumerate() {
-            let url = urls[i % urls.len()].clone();
-            if self
-                .token_manager
-                .update_credential(
-                    *cred_id,
-                    None,
-                    Some(Some(url)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .is_ok()
-            {
-                assigned += 1;
-            }
-        }
-
-        Ok(AssignRoundRobinResponse {
-            assigned,
-            proxy_count: urls.len(),
-        })
     }
 
     // ============ 错误分类 ============

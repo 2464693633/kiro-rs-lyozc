@@ -1,22 +1,28 @@
-//! 代理 IP 池管理
+//! 代理 IP 管理
 //!
-//! 独立于凭据管理，存储为 proxy_pool.json
+//! 独立于凭据管理，存储为 proxy_pool.json。代理按协议、主机、端口、认证结构化保存，
+//! 账号通过 `proxyId` 关联代理：编辑代理后同步到所有关联账号，仍被使用的代理不能删除。
 //!
-//! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理请求一个
-//! 轻量公网探测端点，记录连通性与延迟；连续探测失败达阈值的代理会被自动禁用。
+//! 除增删改查外，还提供主动健康检查：周期性（或按需）通过每个代理探测出口 IP、
+//! 地理位置与延迟；连续探测失败达阈值的代理会被自动禁用。
 
-use crate::http_client::{ProxyConfig, build_client};
-use crate::model::config::TlsBackend;
-use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+mod endpoint;
+mod probe;
+mod storage;
+#[cfg(test)]
+mod tests;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 
-/// 健康检查探测端点：返回 204 No Content 的轻量公网地址，不依赖上游 Kiro。
-const PROXY_HEALTH_CHECK_URL: &str = "https://www.gstatic.com/generate_204";
-/// 单次探测超时（秒）
-const PROXY_PROBE_TIMEOUT_SECS: u64 = 8;
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
+
+pub use endpoint::ProxyEndpoint;
+use storage::write_file;
+
+use crate::model::config::TlsBackend;
+
 /// 连续探测失败阈值：达到后自动禁用（与凭据的 MAX_FAILURES_PER_CREDENTIAL 对齐）
 const MAX_PROXY_PROBE_FAILURES: u32 = 3;
 
@@ -33,14 +39,29 @@ pub enum ProxyHealth {
     Unhealthy,
 }
 
+/// 最近一次探测到的出口信息
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyExitInfo {
+    pub ip: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+}
+
 /// 持久化的代理条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyEntry {
     pub id: u64,
-    pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
+    pub name: String,
+    #[serde(flatten)]
+    pub endpoint: ProxyEndpoint,
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// 健康状态（健康检查结果）
@@ -58,20 +79,32 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 最近一次探测失败的原因（已抹掉密码）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// 最近一次探测到的出口信息
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<ProxyExitInfo>,
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// 代理分配结果
-pub enum GetUrlResult {
-    /// 代理存在且已启用，返回 URL
-    Ok(String),
-    /// 代理不存在
-    NotFound,
-    /// 代理存在但已被禁用
-    Disabled,
+fn fresh_entry(id: u64, name: String, endpoint: ProxyEndpoint) -> ProxyEntry {
+    ProxyEntry {
+        id,
+        name,
+        endpoint,
+        enabled: true,
+        health: ProxyHealth::Unknown,
+        latency_ms: None,
+        last_checked_at: None,
+        consecutive_failures: 0,
+        auto_disabled: false,
+        last_error: None,
+        exit: None,
+    }
 }
 
 /// 一次全量健康检查的摘要
@@ -85,10 +118,34 @@ pub struct CheckSummary {
     pub auto_disabled: usize,
 }
 
-/// 单个代理探测结果
-enum ProbeResult {
-    Ok { latency_ms: u32 },
-    Err { error: String },
+/// 新建代理的输入；名称为空时使用 `主机:端口`
+#[derive(Debug, Clone)]
+pub struct ProxyInput {
+    pub name: Option<String>,
+    pub endpoint: ProxyEndpoint,
+}
+
+/// 编辑代理的补丁：`None` 表示不修改；用户名或密码传空串表示清除
+#[derive(Debug, Clone, Default)]
+pub struct ProxyPatch {
+    pub name: Option<String>,
+    pub protocol: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProxyPoolError {
+    #[error("代理不存在")]
+    NotFound,
+    #[error("代理已存在: {0}")]
+    Duplicate(String),
+    #[error("{0}")]
+    Invalid(String),
+    #[error("保存代理池失败: {0}")]
+    Persist(String),
 }
 
 pub struct ProxyPoolManager {
@@ -99,40 +156,10 @@ pub struct ProxyPoolManager {
     /// TLS 后端，构建探测用 HTTP client 时需要
     tls_backend: TlsBackend,
 }
-
-/// 校验代理 URL 的 scheme 是否合法
-fn validate_proxy_url(url: &str) -> anyhow::Result<()> {
-    let valid_schemes = ["http://", "https://", "socks5://", "socks4://"];
-    if !valid_schemes.iter().any(|s| url.starts_with(s)) {
-        anyhow::bail!(
-            "代理 URL scheme 无效，支持: http/https/socks4/socks5（收到: {}）",
-            url
-        );
-    }
-    // 简单检查 host:port 存在
-    let after_scheme = valid_schemes
-        .iter()
-        .find(|s| url.starts_with(*s))
-        .map(|s| &url[s.len()..])
-        .unwrap_or(url);
-    // after_scheme 可能是 user:pass@host:port 或 host:port
-    let host_part = after_scheme.rsplit('@').next().unwrap_or(after_scheme);
-    if !host_part.contains(':') {
-        anyhow::bail!("代理 URL 缺少端口号: {}", url);
-    }
-    Ok(())
-}
-
 impl ProxyPoolManager {
     pub fn new(path: Option<PathBuf>, tls_backend: TlsBackend) -> Self {
-        let entries = path
-            .as_ref()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<Vec<ProxyEntry>>(&s).ok())
-            .unwrap_or_default();
-
+        let entries = path.as_deref().map(storage::load).unwrap_or_default();
         let next_id = entries.iter().map(|e| e.id).max().unwrap_or(0) + 1;
-
         Self {
             entries: Mutex::new(entries),
             next_id: AtomicU64::new(next_id),
@@ -145,92 +172,170 @@ impl ProxyPoolManager {
         self.entries.lock().clone()
     }
 
-    pub fn add(&self, url: String, label: Option<String>) -> anyhow::Result<ProxyEntry> {
-        let url = url.trim().to_string();
-        if url.is_empty() {
-            anyhow::bail!("代理 URL 不能为空");
-        }
-        validate_proxy_url(&url)?;
+    pub fn get(&self, id: u64) -> Option<ProxyEntry> {
+        self.entries.lock().iter().find(|e| e.id == id).cloned()
+    }
 
+    fn persist(&self, entries: &[ProxyEntry]) -> Result<(), ProxyPoolError> {
+        write_file(self.path.as_deref(), entries)
+            .map_err(|e| ProxyPoolError::Persist(e.to_string()))
+    }
+
+    /// 新建代理；地址（协议 + 主机 + 端口 + 认证）与已有代理重复时拒绝。
+    pub fn add(&self, input: ProxyInput) -> Result<ProxyEntry, ProxyPoolError> {
+        let endpoint = input
+            .endpoint
+            .normalize()
+            .map_err(ProxyPoolError::Invalid)?;
         let mut entries = self.entries.lock();
-
-        if entries.iter().any(|e| e.url == url) {
-            anyhow::bail!("代理 URL 已存在: {}", url);
+        if entries.iter().any(|e| e.endpoint == endpoint) {
+            return Err(ProxyPoolError::Duplicate(endpoint.display_url()));
         }
-
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let entry = ProxyEntry {
-            id,
-            url,
-            label,
-            enabled: true,
-            health: ProxyHealth::Unknown,
-            latency_ms: None,
-            last_checked_at: None,
-            consecutive_failures: 0,
-            auto_disabled: false,
-        };
+        let name = input
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| endpoint.default_name());
+        let entry = fresh_entry(self.next_id.fetch_add(1, Ordering::Relaxed), name, endpoint);
         entries.push(entry.clone());
-        drop(entries);
-
-        self.persist()?;
+        if let Err(e) = self.persist(&entries) {
+            entries.pop();
+            return Err(e);
+        }
         Ok(entry)
     }
 
-    /// 批量添加：在单次加锁内完成所有插入，最后统一持久化一次
-    pub fn batch_add(&self, urls: Vec<String>) -> (Vec<ProxyEntry>, Vec<String>) {
-        let mut added = vec![];
-        let mut errors = vec![];
-
+    /// 按地址查找代理，不存在时新建。返回 `(条目, 是否新建)`。
+    /// 账号带自定义代理地址时用它把地址收进代理池。
+    pub fn find_or_add(
+        &self,
+        endpoint: ProxyEndpoint,
+    ) -> Result<(ProxyEntry, bool), ProxyPoolError> {
+        let endpoint = endpoint.normalize().map_err(ProxyPoolError::Invalid)?;
         let mut entries = self.entries.lock();
-        for url in urls {
-            let url = url.trim().to_string();
-            if url.is_empty() || url.starts_with('#') {
+        if let Some(existing) = entries.iter().find(|e| e.endpoint == endpoint) {
+            return Ok((existing.clone(), false));
+        }
+        let name = endpoint.default_name();
+        let entry = fresh_entry(self.next_id.fetch_add(1, Ordering::Relaxed), name, endpoint);
+        entries.push(entry.clone());
+        if let Err(e) = self.persist(&entries) {
+            entries.pop();
+            return Err(e);
+        }
+        Ok((entry, true))
+    }
+    /// 批量添加：每行一个代理地址，空行与 `#` 开头的行跳过。
+    /// 错误信息带行号与不含密码的地址，返回 `(新增条目, 跳过原因)`。
+    pub fn batch_add(&self, urls: Vec<String>) -> (Vec<ProxyEntry>, Vec<String>) {
+        let mut added = Vec::new();
+        let mut errors = Vec::new();
+        let mut entries = self.entries.lock();
+        let original_len = entries.len();
+        for (index, raw) in urls.iter().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Err(e) = validate_proxy_url(&url) {
-                errors.push(e.to_string());
-                continue;
-            }
-            if entries.iter().any(|e| e.url == url) {
-                errors.push(format!("代理 URL 已存在: {}", url));
-                continue;
-            }
-            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let entry = ProxyEntry {
-                id,
-                url,
-                label: None,
-                enabled: true,
-                health: ProxyHealth::Unknown,
-                latency_ms: None,
-                last_checked_at: None,
-                consecutive_failures: 0,
-                auto_disabled: false,
+            let endpoint = match ProxyEndpoint::parse(line) {
+                Ok(endpoint) => endpoint,
+                Err(e) => {
+                    errors.push(format!("第 {} 行：{}", index + 1, e));
+                    continue;
+                }
             };
+            if entries.iter().any(|e| e.endpoint == endpoint) {
+                errors.push(format!(
+                    "第 {} 行：代理已存在 {}",
+                    index + 1,
+                    endpoint.display_url()
+                ));
+                continue;
+            }
+            let name = endpoint.default_name();
+            let entry = fresh_entry(self.next_id.fetch_add(1, Ordering::Relaxed), name, endpoint);
             entries.push(entry.clone());
             added.push(entry);
         }
-        drop(entries);
-
         if !added.is_empty() {
-            if let Err(e) = self.persist() {
-                tracing::warn!("批量添加代理后持久化失败: {}", e);
+            if let Err(e) = self.persist(&entries) {
+                entries.truncate(original_len);
+                added.clear();
+                errors.push(e.to_string());
             }
         }
-
         (added, errors)
     }
-
-    pub fn delete(&self, id: u64) -> anyhow::Result<()> {
+    /// 编辑代理。返回 `(更新后的条目, 地址是否变化)`；地址变化时清空健康状态与出口信息，
+    /// 并解除健康检查造成的自动禁用（手动禁用保持不变）。
+    pub fn update(&self, id: u64, patch: ProxyPatch) -> Result<(ProxyEntry, bool), ProxyPoolError> {
         let mut entries = self.entries.lock();
-        let len_before = entries.len();
-        entries.retain(|e| e.id != id);
-        if entries.len() == len_before {
-            anyhow::bail!("代理不存在: {}", id);
+        let index = entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or(ProxyPoolError::NotFound)?;
+        let mut entry = entries[index].clone();
+        let mut endpoint = entry.endpoint.clone();
+        if let Some(v) = patch.protocol {
+            endpoint.protocol = v;
         }
-        drop(entries);
-        self.persist()?;
+        if let Some(v) = patch.host {
+            endpoint.host = v;
+        }
+        if let Some(v) = patch.port {
+            endpoint.port = v;
+        }
+        if let Some(v) = patch.username {
+            endpoint.username = Some(v);
+        }
+        if let Some(v) = patch.password {
+            endpoint.password = Some(v);
+        }
+        let endpoint = endpoint.normalize().map_err(ProxyPoolError::Invalid)?;
+        if entries.iter().any(|e| e.id != id && e.endpoint == endpoint) {
+            return Err(ProxyPoolError::Duplicate(endpoint.display_url()));
+        }
+        let endpoint_changed = endpoint != entry.endpoint;
+        if let Some(name) = patch.name {
+            let name = name.trim();
+            entry.name = if name.is_empty() {
+                endpoint.default_name()
+            } else {
+                name.to_string()
+            };
+        }
+        if endpoint_changed {
+            entry.health = ProxyHealth::Unknown;
+            entry.latency_ms = None;
+            entry.last_checked_at = None;
+            entry.consecutive_failures = 0;
+            entry.last_error = None;
+            entry.exit = None;
+            if entry.auto_disabled {
+                entry.auto_disabled = false;
+                entry.enabled = true;
+            }
+        }
+        entry.endpoint = endpoint;
+        let previous = std::mem::replace(&mut entries[index], entry.clone());
+        if let Err(e) = self.persist(&entries) {
+            entries[index] = previous;
+            return Err(e);
+        }
+        Ok((entry, endpoint_changed))
+    }
+
+    pub fn delete(&self, id: u64) -> Result<(), ProxyPoolError> {
+        let mut entries = self.entries.lock();
+        let index = entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or(ProxyPoolError::NotFound)?;
+        let removed = entries.remove(index);
+        if let Err(e) = self.persist(&entries) {
+            entries.insert(index, removed);
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -238,288 +343,36 @@ impl ProxyPoolManager {
     ///
     /// 用户手动启用时清除「健康检查自动禁用」标记与连续失败计数，
     /// 让该代理重新参与健康检查与分配。
-    pub fn set_enabled(&self, id: u64, enabled: bool) -> anyhow::Result<()> {
+    pub fn set_enabled(&self, id: u64, enabled: bool) -> Result<(), ProxyPoolError> {
         let mut entries = self.entries.lock();
-        let entry = entries
-            .iter_mut()
-            .find(|e| e.id == id)
-            .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
+        let index = entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or(ProxyPoolError::NotFound)?;
+        let previous = entries[index].clone();
+        let entry = &mut entries[index];
         entry.enabled = enabled;
         if enabled {
             entry.auto_disabled = false;
             entry.consecutive_failures = 0;
         }
-        drop(entries);
-        self.persist()?;
+        if let Err(e) = self.persist(&entries) {
+            entries[index] = previous;
+            return Err(e);
+        }
         Ok(())
     }
 
-    /// 获取代理 URL，区分"不存在"和"已禁用"两种情况
-    pub fn get_url(&self, id: u64) -> GetUrlResult {
-        match self.entries.lock().iter().find(|e| e.id == id) {
-            None => GetUrlResult::NotFound,
-            Some(e) if !e.enabled => GetUrlResult::Disabled,
-            Some(e) => GetUrlResult::Ok(e.url.clone()),
-        }
-    }
-
-    /// 获取所有「可用于分配」的代理 URL：已启用且非 Unhealthy
-    pub fn assignable_urls(&self) -> Vec<String> {
-        self.entries
+    /// 可用于轮询分配的代理 ID：已启用且最近一次探测未失败
+    pub fn assignable_ids(&self) -> Vec<u64> {
+        let mut ids: Vec<u64> = self
+            .entries
             .lock()
             .iter()
             .filter(|e| e.enabled && e.health != ProxyHealth::Unhealthy)
-            .map(|e| e.url.clone())
-            .collect()
-    }
-
-    fn persist(&self) -> anyhow::Result<()> {
-        let path = match &self.path {
-            Some(p) => p,
-            None => return Ok(()),
-        };
-        let entries = self.entries.lock();
-        let json = serde_json::to_string_pretty(&*entries)?;
-        std::fs::write(path, json)?;
-        Ok(())
-    }
-}
-
-// ============ 健康检查 ============
-
-impl ProxyPoolManager {
-    /// 探测单个代理 URL 的连通性与延迟。
-    ///
-    /// 通过该代理请求 `PROXY_HEALTH_CHECK_URL`，成功（HTTP 2xx/3xx）即视为连通，
-    /// 返回往返延迟；任何网络错误或非预期状态码视为失败。
-    async fn probe_one(&self, url: &str) -> ProbeResult {
-        let proxy = ProxyConfig::new(url);
-        let client = match build_client(Some(&proxy), PROXY_PROBE_TIMEOUT_SECS, self.tls_backend) {
-            Ok(c) => c,
-            Err(e) => {
-                return ProbeResult::Err {
-                    error: format!("构建探测 client 失败: {}", e),
-                };
-            }
-        };
-
-        let started = Instant::now();
-        match client.get(PROXY_HEALTH_CHECK_URL).send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() || status.is_redirection() {
-                    ProbeResult::Ok {
-                        latency_ms: started.elapsed().as_millis().min(u32::MAX as u128) as u32,
-                    }
-                } else {
-                    ProbeResult::Err {
-                        error: format!("探测端点返回非预期状态: {}", status),
-                    }
-                }
-            }
-            Err(e) => ProbeResult::Err {
-                error: e.to_string(),
-            },
-        }
-    }
-
-    /// 将一次探测结果回写到指定条目，并按需触发自动禁用。
-    ///
-    /// 返回 `(变为不健康, 本次新自动禁用)` 供摘要统计。
-    fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -> (bool, bool) {
-        entry.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
-        match result {
-            ProbeResult::Ok { latency_ms } => {
-                entry.health = ProxyHealth::Healthy;
-                entry.latency_ms = Some(*latency_ms);
-                entry.consecutive_failures = 0;
-                (false, false)
-            }
-            ProbeResult::Err { error } => {
-                entry.health = ProxyHealth::Unhealthy;
-                entry.latency_ms = None;
-                entry.consecutive_failures += 1;
-                tracing::warn!(
-                    "代理 #{} 探测失败（{}/{}）: {}",
-                    entry.id,
-                    entry.consecutive_failures,
-                    MAX_PROXY_PROBE_FAILURES,
-                    error
-                );
-                let mut newly_disabled = false;
-                if entry.consecutive_failures >= MAX_PROXY_PROBE_FAILURES && entry.enabled {
-                    entry.enabled = false;
-                    entry.auto_disabled = true;
-                    newly_disabled = true;
-                    tracing::error!(
-                        "代理 #{} 连续探测失败 {} 次，已自动禁用",
-                        entry.id,
-                        entry.consecutive_failures
-                    );
-                }
-                (true, newly_disabled)
-            }
-        }
-    }
-
-    /// 全量健康检查：并发探测所有「已启用」代理，回写结果并持久化一次。
-    ///
-    /// 仅探测当前 enabled 的条目；用户/自动禁用的条目跳过（手动重新启用会清零计数）。
-    pub async fn check_all(&self) -> CheckSummary {
-        // 快照待探测的 (id, url)，避免长时间持锁
-        let targets: Vec<(u64, String)> = self
-            .entries
-            .lock()
-            .iter()
-            .filter(|e| e.enabled)
-            .map(|e| (e.id, e.url.clone()))
+            .map(|e| e.id)
             .collect();
-
-        if targets.is_empty() {
-            return CheckSummary::default();
-        }
-
-        let probes = targets
-            .iter()
-            .map(|(id, url)| async move { (*id, self.probe_one(url).await) });
-        let results = futures::future::join_all(probes).await;
-
-        let mut summary = CheckSummary::default();
-        {
-            let mut entries = self.entries.lock();
-            for (id, result) in &results {
-                if let Some(entry) = entries.iter_mut().find(|e| e.id == *id) {
-                    let (unhealthy, newly_disabled) = Self::apply_probe_result(entry, result);
-                    if unhealthy {
-                        summary.unhealthy += 1;
-                    } else {
-                        summary.healthy += 1;
-                    }
-                    if newly_disabled {
-                        summary.auto_disabled += 1;
-                    }
-                }
-            }
-        }
-
-        if let Err(e) = self.persist() {
-            tracing::warn!("健康检查后持久化失败: {}", e);
-        }
-        summary
-    }
-
-    /// 单个代理即时探测（供 UI「测试」按钮调用），回写结果并持久化。
-    pub async fn check_one(&self, id: u64) -> anyhow::Result<ProxyEntry> {
-        let url = self
-            .entries
-            .lock()
-            .iter()
-            .find(|e| e.id == id)
-            .map(|e| e.url.clone())
-            .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
-
-        let result = self.probe_one(&url).await;
-
-        let entry = {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("代理不存在: {}", id))?;
-            Self::apply_probe_result(entry, &result);
-            entry.clone()
-        };
-
-        self.persist()?;
-        Ok(entry)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_entry(url: &str) -> ProxyEntry {
-        ProxyEntry {
-            id: 1,
-            url: url.to_string(),
-            label: None,
-            enabled: true,
-            health: ProxyHealth::Unknown,
-            latency_ms: None,
-            last_checked_at: None,
-            consecutive_failures: 0,
-            auto_disabled: false,
-        }
-    }
-
-    #[test]
-    fn old_json_without_new_fields_deserializes() {
-        // 旧格式 JSON 只有 id/url/label/enabled，新字段应由 serde default 补全
-        let json = r#"[{"id":1,"url":"socks5://127.0.0.1:1080","enabled":true}]"#;
-        let entries: Vec<ProxyEntry> = serde_json::from_str(json).unwrap();
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
-        assert_eq!(e.health, ProxyHealth::Unknown);
-        assert_eq!(e.latency_ms, None);
-        assert_eq!(e.consecutive_failures, 0);
-        assert!(!e.auto_disabled);
-    }
-
-    #[test]
-    fn probe_failure_increments_and_auto_disables_at_threshold() {
-        let mut entry = make_entry("socks5://127.0.0.1:1080");
-        let err = ProbeResult::Err {
-            error: "connection refused".to_string(),
-        };
-        // 前两次失败：计数累加，仍启用
-        for n in 1..MAX_PROXY_PROBE_FAILURES {
-            let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
-            assert!(unhealthy);
-            assert!(!disabled);
-            assert_eq!(entry.consecutive_failures, n);
-            assert!(entry.enabled);
-            assert!(!entry.auto_disabled);
-        }
-        // 第 N 次失败：自动禁用
-        let (_, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &err);
-        assert!(disabled);
-        assert_eq!(entry.consecutive_failures, MAX_PROXY_PROBE_FAILURES);
-        assert!(!entry.enabled);
-        assert!(entry.auto_disabled);
-    }
-
-    #[test]
-    fn probe_success_clears_failures_and_marks_healthy() {
-        let mut entry = make_entry("socks5://127.0.0.1:1080");
-        entry.consecutive_failures = 2;
-        entry.health = ProxyHealth::Unhealthy;
-        let ok = ProbeResult::Ok { latency_ms: 123 };
-        let (unhealthy, disabled) = ProxyPoolManager::apply_probe_result(&mut entry, &ok);
-        assert!(!unhealthy);
-        assert!(!disabled);
-        assert_eq!(entry.consecutive_failures, 0);
-        assert_eq!(entry.health, ProxyHealth::Healthy);
-        assert_eq!(entry.latency_ms, Some(123));
-    }
-
-    #[test]
-    fn set_enabled_true_clears_auto_disable_state() {
-        let mgr = ProxyPoolManager::new(None, TlsBackend::Rustls);
-        let entry = mgr.add("socks5://127.0.0.1:1080".to_string(), None).unwrap();
-        // 模拟自动禁用状态
-        {
-            let mut entries = mgr.entries.lock();
-            let e = entries.iter_mut().find(|e| e.id == entry.id).unwrap();
-            e.enabled = false;
-            e.auto_disabled = true;
-            e.consecutive_failures = MAX_PROXY_PROBE_FAILURES;
-        }
-        mgr.set_enabled(entry.id, true).unwrap();
-        let list = mgr.list();
-        let e = list.iter().find(|e| e.id == entry.id).unwrap();
-        assert!(e.enabled);
-        assert!(!e.auto_disabled);
-        assert_eq!(e.consecutive_failures, 0);
+        ids.sort_unstable();
+        ids
     }
 }

@@ -1153,6 +1153,9 @@ pub struct CredentialEntrySnapshot {
     /// 代理 URL（用于前端展示）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
+    /// 关联的代理池条目 ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy_id: Option<u64>,
     /// Token 刷新连续失败次数
     pub refresh_failure_count: u32,
     /// 禁用原因
@@ -1175,6 +1178,28 @@ pub struct CredentialEntrySnapshot {
     /// 凭据添加（创建）时间（RFC3339 格式）；旧凭据缺失时为 None
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+}
+
+/// 单个凭据的代理配置与代理池关联（含认证，仅供 Admin 层内部使用，不序列化）。
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialProxyBinding {
+    pub credential_id: u64,
+    /// 关联的代理池条目 ID；None 表示全局代理、直连或未入池的自定义代理
+    pub proxy_id: Option<u64>,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialProxyBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialProxyBinding")
+            .field("credential_id", &self.credential_id)
+            .field("proxy_id", &self.proxy_id)
+            .field("has_proxy_url", &self.proxy_url.is_some())
+            .field("has_proxy_password", &self.proxy_password.is_some())
+            .finish()
+    }
 }
 
 /// 凭据管理器状态快照
@@ -3344,6 +3369,7 @@ impl MultiTokenManager {
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
+                    proxy_id: e.credentials.proxy_id,
                     refresh_failure_count: e.refresh_failure_count,
                     disabled_reason: e.disabled_reason.map(|reason| reason.as_str().to_string()),
                     throttled_remaining_secs: e
@@ -4228,6 +4254,10 @@ impl MultiTokenManager {
             if let Some(v) = email {
                 entry.credentials.email = v.filter(|s| !s.is_empty());
             }
+            // 直接改写代理字段即脱离代理池关联，避免启动对齐时被代理池的配置覆盖回去
+            if invalidate_models {
+                entry.credentials.proxy_id = None;
+            }
             if let Some(v) = proxy_url {
                 entry.credentials.proxy_url = v.filter(|s| !s.is_empty());
             }
@@ -4256,6 +4286,75 @@ impl MultiTokenManager {
             self.invalidate_model_cache(id);
         }
         self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 所有凭据的代理配置（含认证），供 Admin 层与代理池对齐。
+    pub fn proxy_bindings(&self) -> Vec<CredentialProxyBinding> {
+        self.entries
+            .lock()
+            .iter()
+            .map(|e| CredentialProxyBinding {
+                credential_id: e.id,
+                proxy_id: e.credentials.proxy_id,
+                proxy_url: e.credentials.proxy_url.clone(),
+                proxy_username: e.credentials.proxy_username.clone(),
+                proxy_password: e.credentials.proxy_password.clone(),
+            })
+            .collect()
+    }
+
+    /// 批量写入凭据的代理配置与代理池关联，只落盘一次。不存在的凭据跳过。
+    /// 实际生效的代理变化时清理该凭据的模型缓存。返回发生变化的凭据数。
+    pub fn set_credential_proxies(
+        &self,
+        bindings: &[CredentialProxyBinding],
+    ) -> anyhow::Result<usize> {
+        let mut proxy_changed = Vec::new();
+        let mut changed = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for binding in bindings {
+                let Some(entry) = entries.iter_mut().find(|e| e.id == binding.credential_id) else {
+                    continue;
+                };
+                let c = &mut entry.credentials;
+                let same_proxy = c.proxy_url == binding.proxy_url
+                    && c.proxy_username == binding.proxy_username
+                    && c.proxy_password == binding.proxy_password;
+                if same_proxy && c.proxy_id == binding.proxy_id {
+                    continue;
+                }
+                c.proxy_id = binding.proxy_id;
+                c.proxy_url = binding.proxy_url.clone();
+                c.proxy_username = binding.proxy_username.clone();
+                c.proxy_password = binding.proxy_password.clone();
+                changed += 1;
+                if !same_proxy {
+                    proxy_changed.push(entry.id);
+                }
+            }
+        }
+        for id in proxy_changed {
+            self.invalidate_model_cache(id);
+        }
+        if changed > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(changed)
+    }
+
+    /// 写入单个凭据的代理配置；凭据不存在时报错。
+    pub fn set_credential_proxy(&self, binding: CredentialProxyBinding) -> anyhow::Result<()> {
+        if !self
+            .entries
+            .lock()
+            .iter()
+            .any(|e| e.id == binding.credential_id)
+        {
+            anyhow::bail!("凭据不存在: {}", binding.credential_id);
+        }
+        self.set_credential_proxies(std::slice::from_ref(&binding))?;
         Ok(())
     }
 

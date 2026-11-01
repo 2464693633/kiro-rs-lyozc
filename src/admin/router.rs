@@ -38,6 +38,7 @@ use super::{
         test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
+        list_proxy_credentials, set_proxy_as_global, update_proxy,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -113,9 +114,11 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/proxy-pool/assign-round-robin",
             post(assign_proxies_round_robin),
         )
-        .route("/proxy-pool/{id}", delete(delete_proxy))
+        .route("/proxy-pool/{id}", delete(delete_proxy).put(update_proxy))
         .route("/proxy-pool/{id}/enabled", post(set_proxy_enabled))
         .route("/proxy-pool/{id}/check", post(check_proxy))
+        .route("/proxy-pool/{id}/credentials", get(list_proxy_credentials))
+        .route("/proxy-pool/{id}/set-global", post(set_proxy_as_global))
         .route(
             "/config/load-balancing",
             get(get_load_balancing_mode).put(set_load_balancing_mode),
