@@ -101,14 +101,23 @@ impl AdminService {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
         };
-        let (username, password) = (clean(proxy_username), clean(proxy_password));
-        let endpoint = copy_endpoint(url, username.as_deref(), password.as_deref())
+        let mut endpoint = ProxyEndpoint::parse(url).map_err(AdminServiceError::BadRequest)?;
+        // 单独更新用户名或密码时，沿用 URL 中未修改的另一项认证信息。
+        if let Some(username) = clean(proxy_username) {
+            endpoint.username = Some(username);
+        }
+        if let Some(password) = clean(proxy_password) {
+            endpoint.password = Some(password);
+        }
+        let endpoint = endpoint
+            .normalize()
             .map_err(AdminServiceError::BadRequest)?;
         Ok(ProxySetting {
             proxy_id: None,
-            proxy_url: Some(url.to_string()),
-            proxy_username: username,
-            proxy_password: password,
+            // 先写入完整认证地址，收进代理池失败时本次修改也能立即生效。
+            proxy_url: Some(endpoint.full_url()),
+            proxy_username: None,
+            proxy_password: None,
             adopt: Some(endpoint),
         })
     }

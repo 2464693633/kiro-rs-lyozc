@@ -104,9 +104,12 @@ fn client_builder(
     if let Some(proxy_config) = proxy {
         let mut proxy = Proxy::all(&proxy_config.url)?;
 
-        // 设置代理认证
-        if let (Some(username), Some(password)) = (&proxy_config.username, &proxy_config.password) {
-            proxy = proxy.basic_auth(username, password);
+        // 有用户名时即启用认证；未设置密码表示使用空密码。
+        if let Some(username) = &proxy_config.username {
+            proxy = proxy.basic_auth(
+                username,
+                proxy_config.password.as_deref().unwrap_or_default(),
+            );
         }
 
         builder = builder.proxy(proxy);

@@ -88,7 +88,7 @@ export function ProxiesPage() {
     )
   }, [proxies, query, protocol, status])
 
-  /** 全局代理单独保存地址与用户名，按这两项认出是哪个代理 */
+  /** 地址与用户名只用于标记全局代理；密码不回显，仍需允许重新应用认证。 */
   const isGlobal = (p: ProxyPoolEntry) =>
     Boolean(globalProxy?.proxyUrl) &&
     globalProxy?.proxyUrl === p.url &&
@@ -315,8 +315,8 @@ export function ProxiesPage() {
         size="icon"
         variant="ghost"
         onClick={() => handleSetGlobal(p)}
-        disabled={!p.enabled || isGlobal(p) || setGlobal.isPending}
-        title={isGlobal(p) ? '已是全局代理' : p.enabled ? '设为全局代理' : '已禁用的代理不能设为全局代理'}
+        disabled={!p.enabled || setGlobal.isPending}
+        title={!p.enabled ? '已禁用的代理不能设为全局代理' : isGlobal(p) ? '重新应用全局代理（同步认证）' : '设为全局代理'}
       >
         <Globe className="h-3.5 w-3.5" />
       </Button>

@@ -223,3 +223,49 @@ async fn round_robin_links_accounts_to_pool_entries() {
         Err(AdminServiceError::Conflict(_))
     ));
 }
+
+#[tokio::test]
+async fn credential_proxy_auth_updates_preserve_omitted_fields_and_other_accounts() {
+    let svc = service(vec![
+        cred(
+            1,
+            Some("http://127.0.0.1:3128"),
+            Some("user"),
+            Some("before"),
+            None,
+        ),
+        cred(
+            2,
+            Some("http://user:before@127.0.0.1:3128"),
+            None,
+            None,
+            None,
+        ),
+    ]);
+    svc.migrate_credential_proxies();
+    let original = binding(&svc, 2);
+    assert_eq!(binding(&svc, 1).proxy_id, original.proxy_id);
+
+    // The first edit adopts the legacy split credentials into an authenticated URL.
+    // Further password-only edits must still inherit its username.
+    for password in ["first", "second:@/?#"] {
+        svc.update_credential(1, update(serde_json::json!({ "proxyPassword": password })))
+            .unwrap();
+        let b = binding(&svc, 1);
+        let endpoint =
+            crate::admin::proxy_pool::ProxyEndpoint::parse(b.proxy_url.as_deref().unwrap())
+                .unwrap();
+        assert_eq!(endpoint.username.as_deref(), Some("user"));
+        assert_eq!(endpoint.password.as_deref(), Some(password));
+        assert_eq!(binding(&svc, 2), original, "只修改当前账号的代理认证");
+    }
+
+    svc.update_credential(1, update(serde_json::json!({ "proxyUsername": "renamed" })))
+        .unwrap();
+    let b = binding(&svc, 1);
+    let endpoint =
+        crate::admin::proxy_pool::ProxyEndpoint::parse(b.proxy_url.as_deref().unwrap()).unwrap();
+    assert_eq!(endpoint.username.as_deref(), Some("renamed"));
+    assert_eq!(endpoint.password.as_deref(), Some("second:@/?#"));
+    assert_eq!(binding(&svc, 2), original);
+}

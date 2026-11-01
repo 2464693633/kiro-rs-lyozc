@@ -257,6 +257,53 @@ async fn hot_update_applies_password_and_username_changes_at_same_address() {
 }
 
 #[tokio::test]
+async fn pool_proxy_global_reapply_updates_auth_and_keeps_empty_password_auth() {
+    use crate::admin::types::{AddProxyRequest, UpdateProxyRequest};
+
+    let target = LocalServer::named("direct").await;
+    let proxy = LocalServer::named("proxy").await;
+    let (provider, service) = setup(&target, None);
+    let url = proxy.url.replacen("://", "://test-user@", 1);
+    let entry = service
+        .add_proxy(AddProxyRequest {
+            url: Some(url),
+            ..Default::default()
+        })
+        .unwrap();
+
+    service.set_proxy_as_global(entry.id).unwrap();
+    assert!(!service.get_global_proxy().proxy_password_set);
+    assert_eq!(
+        model_response(&provider).await,
+        format!("proxy|Basic {}", STANDARD.encode("test-user:"))
+    );
+
+    for password in ["after", ""] {
+        service
+            .update_proxy(
+                entry.id,
+                UpdateProxyRequest {
+                    password: Some(password.to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        service.set_proxy_as_global(entry.id).unwrap();
+        assert_eq!(
+            service.get_global_proxy().proxy_password_set,
+            !password.is_empty()
+        );
+        assert_eq!(
+            model_response(&provider).await,
+            format!(
+                "proxy|Basic {}",
+                STANDARD.encode(format!("test-user:{password}"))
+            )
+        );
+    }
+}
+
+#[tokio::test]
 async fn hot_update_can_enable_and_clear_proxy_without_overriding_credentials() {
     let target = LocalServer::named("direct").await;
     let first = LocalServer::named("first").await;

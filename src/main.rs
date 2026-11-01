@@ -99,11 +99,9 @@ async fn main() {
         .filter(|url| !url.trim().is_empty())
         .map(|url| {
             let mut proxy = http_client::ProxyConfig::new(url);
-            if let (Some(username), Some(password)) =
-                (&config.proxy_username, &config.proxy_password)
-            {
-                proxy = proxy.with_auth(username, password);
-            }
+            // 与运行时设置保持一致，重启后也保留仅用户名、空密码的认证。
+            proxy.username = config.proxy_username.clone();
+            proxy.password = config.proxy_password.clone();
             proxy
         });
 
