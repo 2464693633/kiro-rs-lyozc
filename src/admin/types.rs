@@ -1068,6 +1068,8 @@ pub struct ClientKeyItem {
     /// 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换）
     #[serde(default)]
     pub is_system: bool,
+    /// 是否对该 Key 做本地缓存计量模拟；false 时输入全部计入 input_tokens
+    pub cache_metering: bool,
 }
 
 /// 客户端 Key 列表响应
@@ -1090,6 +1092,9 @@ pub struct CreateClientKeyRequest {
     /// 积分使用上限（可选；None / 省略表示不限制）
     #[serde(default)]
     pub max_credits: Option<f64>,
+    /// 是否做本地缓存计量模拟（可选；省略表示开启）
+    #[serde(default)]
+    pub cache_metering: Option<bool>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1110,6 +1115,9 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 是否做本地缓存计量模拟；省略表示不修改
+    #[serde(default)]
+    pub cache_metering: Option<bool>,
 }
 
 /// 设置客户端 Key 的积分使用上限

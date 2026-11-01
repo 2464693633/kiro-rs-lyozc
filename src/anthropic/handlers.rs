@@ -1004,7 +1004,7 @@ pub(super) async fn post_messages_inner(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
-            state.cache_meter.clone(),
+            state.cache_meter_for_key(key_ctx.key_id),
             key_ctx.key_id,
             state.protocol_compatibility_for_key(key_ctx.key_id).search_incremental_streaming,
         )
@@ -1088,9 +1088,10 @@ pub(super) async fn post_messages_inner(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = match state.cache_meter.as_ref() {
+    // Key 关闭缓存计量模拟时不查不写，输入全部计入 input_tokens。
+    let cache_usage = match state.cache_meter_for_key(key_ctx.key_id) {
         Some(cache) => {
-            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+            super::cache_metering::compute_cache_usage(&cache, &payload, key_ctx.key_id).await
         }
         None => super::cache_metering::CacheUsage::default(),
     };
@@ -2251,7 +2252,7 @@ pub(super) async fn post_messages_cc_inner(
             payload_stream,
             key_ctx.group.clone(),
             state.tool_compatibility_mode,
-            state.cache_meter.clone(),
+            state.cache_meter_for_key(key_ctx.key_id),
             key_ctx.key_id,
             state.protocol_compatibility_for_key(key_ctx.key_id).search_incremental_streaming,
         )
@@ -2334,9 +2335,10 @@ pub(super) async fn post_messages_cc_inner(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = match state.cache_meter.as_ref() {
+    // Key 关闭缓存计量模拟时不查不写，输入全部计入 input_tokens。
+    let cache_usage = match state.cache_meter_for_key(key_ctx.key_id) {
         Some(cache) => {
-            super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id).await
+            super::cache_metering::compute_cache_usage(&cache, &payload, key_ctx.key_id).await
         }
         None => super::cache_metering::CacheUsage::default(),
     };

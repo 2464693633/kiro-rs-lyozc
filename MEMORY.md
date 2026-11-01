@@ -33,6 +33,10 @@
   失效层级；`tool_choice` 和图片存在性只使 message 前缀失效。
 - 本地条目按客户端 Key 与 session 组合隔离；共享系统 Key 缺少 session 时禁用模拟，
   避免跨用户虚假命中。
+- 客户端 Key 的 `cacheMetering`（默认 true，仅为 false 时写入文件）可单独关闭模拟：
+  该 Key 不读写 CacheMeter、不计入 hit/miss 统计，输入全部计入 `input_tokens`，
+  上游真实用量仍优先。请求路径必须经 `AppState::cache_meter_for_key` 取计量器，
+  `cache_meter` 字段因此是私有的。
 - 代表性三轮夹具的热缓存读取率约 88.21%，仅用于验证目标工作负载；不得随机或
   硬编码制造 75%～90% 命中率。
 - 已知边界：尚未按模型执行 512～4096 token 的最小缓存阈值；并发请求中条目在

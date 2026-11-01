@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 📊 Key 级缓存计量开关
+
+- 客户端 Key 新增「模拟缓存计量」开关。关闭后该 Key 的请求不读写本地 CacheMeter，输入 Token 全部计入 `input_tokens`，`cache_creation_input_tokens` 与 `cache_read_input_tokens` 为 0；上游下发的真实用量仍原样上报。
+- 新建与已有 Key 默认开启，行为不变；全局 `cacheMeteringEnabled` 关闭时所有 Key 都不模拟，Key 级开关只在全局开启时有区别。
+- Admin API：`GET /api/admin/client-keys` 返回 `cacheMetering`，`POST /api/admin/client-keys` 与 `PUT /api/admin/client-keys/{id}` 接受可选的 `cacheMetering`。`client_api_keys.json` 只为关闭模拟的 Key 写入该字段，现有文件无需迁移。
+
 ## [0.9.3] - 2026-10-26
 
 主题：**全局代理热更新、模型过载隔离与 Sonnet 5.5 上下文计量修复**。本版汇总 `v0.9.2` 之后合并的 3 个 PR；没有新增配置项，现有配置、凭据与请求日志无需手动迁移。

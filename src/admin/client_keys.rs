@@ -61,6 +61,13 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+    /// 是否对该 Key 做本地 prompt cache 计量模拟。
+    ///
+    /// 关闭后该 Key 的请求不读写 CacheMeter，输入全部计入 `input_tokens`、缓存两项为 0；
+    /// 上游下发的真实用量仍原样上报。仅在全局 `cacheMeteringEnabled` 开启时有区别。
+    /// 老数据无此字段，默认开启。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub cache_metering: bool,
 }
 
 /// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
@@ -197,6 +204,7 @@ impl ClientKeyManager {
             max_credits: None,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
+            cache_metering: true,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -241,6 +249,7 @@ impl ClientKeyManager {
                     max_credits: None,
                     group: None,
                     is_system: true,
+                    cache_metering: true,
                 },
             );
             changed = true;
@@ -309,6 +318,32 @@ impl ClientKeyManager {
             self.save_locked(&inner);
         }
         updated
+    }
+
+    /// 开启或关闭单个 Key 的本地缓存计量模拟。返回 `false` 表示 Key 不存在。
+    pub fn set_cache_metering(&self, id: u64, enabled: bool) -> bool {
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                e.cache_metering = enabled;
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
+    /// 指定 Key 是否参与本地缓存计量模拟。Key 不存在时返回 `true`，保持既有行为。
+    pub fn cache_metering_enabled(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.cache_metering)
+            .unwrap_or(true)
     }
 
     pub fn update_meta(
@@ -560,6 +595,14 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// 生成 `sk-` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
     const CHARSET: &[u8] =
@@ -757,5 +800,58 @@ mod tests {
         mgr.sync_system_key("默认密钥".into(), None, "custom-api-key".into());
         assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
         assert!(mgr.is_system(0));
+    }
+
+    #[test]
+    fn cache_metering_defaults_on_for_legacy_and_unknown_keys() {
+        let legacy: Vec<ClientKey> = serde_json::from_str(
+            r#"[{"id":1,"key":"sk-legacy","name":"old","createdAt":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        assert!(legacy[0].cache_metering, "老数据缺字段时默认开启模拟");
+
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("new".into(), None, None);
+        assert!(entry.cache_metering);
+        assert!(mgr.cache_metering_enabled(entry.id));
+        assert!(mgr.cache_metering_enabled(999), "不存在的 Key 保持既有行为");
+        assert!(!mgr.set_cache_metering(999, false));
+    }
+
+    #[test]
+    fn cache_metering_off_persists_and_default_is_not_written() {
+        let path = std::env::temp_dir().join(format!(
+            "kiro-client-keys-{}-{}.json",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        let mgr = ClientKeyManager::load(&path).unwrap();
+        let simulated = mgr.create("simulated".into(), None, None);
+        let raw = mgr.create("raw".into(), None, None);
+        assert!(mgr.set_cache_metering(raw.id, false));
+
+        let json = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            json.matches("cacheMetering").count(),
+            1,
+            "只有关闭模拟的 Key 写出该字段: {json}"
+        );
+
+        let reloaded = ClientKeyManager::load(&path).unwrap();
+        assert!(reloaded.cache_metering_enabled(simulated.id));
+        assert!(!reloaded.cache_metering_enabled(raw.id));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn cache_metering_survives_system_key_sync() {
+        let mgr = ClientKeyManager::new();
+        mgr.sync_system_key("默认密钥".into(), None, "custom-a".into());
+        assert!(mgr.set_cache_metering(0, false));
+        mgr.sync_system_key("默认密钥".into(), None, "custom-b".into());
+        assert!(
+            !mgr.cache_metering_enabled(0),
+            "config.apiKey 变化只换明文，不应重置计量设置"
+        );
     }
 }

@@ -6,6 +6,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -18,6 +19,7 @@ import {
   useRotateClientKey, useSetClientKeyMaxCredits,
 } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
+import { useCacheMeteringConfig } from '@/hooks/use-credentials'
 import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
@@ -65,6 +67,16 @@ function CreditsUsage({ used, max }: { used: number; max?: number }) {
   )
 }
 
+/** 单个 Key 缓存计量开关的说明文案；全局开关关闭时 Key 级设置不生效 */
+function cacheMeteringHint(enabled: boolean, globalEnabled: boolean): string {
+  if (!globalEnabled) {
+    return '全局缓存计量模拟已在设置页关闭，所有 Key 都按无缓存上报，此项暂不生效。'
+  }
+  return enabled
+    ? '按客户端声明的 cache_control 断点模拟缓存读取与创建，与全局设置一致。'
+    : '不模拟缓存：输入 Token 全部计入 input tokens，缓存两项为 0。上游返回的真实用量仍原样上报。'
+}
+
 function formatRelative(ts?: string): string {
   if (!ts) return '从未使用'
   const t = new Date(ts).getTime()
@@ -87,12 +99,16 @@ export function ClientKeysPage() {
   const rotateKey = useRotateClientKey()
   const setMaxCredits = useSetClientKeyMaxCredits()
   const confirm = useConfirm()
+  // 全局开关未加载完时按开启处理，避免把每个 Key 都闪成「全局已关闭」
+  const { data: cacheMeteringConfig } = useCacheMeteringConfig()
+  const globalCacheMetering = cacheMeteringConfig?.enabled ?? true
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createGroup, setCreateGroup] = useState('')
   const [createMaxCredits, setCreateMaxCredits] = useState('')
+  const [createCacheMetering, setCreateCacheMetering] = useState(true)
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -102,6 +118,7 @@ export function ClientKeysPage() {
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
   const [editMaxCredits, setEditMaxCredits] = useState('')
+  const [editCacheMetering, setEditCacheMetering] = useState(true)
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -121,6 +138,7 @@ export function ClientKeysPage() {
         description: createDesc.trim() || undefined,
         group: createGroup.trim() || undefined,
         maxCredits: maxCredits ?? undefined,
+        cacheMetering: createCacheMetering,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -128,6 +146,7 @@ export function ClientKeysPage() {
       setCreateDesc('')
       setCreateGroup('')
       setCreateMaxCredits('')
+      setCreateCacheMetering(true)
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -210,6 +229,7 @@ export function ClientKeysPage() {
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
+    setEditCacheMetering(item.cacheMetering)
     setEditOpen(true)
   }
 
@@ -224,7 +244,12 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          cacheMetering: editCacheMetering,
+        },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
       const prev = editTarget.maxCredits ?? null
@@ -392,6 +417,22 @@ export function ClientKeysPage() {
           ),
       },
       {
+        id: 'cacheMetering',
+        header: '缓存计量',
+        cell: (k) =>
+          !globalCacheMetering ? (
+            <span className="text-[12px] text-muted-foreground" title="设置页的全局缓存计量模拟已关闭">
+              全局已关闭
+            </span>
+          ) : k.cacheMetering ? (
+            <Badge variant="outline">模拟</Badge>
+          ) : (
+            <Badge variant="secondary" title="输入全部计入 input tokens，缓存两项为 0">
+              无缓存
+            </Badge>
+          ),
+      },
+      {
         id: 'status',
         header: '状态',
         cell: (k) =>
@@ -435,7 +476,7 @@ export function ClientKeysPage() {
         ),
       },
     ],
-    [],
+    [globalCacheMetering],
   )
 
   const rowActions = (k: ClientKeyItem) => (
@@ -643,6 +684,23 @@ export function ClientKeysPage() {
                   累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
                 </p>
               </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <label htmlFor="create-cache-metering" className="text-[12px] text-muted-foreground">
+                    模拟缓存计量
+                  </label>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    {cacheMeteringHint(createCacheMetering, globalCacheMetering)}
+                  </p>
+                </div>
+                <Switch
+                  id="create-cache-metering"
+                  checked={createCacheMetering}
+                  onCheckedChange={setCreateCacheMetering}
+                  disabled={createKey.isPending}
+                  aria-label="模拟缓存计量"
+                />
+              </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                   取消
@@ -756,6 +814,23 @@ export function ClientKeysPage() {
                 <p className="mt-1 text-[11px] text-muted-foreground">
                   累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
                 </p>
+              </div>
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <label htmlFor="edit-cache-metering" className="text-[12px] text-muted-foreground">
+                    模拟缓存计量
+                  </label>
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    {cacheMeteringHint(editCacheMetering, globalCacheMetering)}
+                  </p>
+                </div>
+                <Switch
+                  id="edit-cache-metering"
+                  checked={editCacheMetering}
+                  onCheckedChange={setEditCacheMetering}
+                  disabled={updateKey.isPending || setMaxCredits.isPending}
+                  aria-label="模拟缓存计量"
+                />
               </div>
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

@@ -1062,6 +1062,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         max_credits: k.max_credits,
         group: k.group.clone(),
         is_system: k.is_system,
+        cache_metering: k.cache_metering,
     }
 }
 
@@ -1117,6 +1118,10 @@ pub async fn create_client_key(
     // 创建后若指定了上限则应用
     if let Some(v) = payload.max_credits {
         state.client_keys.set_max_credits(entry.id, Some(v));
+    }
+    // 新 Key 默认开启缓存计量模拟，只在显式关闭时写入
+    if payload.cache_metering == Some(false) {
+        state.client_keys.set_cache_metering(entry.id, false);
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1215,6 +1220,9 @@ pub async fn update_client_key(
         .client_keys
         .update_meta(id, payload.name, description, group)
     {
+        if let Some(enabled) = payload.cache_metering {
+            state.client_keys.set_cache_metering(id, enabled);
+        }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (

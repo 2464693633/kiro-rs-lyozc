@@ -48,8 +48,9 @@ pub struct AppState {
     pub usage_recorder: Option<SharedRecorder>,
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
-    /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
-    pub cache_meter: Option<SharedCacheMeter>,
+    /// 中转层缓存计量（基于 cache_control 断点的内存缓存）。
+    /// 私有：请求路径必须经 [`AppState::cache_meter_for_key`] 取用，才能遵守 Key 级开关。
+    cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
     /// Request-local accounting for internal identity checks and generation.
@@ -114,6 +115,20 @@ impl AppState {
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
         self.cache_meter = cache;
         self
+    }
+
+    /// 返回该 Key 应使用的缓存计量器。Key 关闭了缓存计量模拟时返回 `None`，
+    /// 调用方据此按无缓存上报：输入全部计入 `input_tokens`，不读写 CacheMeter。
+    pub fn cache_meter_for_key(&self, key_id: u64) -> Option<SharedCacheMeter> {
+        let enabled = self
+            .client_keys
+            .as_ref()
+            .is_none_or(|keys| keys.cache_metering_enabled(key_id));
+        if enabled {
+            self.cache_meter.clone()
+        } else {
+            None
+        }
     }
 
     /// 注入链路追踪存储

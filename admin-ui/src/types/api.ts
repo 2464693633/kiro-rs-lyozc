@@ -487,6 +487,8 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（由 config.json apiKey 同步，不可删除、可轮换） */
   isSystem: boolean
+  /** 是否做本地缓存计量模拟；false 时输入全部计入 input_tokens，缓存两项为 0 */
+  cacheMetering: boolean
 }
 
 export interface ClientKeysResponse {
@@ -500,6 +502,8 @@ export interface CreateClientKeyRequest {
   group?: string
   /** 积分使用上限（可选，不传表示不限制） */
   maxCredits?: number
+  /** 是否做本地缓存计量模拟（可选，不传表示开启） */
+  cacheMetering?: boolean
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -514,6 +518,8 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 是否做本地缓存计量模拟（不传表示不修改） */
+  cacheMetering?: boolean
 }
 
 // ============ 用量统计 ============

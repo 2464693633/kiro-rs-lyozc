@@ -87,6 +87,8 @@ enum Mode {
     RefusedWithInvalidTool,
     RefusedWithEmptyTool,
     RefusedBare,
+    /// 上游不下发 tokenUsage，只给 contextUsage：走本地计量回退路径。
+    ContextUsageOnly,
 }
 
 struct Fixture {
@@ -202,6 +204,11 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 return Response::builder().status(500).body(Body::from_stream(stream::pending::<Result<Bytes, Infallible>>())).unwrap();
             }
             if matches!(mode, Mode::Empty) { return Response::new(Body::empty()); }
+            if matches!(mode, Mode::ContextUsageOnly) {
+                let mut bytes = frame("assistantResponseEvent", json!({"content":"fixture answer"})).to_vec();
+                bytes.extend_from_slice(&frame("contextUsageEvent", json!({"contextUsagePercentage":5.0})));
+                return Response::new(Body::from(bytes));
+            }
             if let Mode::Signature { only } = mode {
                 let mut reasoning = json!({"signature":super::signature_compat::fixture_signature()});
                 if !only { reasoning["text"] = json!("fixture reasoning"); }
@@ -622,6 +629,108 @@ async fn gateway_plain_identity_does_not_intercept_normal_kiro_tasks_or_structur
     assert!(message["content"].to_string().contains("early content"));
     assert_eq!(f.calls.load(Ordering::Relaxed), 2);
     assert!(super::identity::local_response(&serde_json::from_value(identity_request(false)).unwrap(), true).is_none());
+}
+
+async fn client_key_usage(
+    state: &AppState,
+    key_id: u64,
+    payload: serde_json::Value,
+) -> serde_json::Value {
+    let key = KeyContext {
+        key_id,
+        group: None,
+        key_source: TraceKeySource::ClientKey,
+        client_ip: None,
+    };
+    let response = post_messages(
+        axum::extract::State(state.clone()),
+        Extension(key),
+        Json(serde_json::from_value(payload).unwrap()),
+    )
+    .await;
+    parsed_protocol_message(response, false).await["usage"].clone()
+}
+
+/// Key 级缓存计量开关：同一组请求，关闭模拟的 Key 只报 input，且不读写 CacheMeter。
+#[tokio::test]
+async fn gateway_key_without_cache_metering_reports_full_input() {
+    use crate::{admin::client_keys::ClientKeyManager, anthropic::cache_metering::CacheMeter};
+
+    let f = fixture(Mode::ContextUsageOnly).await;
+    let keys = Arc::new(ClientKeyManager::new());
+    let simulated = keys.create("simulated".into(), None, None);
+    let raw = keys.create("raw".into(), None, None);
+    assert!(keys.set_cache_metering(raw.id, false));
+    let meter = Arc::new(CacheMeter::new(None));
+    let state = f
+        .state
+        .clone()
+        .with_usage(Some(keys.clone()), None, None)
+        .with_cache_meter(Some(meter.clone()));
+
+    let system = "Stable workspace instructions for the gateway fixture. ".repeat(40);
+    let first = json!({"model":"claude-opus-5-5", "max_tokens":64, "stream":false,
+        "cache_control":{"type":"ephemeral"}, "system":[{"type":"text","text":system}],
+        "messages":[{"role":"user","content":"first question"}]});
+    let second = json!({"model":"claude-opus-5-5", "max_tokens":64, "stream":false,
+        "cache_control":{"type":"ephemeral"}, "system":[{"type":"text","text":system}],
+        "messages":[{"role":"user","content":"first question"},
+            {"role":"assistant","content":"fixture answer"},
+            {"role":"user","content":"second question"}]});
+
+    // 对照组：默认开启模拟的 Key 首轮写入、次轮读取
+    let sim_first = client_key_usage(&state, simulated.id, first.clone()).await;
+    let sim_second = client_key_usage(&state, simulated.id, second.clone()).await;
+    assert!(
+        sim_first["cache_creation_input_tokens"].as_i64().unwrap() > 0,
+        "{sim_first}"
+    );
+    assert!(
+        sim_second["cache_read_input_tokens"].as_i64().unwrap() > 0,
+        "{sim_second}"
+    );
+
+    let stats_before = meter.stats_total();
+    let entries_before = meter.len();
+    let raw_first = client_key_usage(&state, raw.id, first).await;
+    let raw_second = client_key_usage(&state, raw.id, second).await;
+    for usage in [&raw_first, &raw_second] {
+        assert_eq!(usage["cache_creation_input_tokens"], 0, "{usage}");
+        assert_eq!(usage["cache_read_input_tokens"], 0, "{usage}");
+    }
+    let total = |usage: &serde_json::Value| -> i64 {
+        [
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .into_iter()
+        .map(|field| usage[field].as_i64().unwrap())
+        .sum()
+    };
+    assert_eq!(
+        total(&raw_second),
+        total(&sim_second),
+        "关闭模拟只改拆分，不改总输入"
+    );
+    assert_eq!(raw_second["output_tokens"], sim_second["output_tokens"]);
+    assert_eq!(
+        meter.stats_total(),
+        stats_before,
+        "关闭模拟的 Key 不应计入命中统计"
+    );
+    assert_eq!(
+        meter.len(),
+        entries_before,
+        "关闭模拟的 Key 不应写入缓存条目"
+    );
+
+    let stored = keys.list().into_iter().find(|k| k.id == raw.id).unwrap();
+    assert_eq!(
+        stored.total_cache_creation_tokens + stored.total_cache_read_tokens,
+        0
+    );
+    assert!(stored.total_input_tokens > 0);
 }
 
 fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::UsageAggregator> {

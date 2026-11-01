@@ -722,6 +722,10 @@ data/
 - `cache_read_input_tokens`
 - `output_tokens`
 
+模拟可以按客户端 Key 关闭：在管理面板「客户端 Key」页编辑 Key，关掉「模拟缓存计量」。
+关闭后该 Key 不读写 CacheMeter，输入全部计入 `input_tokens`，缓存两项为 0，
+上游返回的真实用量仍原样上报。全局 `cacheMeteringEnabled` 关闭时所有 Key 都不模拟。
+
 ### Prompt cache 计量容量选型
 
 `CacheMeter` 是一张定容表。写入速率为 `W` 条/秒时，一条 entry 的实际存活期是
