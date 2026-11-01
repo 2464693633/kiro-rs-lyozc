@@ -190,6 +190,7 @@ const DEV_PREVIEW_CREDENTIAL: CredentialStatusItem = {
   subscriptionTitle: "KIRO PRO",
   maskedApiKey: "ksk_…demo",
   successCount: 1_284,
+  totalCredits: 12.345678,
   lastUsedAt: new Date().toISOString(),
   hasProxy: true,
   proxyUrl: "http://demo:demo@127.0.0.1:8080",

@@ -893,6 +893,7 @@ impl AdminService {
                     email: entry.email,
                     subscription_title: entry.subscription_title,
                     success_count: entry.success_count,
+                    total_credits: entry.total_credits,
                     last_used_at: entry.last_used_at.clone(),
                     has_proxy: entry.has_proxy,
                     proxy_url: entry.proxy_url,
@@ -1210,12 +1211,15 @@ impl AdminService {
         .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
 
         let started = std::time::Instant::now();
-        let (credential_id, bytes) =
+        let (credential_id, bytes, mut credit_guard) =
             tokio::time::timeout(std::time::Duration::from_secs(90), async {
                 let call = provider.call_api(&body, None, None).await?;
                 let credential_id = call.credential_id;
+                let credit_guard = crate::kiro::credit_usage::CreditUsageGuard::new(
+                    Some(self.token_manager.clone()), credential_id,
+                );
                 let bytes = call.response.bytes().await?;
-                Ok::<_, anyhow::Error>((credential_id, bytes))
+                Ok::<_, anyhow::Error>((credential_id, bytes, credit_guard))
             })
             .await
             .map_err(|_| AdminServiceError::UpstreamError("模型测试请求超时".to_string()))?
@@ -1239,7 +1243,9 @@ impl AdminService {
             match event {
                 Event::AssistantResponse(response) => response_text.push_str(&response.content),
                 Event::Metering(metering) => {
-                    credit_usage += metering.usage;
+                    credit_guard.observe(&metering);
+                    let Some(amount) = metering.credits() else { continue; };
+                    credit_usage += amount;
                     if !metering.unit.is_empty() {
                         credit_unit = Some(metering.unit);
                     }

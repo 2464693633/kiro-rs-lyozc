@@ -30,6 +30,14 @@ pub struct MeteringEvent {
     pub usage: f64,
 }
 
+impl MeteringEvent {
+    /// Only finite, nonnegative amounts in credit units may enter credit totals.
+    pub fn credits(&self) -> Option<f64> {
+        (self.unit.eq_ignore_ascii_case("credit") && self.usage.is_finite() && self.usage >= 0.0)
+            .then_some(self.usage)
+    }
+}
+
 impl EventPayload for MeteringEvent {
     fn from_frame(frame: &Frame) -> ParseResult<Self> {
         frame.payload_as_json()

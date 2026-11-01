@@ -53,6 +53,7 @@ pub(crate) struct UsageRecordHook {
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
+    pub credit_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
@@ -60,11 +61,16 @@ pub(crate) struct UsageRecordHook {
 }
 
 impl UsageRecordHook {
+    pub(crate) fn credit_guard(&self, credential_id: u64) -> crate::kiro::credit_usage::CreditUsageGuard {
+        crate::kiro::credit_usage::CreditUsageGuard::new(self.credit_manager.clone(), credential_id)
+    }
+
     pub fn from_state(state: &AppState, key_id: u64, model: String) -> Self {
         Self {
             recorder: state.usage_recorder.clone(),
             aggregator: state.usage_aggregator.clone(),
             client_keys: state.client_keys.clone(),
+            credit_manager: state.kiro_provider.as_ref().map(|provider| provider.token_manager().clone()),
             key_id,
             model,
             started_at: Instant::now(),
@@ -1377,6 +1383,7 @@ struct StreamSettlement {
     usage: TraceUsage,
     sent_bytes: u64,
     settled: bool,
+    credit_guard: crate::kiro::credit_usage::CreditUsageGuard,
 }
 
 impl StreamSettlement {
@@ -1411,6 +1418,8 @@ impl StreamSettlement {
         tracer: std::sync::Arc<RequestTracer>,
         ctx: &StreamContext,
     ) -> Self {
+        let mut credit_guard = hook.credit_guard(credential_id);
+        credit_guard.set_usage((ctx.metering.is_some() || ctx.credits > 0.0).then_some(ctx.credits));
         Self {
             hook,
             credential_id,
@@ -1418,11 +1427,13 @@ impl StreamSettlement {
             usage: stream_trace_usage(ctx),
             sent_bytes: 0,
             settled: false,
+            credit_guard,
         }
     }
 
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
+        self.credit_guard.set_usage((ctx.metering.is_some() || ctx.credits > 0.0).then_some(ctx.credits));
         self.sent_bytes = sent_bytes;
     }
 
@@ -1578,15 +1589,16 @@ fn non_stream_read_failure(
     tracer: &RequestTracer,
     credential_id: u64,
     input_tokens: i32,
+    credits: f64,
     error: &str,
 ) -> NonStreamExecutionError {
-    hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+    hook.record(credential_id, input_tokens, 0, 0, 0, credits, "error");
     tracer.finalize(
         "interrupted",
         Some(outcome::STREAM_INTERRUPTED),
         Some(error),
         None,
-        TraceUsage::zero(),
+        TraceUsage { credits, ..TraceUsage::zero() },
     );
     NonStreamExecutionError::Response(
         (
@@ -1664,6 +1676,7 @@ async fn execute_non_stream_request_with_format(
     let credential_id = call_result.credential_id;
 
     let mut body_stream = response.bytes_stream();
+    let mut credit_guard = hook.credit_guard(credential_id);
     let mut decoder = EventStreamDecoder::new();
     let mut received_data = false;
 
@@ -1703,6 +1716,7 @@ async fn execute_non_stream_request_with_format(
                     &tracer,
                     credential_id,
                     input_tokens,
+                    credits,
                     &format!("{:#}", anyhow::Error::new(e)),
                 ));
             }
@@ -1714,6 +1728,7 @@ async fn execute_non_stream_request_with_format(
                 &tracer,
                 credential_id,
                 input_tokens,
+                credits,
                 &e.to_string(),
             ));
         }
@@ -1728,6 +1743,7 @@ async fn execute_non_stream_request_with_format(
                                 &tracer,
                                 credential_id,
                                 input_tokens,
+                                credits,
                                 &e.to_string(),
                             ));
                         }
@@ -1738,6 +1754,7 @@ async fn execute_non_stream_request_with_format(
                             &tracer,
                             credential_id,
                             input_tokens,
+                            credits,
                             &error,
                         ));
                     }
@@ -1812,8 +1829,10 @@ async fn execute_non_stream_request_with_format(
                                 );
                             }
                             Event::Metering(event_metering) => {
+                                credit_guard.observe(&event_metering);
+                                let Some(amount) = event_metering.credits() else { continue; };
                                 // 上游只下发 credit；token / cache 字段不存在
-                                credits += event_metering.usage;
+                                credits += amount;
                                 tracing::debug!(
                                     usage = event_metering.usage,
                                     unit = %event_metering.unit,
@@ -1837,6 +1856,7 @@ async fn execute_non_stream_request_with_format(
                         &tracer,
                         credential_id,
                         input_tokens,
+                        credits,
                         &e.to_string(),
                     ));
                 }
@@ -1850,6 +1870,7 @@ async fn execute_non_stream_request_with_format(
             &tracer,
             credential_id,
             input_tokens,
+            credits,
             if received_data { "Upstream ended with an incomplete event frame" } else { "Upstream returned an empty event stream" },
         ));
     }
@@ -1911,7 +1932,7 @@ async fn execute_non_stream_request_with_format(
             );
         } else {
             // metadata 缺失时保留原有错误口径，不把不完整工具输出估算成已消费量。
-            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            hook.record(credential_id, input_tokens, 0, 0, 0, credits, "error");
             tracer.finalize(
                 "error",
                 Some(outcome::BAD_REQUEST),
@@ -2473,7 +2494,13 @@ mod tests {
             None,
             Some(aggregator.clone()),
         );
-        let hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        let manager = std::sync::Arc::new(crate::kiro::token_manager::MultiTokenManager::new(
+            crate::model::config::Config::default(),
+            vec![crate::kiro::model::credentials::KiroCredentials { id: Some(42), ..Default::default() }],
+            None, None, false,
+        ).unwrap());
+        let mut hook = UsageRecordHook::from_state(&state, 0, "test-model".to_string());
+        hook.credit_manager = Some(manager.clone());
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -2507,6 +2534,7 @@ mod tests {
         assert_eq!(overview.today_input_tokens, 11);
         assert_eq!(overview.today_output_tokens, 7);
         assert_eq!(overview.today_credits, 0.5);
+        assert_eq!(manager.snapshot().entries[0].total_credits, 0.5);
     }
 
     /// CC 实时流在客户端断开时：Drop 必须记账 + 落 trace，

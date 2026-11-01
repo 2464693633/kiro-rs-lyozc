@@ -142,6 +142,13 @@ function formatNumber(n: number): string {
   });
 }
 
+function formatProjectCredits(value: number | undefined): string {
+  return (value ?? 0).toLocaleString("en-US", {
+    minimumFractionDigits: 3,
+    maximumFractionDigits: 6,
+  });
+}
+
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
   return new Date(ts * 1000).toLocaleString("zh-CN", {
@@ -1038,6 +1045,10 @@ function CredentialCardImpl({
             余额未查询
           </div>
         )}
+        <div className="mt-1 flex items-center justify-between gap-1 text-[10px] text-muted-foreground">
+          <span>本项目消耗积分</span>
+          <span className="font-mono tabular-nums text-foreground">{formatProjectCredits(credential.totalCredits)}</span>
+        </div>
       </div>
 
       <div className="hidden w-28 shrink-0 truncate text-right text-xs md:block">
@@ -1377,6 +1388,15 @@ function CredentialCardImpl({
                   </Button>
                 </div>
               )}
+              <div
+                className="flex items-center justify-between gap-2 border-t border-border/30 pt-2 text-[12px]"
+                title="按每次请求上游返回的积分累加，从启用本功能后开始统计。"
+              >
+                <span className="text-muted-foreground">本项目消耗积分</span>
+                <span className="font-mono font-semibold tabular-nums text-foreground">
+                  {formatProjectCredits(credential.totalCredits)}
+                </span>
+              </div>
             </div>
 
             {/* Connection Details 手风琴展开面板 */}

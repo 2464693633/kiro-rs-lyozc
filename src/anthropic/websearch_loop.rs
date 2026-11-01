@@ -361,6 +361,7 @@ async fn decode_round(
     tool_name_map: &std::collections::HashMap<String, String>,
     tracer: &RequestTracer,
     mut emitter: Option<&mut WebSearchSseEmitter>,
+    credit_guard: &mut crate::kiro::credit_usage::CreditUsageGuard,
 ) -> RoundOutcome {
     let mut body_stream = response.bytes_stream();
     let mut decoder = EventStreamDecoder::new();
@@ -446,7 +447,9 @@ async fn decode_round(
                     }
                 }
                 Event::Metering(m) => {
-                    credits += m.usage;
+                    credit_guard.observe(&m);
+                    let Some(amount) = m.credits() else { continue; };
+                    credits += amount;
                     last_metering = Some(m.clone());
                 }
                 Event::Exception { exception_type, .. } => {
@@ -525,6 +528,7 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
     emitter: Option<&mut WebSearchSseEmitter>,
+    hook: &UsageRecordHook,
 ) -> Result<(RoundOutcome, u64), RoundFailure> {
     let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
         Ok(c) => c,
@@ -609,12 +613,14 @@ async fn run_round(
     // 读取 body 前标记，确保该窗口取消时不会被 RequestTracer::Drop 误归为等头中断。
     tracer.mark_upstream_headers_received();
     let credential_id = call_result.credential_id;
+    let mut credit_guard = hook.credit_guard(credential_id);
     let mut outcome = decode_round(
         call_result.response,
         &payload.model,
         &conversion.tool_name_map,
         tracer,
         emitter,
+        &mut credit_guard,
     )
     .await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -1729,6 +1735,7 @@ async fn run_web_search_loop_inner(
                 } else {
                     None
                 },
+                &settlement.hook,
             )
             .await
             {
@@ -2788,6 +2795,7 @@ mod tests {
             recorder: None,
             aggregator: Some(aggregator.clone()),
             client_keys: None,
+            credit_manager: None,
             key_id: 0,
             model: "test-model".to_string(),
             started_at: std::time::Instant::now(),
@@ -3971,6 +3979,7 @@ mod tests {
             recorder: None,
             aggregator: None,
             client_keys: None,
+            credit_manager: None,
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),
@@ -4090,6 +4099,7 @@ mod tests {
             recorder: None,
             aggregator: None,
             client_keys: None,
+            credit_manager: None,
             key_id: 0,
             model: "gpt-5.6-sol".to_string(),
             started_at: std::time::Instant::now(),

@@ -86,6 +86,8 @@ export interface CredentialStatusItem {
   apiKeyHash?: string
   maskedApiKey?: string
   successCount: number
+  /** 此凭据通过当前实例累计消耗的积分，独立于账号余额。 */
+  totalCredits: number
   lastUsedAt: string | null
   hasProxy: boolean
   proxyUrl?: string

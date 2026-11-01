@@ -42,6 +42,7 @@ use std::{
 #[derive(Clone, Copy)]
 enum Mode {
     Normal(Duration),
+    Metered { incomplete: bool },
     SemanticIdentity {
         classification: &'static str,
         reply: &'static str,
@@ -186,6 +187,16 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 };
                 let mut bytes = frame("assistantResponseEvent", json!({"content":text})).to_vec();
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                if matches!(mode, Mode::Metered { .. }) {
+                    bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.125})));
+                }
+                return Response::new(Body::from(bytes));
+            }
+            if let Mode::Metered { incomplete } = mode {
+                let mut bytes = frame("assistantResponseEvent", json!({"content":"metered answer"})).to_vec();
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17}})));
+                bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.125})));
+                if incomplete { bytes.extend_from_slice(&[0, 1]); }
                 return Response::new(Body::from(bytes));
             }
             if let Mode::SemanticIdentity { reply, tool, .. } = mode {
@@ -396,6 +407,68 @@ fn key() -> KeyContext {
         client_ip: None,
     }
 }
+
+fn project_credits(fixture: &Fixture) -> f64 {
+    fixture.state.kiro_provider.as_ref().unwrap().token_manager().snapshot().entries[0].total_credits
+}
+
+#[tokio::test]
+async fn gateway_credential_credit_usage_covers_all_api_formats_once() {
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::Metered { incomplete: false }).await;
+            let response = request(f.state.clone(), endpoint, streaming).await;
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint} stream={streaming}");
+            to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(project_credits(&f), 0.125, "{endpoint} stream={streaming}");
+            assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_credential_credit_usage_covers_the_server_tool_path() {
+    for streaming in [false, true] {
+        let f = fixture(Mode::Metered { incomplete: false }).await;
+        let response = compatibility_request(f.state.clone(), false, json!({
+            "model":"gpt-5.6-sol","max_tokens":256,"stream":streaming,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"type":"web_search_20250305","name":"web_search"}]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(project_credits(&f), 0.125);
+        assert_eq!(f.calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[tokio::test]
+async fn gateway_credential_credit_usage_keeps_consumption_before_an_invalid_tail() {
+    for streaming in [false, true] {
+        let f = fixture(Mode::Metered { incomplete: true }).await;
+        let response = request(f.state.clone(), "messages", streaming).await;
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("error"));
+        assert_eq!(project_credits(&f), 0.125);
+    }
+}
+
+#[tokio::test]
+async fn gateway_credential_credit_usage_counts_internal_calls_without_counting_the_aggregate_again() {
+    for streaming in [false, true] {
+        let mut f = fixture(Mode::Metered { incomplete: false }).await;
+        enable_semantic_identity(&mut f);
+        let response = compatibility_request(f.state.clone(), false, json!({
+            "model":"claude-opus-5-5","max_tokens":256,"stream":streaming,
+            "messages":[{"role":"user","content":"普通编程任务"}]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(f.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(project_credits(&f), 0.25);
+    }
+}
+
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     let req = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "stream": streaming, "messages": [{"role": "user", "content": "hello"}], "input": [{"role":"user", "content":"hello"}]});
     if endpoint == "chat" {

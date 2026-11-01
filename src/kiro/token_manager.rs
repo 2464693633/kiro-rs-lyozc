@@ -980,6 +980,8 @@ struct CredentialEntry {
     disabled_reason: Option<DisabledReason>,
     /// API 调用成功次数
     success_count: u64,
+    /// 本实例收到上游 meteringEvent 后累计的积分，不使用余额差额推算。
+    total_credits: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     last_used_at: Option<String>,
     /// 临时冷却到期时间（账号级 429 风控触发后短期跳过该凭据）
@@ -1100,6 +1102,8 @@ impl CredentialEntry {
 struct StatsEntry {
     success_count: u64,
     #[serde(default)]
+    total_credits: f64,
+    #[serde(default)]
     total_failure_count: u64,
     last_used_at: Option<String>,
 }
@@ -1146,6 +1150,8 @@ pub struct CredentialEntrySnapshot {
     pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
+    /// 本凭据通过当前实例累计消耗的上游积分。
+    pub total_credits: f64,
     /// 最后一次 API 调用时间（RFC3339 格式）
     pub last_used_at: Option<String>,
     /// 是否配置了凭据级代理
@@ -1297,6 +1303,8 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 串行化统计快照写盘，避免并发请求用旧快照覆盖新的积分累计。
+    stats_save_lock: Mutex<()>,
     /// 每个凭据最后一次成功加载的完整模型列表。
     model_cache: Mutex<HashMap<u64, ModelCacheEntry>>,
     /// 每凭据单飞锁，避免并发模型列表请求重复访问上游。
@@ -1463,6 +1471,7 @@ impl MultiTokenManager {
                     disabled: cred.disabled, // 从配置文件读取 disabled 状态
                     disabled_reason,
                     success_count: 0,
+                    total_credits: 0.0,
                     last_used_at: None,
                     throttled_until: None,
                     rpm_window: VecDeque::new(),
@@ -1563,6 +1572,7 @@ impl MultiTokenManager {
             quota_reset_recovery_enabled: AtomicBool::new(quota_reset_recovery_enabled),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            stats_save_lock: Mutex::new(()),
             model_cache: Mutex::new(HashMap::new()),
             model_refresh_locks: Mutex::new(HashMap::new()),
             model_refresh_semaphore: Semaphore::new(4),
@@ -2700,6 +2710,11 @@ impl MultiTokenManager {
         for entry in entries.iter_mut() {
             if let Some(s) = stats.get(&entry.id.to_string()) {
                 entry.success_count = s.success_count;
+                entry.total_credits = if s.total_credits.is_finite() && s.total_credits >= 0.0 {
+                    s.total_credits
+                } else {
+                    0.0
+                };
                 entry.total_failure_count = s.total_failure_count;
                 entry.last_used_at = s.last_used_at.clone();
             }
@@ -2711,6 +2726,7 @@ impl MultiTokenManager {
 
     /// 将当前统计数据持久化到磁盘
     fn save_stats(&self) {
+        let _save_guard = self.stats_save_lock.lock();
         let path = match self.stats_path() {
             Some(p) => p,
             None => return,
@@ -2725,6 +2741,7 @@ impl MultiTokenManager {
                         e.id.to_string(),
                         StatsEntry {
                             success_count: e.success_count,
+                            total_credits: e.total_credits,
                             total_failure_count: e.total_failure_count,
                             last_used_at: e.last_used_at.clone(),
                         },
@@ -2761,6 +2778,27 @@ impl MultiTokenManager {
         if should_flush {
             self.save_stats();
         }
+    }
+
+    /// 只累加本实例实际收到的积分。与账号余额、成功计数和模拟 Token 缓存独立。
+    pub(crate) fn record_credit_usage(&self, id: u64, credits: f64) {
+        if !credits.is_finite() || credits <= 0.0 {
+            return;
+        }
+        {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
+                return;
+            };
+            let total = entry.total_credits + credits;
+            if !total.is_finite() {
+                tracing::warn!(id, "忽略超出范围的积分累计");
+                return;
+            }
+            entry.total_credits = total;
+        }
+        self.stats_dirty.store(true, Ordering::Relaxed);
+        self.save_stats();
     }
 
     /// 报告指定凭据 API 调用成功
@@ -3366,6 +3404,7 @@ impl MultiTokenManager {
                     email: e.credentials.email.clone(),
                     subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
+                    total_credits: e.total_credits,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
                     proxy_url: e.credentials.proxy_url.clone(),
@@ -4200,6 +4239,7 @@ impl MultiTokenManager {
                 disabled: false,
                 disabled_reason: None,
                 success_count: 0,
+                total_credits: 0.0,
                 last_used_at: None,
                 throttled_until: None,
                 rpm_window: VecDeque::new(),
@@ -5710,6 +5750,53 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("credentials.json");
         (dir, path)
+    }
+
+    #[test]
+    fn credit_usage_persists_and_success_reset_does_not_clear_it() {
+        let (dir, path) = issue51_credentials_path("credit_usage");
+        let credentials = vec![KiroCredentials { id: Some(1), ..KiroCredentials::default() }];
+        let manager = MultiTokenManager::new(Config::default(), credentials.clone(), None, Some(path.clone()), false).unwrap();
+        manager.record_credit_usage(1, 0.125);
+        manager.record_credit_usage(1, 0.25);
+        manager.record_credit_usage(1, -1.0);
+        manager.record_credit_usage(1, f64::NAN);
+        manager.record_credit_usage(999, 100.0);
+        manager.reset_success_count(Some(1)).unwrap();
+        assert_eq!(manager.snapshot().entries[0].total_credits, 0.375);
+        drop(manager);
+        let restored = MultiTokenManager::new(Config::default(), credentials, None, Some(path), false).unwrap();
+        assert_eq!(restored.snapshot().entries[0].total_credits, 0.375);
+        drop(restored);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credit_usage_concurrent_updates_do_not_overwrite_newer_totals() {
+        let (dir, path) = issue51_credentials_path("credit_usage_concurrent");
+        let credentials = vec![KiroCredentials { id: Some(1), ..KiroCredentials::default() }];
+        let manager = Arc::new(MultiTokenManager::new(Config::default(), credentials.clone(), None, Some(path.clone()), false).unwrap());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let manager = manager.clone();
+                scope.spawn(move || {
+                    for _ in 0..10 { manager.record_credit_usage(1, 0.125); }
+                });
+            }
+        });
+        assert_eq!(manager.snapshot().entries[0].total_credits, 10.0);
+        drop(manager);
+        let restored = MultiTokenManager::new(Config::default(), credentials, None, Some(path), false).unwrap();
+        assert_eq!(restored.snapshot().entries[0].total_credits, 10.0);
+        drop(restored);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credit_usage_legacy_stats_start_at_zero_without_balance_estimates() {
+        let old: StatsEntry = serde_json::from_str(r#"{"success_count":88,"last_used_at":null}"#).unwrap();
+        assert_eq!(old.total_credits, 0.0);
+        assert_eq!(old.success_count, 88);
     }
 
     #[test]

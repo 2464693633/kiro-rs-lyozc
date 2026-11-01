@@ -1685,8 +1685,9 @@ impl StreamContext {
                 Vec::new()
             }
             Event::Metering(metering) => {
+                let Some(amount) = metering.credits() else { return Vec::new(); };
                 // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
-                self.credits += metering.usage;
+                self.credits += amount;
                 tracing::debug!(
                     usage = metering.usage,
                     unit = %metering.unit,
