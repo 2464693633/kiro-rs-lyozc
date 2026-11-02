@@ -38,6 +38,7 @@ mod responses;
 mod router;
 pub(crate) mod search_context;
 mod signature_compat;
+mod structured_rewrite;
 pub mod stream;
 mod structured_output;
 pub mod types;

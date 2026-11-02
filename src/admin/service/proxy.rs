@@ -41,6 +41,7 @@ fn entry_view(entry: ProxyEntry, credential_count: u32) -> ProxyPoolEntry {
         last_checked_at: entry.last_checked_at,
         consecutive_failures: entry.consecutive_failures,
         auto_disabled: entry.auto_disabled,
+        auto_detected: entry.auto_detected,
     }
 }
 
@@ -228,11 +229,16 @@ impl AdminService {
 
     /// 触发全部代理的健康检查
     pub async fn check_all_proxies(&self) -> ProxyCheckAllResponse {
+        let detected = self.detect_credential_proxies();
         let summary = self.proxy_pool.check_all().await;
+        let rotation = self.rotate_unavailable_credential_proxies();
         ProxyCheckAllResponse {
             healthy: summary.healthy,
             unhealthy: summary.unhealthy,
             auto_disabled: summary.auto_disabled,
+            auto_recovered: summary.auto_recovered,
+            detected,
+            rotation,
         }
     }
 

@@ -25,6 +25,7 @@ import { useGlobalProxy } from '@/hooks/use-credentials'
 import { cn, extractErrorMessage, maskProxyUrl } from '@/lib/utils'
 import { PROXY_PROTOCOLS, ProxyHealthBadge, formatLocation } from '@/components/proxy-format'
 import { CreateProxyDialog, EditProxyDialog } from '@/components/proxy-form-dialog'
+import { ProxyFailoverPanel } from '@/components/proxy-failover-panel'
 import type { ProxyPoolEntry } from '@/types/api'
 
 type StatusFilter = 'all' | 'healthy' | 'unhealthy' | 'unknown' | 'disabled'
@@ -121,7 +122,10 @@ export function ProxiesPage() {
     mutationFn: () => checkAllProxies(),
     onSuccess: (res) => {
       const disabled = res.autoDisabled > 0 ? `，${res.autoDisabled} 个连续失败被自动禁用` : ''
-      toast.success(`检测完成：可用 ${res.healthy}，异常 ${res.unhealthy}${disabled}`)
+      const recovered = res.autoRecovered > 0 ? `，恢复 ${res.autoRecovered} 个` : ''
+      const rotated = res.rotation?.rotated > 0 ? `，轮换 ${res.rotation.rotated} 个账号` : ''
+      toast.success(`检测完成：可用 ${res.healthy}，异常 ${res.unhealthy}${disabled}${recovered}${rotated}`)
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
     onError: (err) => toast.error(`检测失败: ${extractErrorMessage(err)}`),
     onSettled: refreshPool,
@@ -133,7 +137,7 @@ export function ProxiesPage() {
       if (p.enabled) {
         toast.success(
           p.credentialCount > 0
-            ? `已禁用 ${p.name}；已关联的 ${p.credentialCount} 个账号继续使用它`
+            ? `已禁用 ${p.name}；自动轮换开启时，关联的 ${p.credentialCount} 个账号会在巡检后切换`
             : `已禁用 ${p.name}`,
         )
       } else {
@@ -224,6 +228,7 @@ export function ProxiesPage() {
             {isGlobal(p) && (
               <span className="shrink-0 rounded bg-primary/10 px-1.5 text-[11px] text-primary">全局</span>
             )}
+            {p.autoDetected && <span className="text-[11px] text-muted-foreground">自动发现</span>}
           </div>
           <div className="console-num text-[11px] text-muted-foreground">#{p.id}</div>
         </div>
@@ -293,7 +298,7 @@ export function ProxiesPage() {
           {p.autoDisabled && (
             <span
               className="text-[11px] text-destructive"
-              title="连续检测失败后被自动禁用；重新检测通过后需手动启用"
+              title="连续检测失败后被自动禁用；恢复连通后会自动重新启用"
             >
               自动禁用
             </span>
@@ -367,7 +372,7 @@ export function ProxiesPage() {
               variant="outline"
               onClick={() => testAll.mutate()}
               disabled={testAll.isPending || counts.all === 0}
-              title="检测所有已启用的代理"
+              title="检测已启用和被自动禁用的代理，并按设置执行故障转移"
             >
               {testAll.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Activity className="h-3.5 w-3.5" />}
               全部检测
@@ -391,6 +396,7 @@ export function ProxiesPage() {
       />
 
       <GlobalProxyNote url={globalProxy?.proxyUrl ?? null} />
+      <ProxyFailoverPanel />
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <StatusStrip segments={segments} />

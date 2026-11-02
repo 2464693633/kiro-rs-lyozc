@@ -57,6 +57,7 @@ export function EditCredentialDialog({
   const [proxyChoice, setProxyChoice] = useState<ProxyChoice>(() => proxyChoiceOf(credential))
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  const [loadFactor, setLoadFactor] = useState<number>(credential.loadFactor ?? 10)
   const [metadata, setMetadata] = useState<CredentialMetadata>(
     { ...metadataDefaults(metadataSchema), ...metadataValues(credential.metadata) },
   )
@@ -70,6 +71,7 @@ export function EditCredentialDialog({
       setProxyChoice(proxyChoiceOf(credential))
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setLoadFactor(credential.loadFactor ?? 10)
       setMetadata({
         ...metadataDefaults(metadataSchema),
         ...metadataValues(credential.metadata),
@@ -91,6 +93,8 @@ export function EditCredentialDialog({
           ...(sameProxyChoice(proxyChoiceOf(credential), proxyChoice) ? {} : proxyRequestFields(proxyChoice)),
           groups: groups,
           sourceChannel: sourceChannel,
+          loadFactor:
+            Number.isFinite(loadFactor) && loadFactor >= 1 ? loadFactor : 10,
           metadata,
         },
       },
@@ -192,7 +196,28 @@ export function EditCredentialDialog({
                   </p>
                 </div>
 
-                {/* 代理 */}
+                {/* 负载因子（均衡模式下的调度权重） */}
+                <div className="space-y-2">
+                  <label htmlFor="loadFactor" className="text-sm font-medium">
+                    负载因子（调度权重）
+                  </label>
+                  <Input
+                    id="loadFactor"
+                    type="number"
+                    min="1"
+                    placeholder="默认 10"
+                    value={loadFactor}
+                    onChange={(e) =>
+                      setLoadFactor(Math.max(1, parseInt(e.target.value, 10) || 10))
+                    }
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    均衡负载模式下按该权重平滑轮询，数值越大被调度频次越高，默认为 10。
+                  </p>
+                </div>
+
+                {/* 代理配置 */}
                 <div className="space-y-2">
                   <label className="text-sm font-medium">代理</label>
                   <ProxySelector value={proxyChoice} onChange={setProxyChoice} disabled={isPending} />

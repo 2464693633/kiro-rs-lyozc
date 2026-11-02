@@ -202,7 +202,7 @@ impl AdminService {
         if fixes.is_empty() {
             return;
         }
-        match self.token_manager.set_credential_proxies(&fixes) {
+        match self.token_manager.align_credential_proxies(&fixes) {
             Ok(_) => tracing::info!(
                 "账号代理已与 IP 管理对齐：关联 {} 个，同步 {} 个，共更新 {} 个账号",
                 linked,

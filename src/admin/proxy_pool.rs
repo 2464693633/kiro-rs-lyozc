@@ -7,6 +7,7 @@
 //! 地理位置与延迟；连续探测失败达阈值的代理会被自动禁用。
 
 mod endpoint;
+mod failover;
 mod probe;
 mod storage;
 #[cfg(test)]
@@ -19,6 +20,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub use endpoint::ProxyEndpoint;
+pub use failover::ProxyAvailability;
 use storage::write_file;
 
 use crate::model::config::TlsBackend;
@@ -79,6 +81,9 @@ pub struct ProxyEntry {
     /// 是否由健康检查自动禁用（区别于用户手动禁用）
     #[serde(default)]
     pub auto_disabled: bool,
+    /// 由运行中的凭据或全局配置自动发现，而非手动新增。
+    #[serde(default)]
+    pub auto_detected: bool,
     /// 最近一次探测失败的原因（已抹掉密码）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -102,6 +107,7 @@ fn fresh_entry(id: u64, name: String, endpoint: ProxyEndpoint) -> ProxyEntry {
         last_checked_at: None,
         consecutive_failures: 0,
         auto_disabled: false,
+        auto_detected: false,
         last_error: None,
         exit: None,
     }
@@ -116,6 +122,7 @@ pub struct CheckSummary {
     pub unhealthy: usize,
     /// 本轮新增的自动禁用数
     pub auto_disabled: usize,
+    pub auto_recovered: usize,
 }
 
 /// 新建代理的输入；名称为空时使用 `主机:端口`

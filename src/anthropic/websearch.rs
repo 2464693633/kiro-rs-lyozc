@@ -316,48 +316,17 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 2. content_block_start (text - 搜索决策说明, index 0)
-    let decision_text = format!("I'll search for \"{}\".", query);
-    events.push(SseEvent::new(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": {
-                "type": "text",
-                "text": ""
-            }
-        }),
-    ));
+    // 这条路径没有调用模型，回包里的文字全是网关生成的；不替模型写
+    // "I'll search for …" 这类它没说过的话，只给工具调用、结果和结果列表。
 
-    events.push(SseEvent::new(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": {
-                "type": "text_delta",
-                "text": decision_text
-            }
-        }),
-    ));
-
-    events.push(SseEvent::new(
-        "content_block_stop",
-        json!({
-            "type": "content_block_stop",
-            "index": 0
-        }),
-    ));
-
-    // 3. content_block_start (server_tool_use, index 1)
+    // 2. content_block_start (server_tool_use, index 0)
     // server_tool_use 是服务端工具，input 在 content_block_start 中一次性完整发送，
     // 不像客户端 tool_use 需要通过 input_json_delta 增量传输。
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 1,
+            "index": 0,
             "content_block": {
                 "id": tool_use_id,
                 "type": "server_tool_use",
@@ -367,16 +336,16 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 4. content_block_stop (server_tool_use)
+    // 3. content_block_stop (server_tool_use)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 1
+            "index": 0
         }),
     ));
 
-    // 5. content_block_start (web_search_tool_result, index 2)
+    // 4. content_block_start (web_search_tool_result, index 1)
     // 官方 API 要求 tool_use_id 指向对应的 server_tool_use，AI SDK 等严格客户端缺了会解析失败
     let search_content = websearch_result_content(&search_results);
 
@@ -384,7 +353,7 @@ fn generate_websearch_events(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 2,
+            "index": 1,
             "content_block": {
                 "type": "web_search_tool_result",
                 "tool_use_id": tool_use_id,
@@ -393,21 +362,21 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 6. content_block_stop (web_search_tool_result)
+    // 5. content_block_stop (web_search_tool_result)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 2
+            "index": 1
         }),
     ));
 
-    // 7. content_block_start (text, index 3)
+    // 6. content_block_start (text, index 2)
     events.push(SseEvent::new(
         "content_block_start",
         json!({
             "type": "content_block_start",
-            "index": 3,
+            "index": 2,
             "content_block": {
                 "type": "text",
                 "text": ""
@@ -415,7 +384,7 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 8. content_block_delta (text_delta) - 生成搜索结果摘要
+    // 7. content_block_delta (text_delta) - 搜索结果列表
     let summary = generate_search_summary(query, &search_results);
 
     // 分块发送文本
@@ -426,7 +395,7 @@ fn generate_websearch_events(
             "content_block_delta",
             json!({
                 "type": "content_block_delta",
-                "index": 3,
+                "index": 2,
                 "delta": {
                     "type": "text_delta",
                     "text": text
@@ -435,16 +404,16 @@ fn generate_websearch_events(
         ));
     }
 
-    // 9. content_block_stop (text)
+    // 8. content_block_stop (text)
     events.push(SseEvent::new(
         "content_block_stop",
         json!({
             "type": "content_block_stop",
-            "index": 3
+            "index": 2
         }),
     ));
 
-    // 10. message_delta
+    // 9. message_delta
     // 官方 API 的 message_delta.delta 中没有 stop_sequence 字段
     let output_tokens = (summary.len() as i32 + 3) / 4; // 简单估算
     events.push(SseEvent::new(
@@ -463,7 +432,7 @@ fn generate_websearch_events(
         }),
     ));
 
-    // 11. message_stop
+    // 10. message_stop
     events.push(SseEvent::new(
         "message_stop",
         json!({
@@ -474,7 +443,8 @@ fn generate_websearch_events(
     events
 }
 
-/// 生成搜索结果摘要
+/// 生成搜索结果列表文字（纯 WebSearch 回包的正文，也是 websearch_loop 回给上游的 tool_result）。
+/// 只列结果，不加网关自己的评论或免责声明。
 pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchResults>) -> String {
     if results
         .as_ref()
@@ -501,8 +471,6 @@ pub(crate) fn generate_search_summary(query: &str, results: &Option<WebSearchRes
     } else {
         summary.push_str("No results found.\n");
     }
-
-    summary.push_str("\nPlease note that these are web search results and may not be fully accurate or up-to-date.");
 
     summary
 }
@@ -540,7 +508,6 @@ fn build_websearch_content(
     search_results: &Option<WebSearchResults>,
 ) -> Vec<Value> {
     vec![
-        json!({"type": "text", "text": format!("I'll search for \"{}\".", query)}),
         json!({
             "id": tool_use_id,
             "type": "server_tool_use",
@@ -633,8 +600,9 @@ pub(crate) async fn call_mcp_api(
             .await;
     }
 
-    let response = provider.call_mcp(&request_body, group).await?;
-    let body = response.text().await?;
+    let result = provider.call_mcp(&request_body, group).await?;
+    let _in_flight = result._in_flight;
+    let body = result.response.text().await?;
     parse_mcp_response(&body)
 }
 
@@ -1043,5 +1011,57 @@ mod tests {
             .find(|b| b["type"] == "web_search_tool_result")
             .expect("web_search_tool_result block");
         assert_eq!(block["tool_use_id"], "srvtoolu_abc");
+    }
+
+    // ---- fix-req L8：查询取最后一条 user，网关不替模型写话 ----
+    #[test]
+    fn fixreq_l8_query_comes_from_last_user_message() {
+        let req: MessagesRequest = serde_json::from_value(json!({
+            "model": "claude-sonnet-4",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": [{"type": "text", "text": "answer"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Perform a web search for the query: rust 1.90 release"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(extract_search_query(&req).as_deref(), Some("rust 1.90 release"));
+    }
+
+    #[test]
+    fn fixreq_l8_no_fabricated_assistant_text() {
+        let content = build_websearch_content("q", "srvtoolu_x", &None);
+        assert!(
+            !content
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .any(|t| t.contains("I'll search for")),
+            "{content:?}"
+        );
+        assert!(!generate_search_summary("q", &None).contains("Please note"));
+
+        let events = generate_websearch_events("m", "q", "srvtoolu_x", None, 1);
+        assert!(!events.iter().any(|e| e.data.to_string().contains("I'll search for")));
+        let starts: Vec<(i64, String)> = events
+            .iter()
+            .filter(|e| e.data["type"] == "content_block_start")
+            .map(|e| {
+                (
+                    e.data["index"].as_i64().unwrap(),
+                    e.data["content_block"]["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            vec![
+                (0, "server_tool_use".to_string()),
+                (1, "web_search_tool_result".to_string()),
+                (2, "text".to_string()),
+            ]
+        );
     }
 }

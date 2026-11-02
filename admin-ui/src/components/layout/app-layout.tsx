@@ -20,6 +20,7 @@ import {
   PackageOpen,
   ShieldCheck,
   Wrench,
+  Bell,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { TopbarTools } from "@/components/topbar-tools";
@@ -99,6 +100,7 @@ export const TABS: readonly TabItem[] = [
     icon: SlidersHorizontal,
     children: [
       { key: "dispatch", label: "调度策略", icon: Gauge },
+      { key: "alerts", label: "额度告警", icon: Bell },
       { key: "metadata", label: "凭据字段", icon: Tags },
       { key: "models", label: "模型配置", icon: Cpu },
       { key: "network", label: "网络代理", icon: Globe },

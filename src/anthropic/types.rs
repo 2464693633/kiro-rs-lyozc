@@ -107,6 +107,15 @@ pub struct OutputConfig {
     pub format: Option<serde_json::Value>,
 }
 
+impl OutputConfig {
+    pub fn json_schema(&self) -> Option<&serde_json::Value> {
+        let format = self.format.as_ref()?;
+        (format.get("type")?.as_str()? == "json_schema")
+            .then(|| format.get("schema").filter(|schema| schema.is_object()))
+            .flatten()
+    }
+}
+
 /// Claude Code 请求中的 metadata
 #[derive(Debug, Clone, Deserialize)]
 pub struct Metadata {
@@ -285,11 +294,16 @@ pub struct ContentBlock {
 }
 
 /// 图片数据源
+///
+/// 字段都有默认值：url / file 来源没有 media_type 和 data，缺省时整块反序列化失败、
+/// 被静默丢掉；有默认值后由转换器识别出 data 为空，留一句占位文字。
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ImageSource {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub source_type: String,
+    #[serde(default)]
     pub media_type: String,
+    #[serde(default)]
     pub data: String,
 }
 
@@ -308,6 +322,9 @@ pub struct CountTokensRequest {
     pub system: Option<Vec<SystemMessage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<Tool>>,
+    /// 只用于把结构化输出注入的 schema 指令计入估算；不转发给外部 count_tokens API。
+    #[serde(default, skip_serializing)]
+    pub output_config: Option<OutputConfig>,
 }
 
 /// Token 计数响应
@@ -318,7 +335,7 @@ pub struct CountTokensResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::MessagesRequest;
+    use super::{MessagesRequest, OutputConfig};
 
     #[test]
     fn format_only_output_config_preserves_absent_effort() {
@@ -367,5 +384,67 @@ mod tests {
         let cc = request.cache_control.unwrap();
         assert_eq!(cc.cache_type, "ephemeral");
         assert_eq!(cc.ttl.as_deref(), Some("1h"));
+    }
+
+    fn output_config(value: serde_json::Value) -> OutputConfig {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn output_config_preserves_explicit_effort_and_defaults_to_unspecified() {
+        assert_eq!(output_config(serde_json::json!({"effort": "max"})).effort, "max");
+        assert_eq!(output_config(serde_json::json!({})).effort, "");
+        let effort_only = output_config(serde_json::json!({"effort": "low"}));
+        assert!(effort_only.format.is_none());
+        assert!(effort_only.json_schema().is_none());
+    }
+
+    #[test]
+    fn output_config_parses_json_schema_format() {
+        let schema = serde_json::json!({"type": "object", "properties": {"ok": {"type": "boolean"}}});
+        let config = output_config(serde_json::json!({
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": schema}
+        }));
+        assert_eq!(config.effort, "low");
+        assert_eq!(config.json_schema(), Some(&schema));
+
+        // 仅 format 不应隐式启用高强度推理。
+        let format_only = output_config(serde_json::json!({
+            "format": {"type": "json_schema", "schema": schema}
+        }));
+        assert_eq!(format_only.effort, "");
+        assert_eq!(format_only.json_schema(), Some(&schema));
+        // 未知字段（如只有 format 的真实请求）同样落到默认 effort。
+        assert_eq!(
+            output_config(serde_json::json!({"unknown": 1})).effort,
+            ""
+        );
+    }
+
+    #[test]
+    fn output_config_ignores_non_json_schema_formats() {
+        for format in [
+            serde_json::json!({"type": "text"}),
+            serde_json::json!({"type": "json_schema"}),
+            serde_json::json!({"type": "json_schema", "schema": "nope"}),
+            serde_json::json!({"schema": {"type": "object"}}),
+        ] {
+            let config = output_config(serde_json::json!({"format": format}));
+            assert!(config.json_schema().is_none(), "{format}");
+        }
+    }
+
+    #[test]
+    fn output_config_tolerates_malformed_format() {
+        for format in [
+            serde_json::json!("json_schema"),
+            serde_json::json!({"type": null}),
+            serde_json::json!(42),
+        ] {
+            let config = output_config(serde_json::json!({"effort": "low", "format": format}));
+            assert_eq!(config.effort, "low");
+            assert!(config.json_schema().is_none());
+        }
     }
 }

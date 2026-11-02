@@ -196,6 +196,11 @@ pub(super) fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -
             entry.latency_ms = Some(*latency_ms);
             entry.consecutive_failures = 0;
             entry.last_error = None;
+            if entry.auto_disabled {
+                entry.enabled = true;
+                entry.auto_disabled = false;
+                tracing::info!(proxy_id = entry.id, "代理恢复连通，已自动重新启用");
+            }
             if let Some(exit) = exit {
                 // 只拿到 IP 且与上次一致时保留已知的地理位置
                 let keep_geo = exit.country.is_none()
@@ -234,24 +239,57 @@ pub(super) fn apply_probe_result(entry: &mut ProxyEntry, result: &ProbeResult) -
     }
 }
 impl ProxyPoolManager {
-    /// 并发探测所有已启用代理，回写结果并持久化一次。
+    /// 并发探测已启用及自动禁用的代理，回写结果并持久化一次。
     ///
     /// 探测期间被编辑了地址的条目不回写：旧地址的结果不代表新地址。
     pub async fn check_all(&self) -> CheckSummary {
+        self.check_all_with_probe(|endpoint| async move { self.probe_one(&endpoint).await })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn check_all_for_url(&self, url: &str) -> CheckSummary {
+        self.check_all_with_probe(|endpoint| async move {
+            let result = match build_client(
+                Some(&ProxyConfig::new(endpoint.full_url())),
+                PROBE_TIMEOUT_SECS,
+                self.tls_backend,
+            ) {
+                Ok(client) => fetch_ok(&client, url).await,
+                Err(error) => Err(error.to_string()),
+            };
+            match result {
+                Ok(latency_ms) => ProbeResult::Ok {
+                    latency_ms,
+                    exit: None,
+                },
+                Err(error) => ProbeResult::Err {
+                    error: redact(&error, &endpoint),
+                },
+            }
+        })
+        .await
+    }
+
+    async fn check_all_with_probe<F, Fut>(&self, probe: F) -> CheckSummary
+    where
+        F: Fn(ProxyEndpoint) -> Fut,
+        Fut: std::future::Future<Output = ProbeResult>,
+    {
         let targets: Vec<(u64, ProxyEndpoint)> = self
             .entries
             .lock()
             .iter()
-            .filter(|e| e.enabled)
+            .filter(|e| e.enabled || e.auto_disabled)
             .map(|e| (e.id, e.endpoint.clone()))
             .collect();
         if targets.is_empty() {
             return CheckSummary::default();
         }
 
-        let probes = targets.into_iter().map(|(id, endpoint)| async move {
-            let result = self.probe_one(&endpoint).await;
-            (id, endpoint, result)
+        let probes = targets.into_iter().map(|(id, endpoint)| {
+            let future = probe(endpoint.clone());
+            async move { (id, endpoint, future.await) }
         });
         let results = futures::future::join_all(probes).await;
 
@@ -264,7 +302,11 @@ impl ProxyPoolManager {
             if entry.endpoint != *endpoint {
                 continue;
             }
+            let was_auto_disabled = entry.auto_disabled;
             let (unhealthy, newly_disabled) = apply_probe_result(entry, result);
+            if was_auto_disabled && !entry.auto_disabled {
+                summary.auto_recovered += 1;
+            }
             if unhealthy {
                 summary.unhealthy += 1;
             } else {

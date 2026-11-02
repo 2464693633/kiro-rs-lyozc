@@ -41,6 +41,64 @@ fn input(raw: &str) -> ProxyInput {
 }
 
 #[test]
+fn detected_proxy_requires_probe_and_recovers_without_reenabling_manual_entries() {
+    let pool = ProxyPoolManager::new(None, crate::model::config::TlsBackend::Rustls);
+    let proxy = crate::http_client::ProxyConfig::new("http://user:p%40ss@localhost:1234");
+    assert_eq!(pool.register_detected(std::slice::from_ref(&proxy)), 1);
+    assert_eq!(pool.register_detected(std::slice::from_ref(&proxy)), 0);
+    assert_eq!(
+        pool.availability_for_proxy(&proxy),
+        ProxyAvailability::Untracked
+    );
+    assert!(pool.assignable_urls().is_empty());
+    let id = pool.list()[0].id;
+    {
+        let mut entries = pool.entries.lock();
+        let entry = &mut entries[0];
+        for _ in 0..MAX_PROXY_PROBE_FAILURES {
+            apply_probe_result(
+                entry,
+                &ProbeResult::Err {
+                    error: "unavailable".into(),
+                },
+            );
+        }
+        assert!(entry.auto_disabled);
+        apply_probe_result(
+            entry,
+            &ProbeResult::Ok {
+                latency_ms: 1,
+                exit: None,
+            },
+        );
+        assert!(entry.enabled);
+        assert!(!entry.auto_disabled);
+    }
+    assert_eq!(
+        pool.availability_for_proxy(&proxy),
+        ProxyAvailability::Available
+    );
+    assert_eq!(pool.assignable_urls(), vec![proxy.url.clone()]);
+    pool.set_enabled(id, false).unwrap();
+    {
+        let mut entries = pool.entries.lock();
+        apply_probe_result(
+            &mut entries[0],
+            &ProbeResult::Ok {
+                latency_ms: 1,
+                exit: None,
+            },
+        );
+        assert!(!entries[0].enabled);
+    }
+    assert_eq!(
+        pool.availability_for_proxy(&proxy),
+        ProxyAvailability::Unavailable
+    );
+    assert!(pool.assignable_urls().is_empty());
+}
+
+#[test]
 fn parse_decodes_auth_and_normalizes() {
     let ep = endpoint("SOCKS5://us%40r:p%3Ass@Proxy.Example.com:1080");
     assert_eq!(ep.protocol, "socks5");

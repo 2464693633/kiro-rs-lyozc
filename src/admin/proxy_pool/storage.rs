@@ -26,6 +26,8 @@ pub(super) struct LegacyProxyEntry {
     pub consecutive_failures: u32,
     #[serde(default)]
     pub auto_disabled: bool,
+    #[serde(default)]
+    pub auto_detected: bool,
 }
 
 impl LegacyProxyEntry {
@@ -46,6 +48,7 @@ impl LegacyProxyEntry {
             last_checked_at: self.last_checked_at,
             consecutive_failures: self.consecutive_failures,
             auto_disabled: self.auto_disabled,
+            auto_detected: self.auto_detected,
             last_error: None,
             exit: None,
         })
