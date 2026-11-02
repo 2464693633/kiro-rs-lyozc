@@ -1124,6 +1124,7 @@ pub struct ClientKeyItem {
     pub is_system: bool,
     /// 是否对该 Key 做本地缓存计量模拟；false 时输入全部计入 input_tokens
     pub cache_metering: bool,
+    pub cache_read_limit_percent: Option<u8>,
 }
 
 /// 客户端 Key 列表响应
@@ -1149,6 +1150,9 @@ pub struct CreateClientKeyRequest {
     /// 是否做本地缓存计量模拟（可选；省略表示开启）
     #[serde(default)]
     pub cache_metering: Option<bool>,
+    /// 模拟缓存读取上限，整数 0..=100；省略或 null 表示不额外限制。
+    #[serde(default)]
+    pub cache_read_limit_percent: Option<u8>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1172,6 +1176,16 @@ pub struct UpdateClientKeyRequest {
     /// 是否做本地缓存计量模拟；省略表示不修改
     #[serde(default)]
     pub cache_metering: Option<bool>,
+    /// 省略保留原设置；null 清除上限；整数 0..=100 设置百分比。
+    #[serde(default, deserialize_with = "deserialize_cache_read_limit_patch")]
+    pub cache_read_limit_percent: Option<Option<u8>>,
+}
+
+fn deserialize_cache_read_limit_patch<'de, D>(deserializer: D) -> Result<Option<Option<u8>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u8>::deserialize(deserializer).map(Some)
 }
 
 /// 设置客户端 Key 的积分使用上限

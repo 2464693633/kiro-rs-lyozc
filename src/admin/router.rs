@@ -50,6 +50,10 @@ use super::{
 /// axum 默认的 2MB 上限而被拒绝（HTTP 413）。这里与 Anthropic 路由保持一致放宽到 50MB。
 const MAX_ADMIN_BODY_SIZE: usize = 50 * 1024 * 1024;
 
+#[cfg(test)]
+#[path = "cache_limit_tests.rs"]
+mod cache_read_limit_tests;
+
 /// 创建 Admin API 路由
 ///
 /// # 端点

@@ -131,6 +131,24 @@ impl AppState {
         }
     }
 
+    /// 按 Key 的开关计算本地模拟用量，并附加该 Key 的读取比例上限。
+    pub async fn compute_cache_usage_for_key(
+        &self,
+        request: &super::types::MessagesRequest,
+        key_id: u64,
+    ) -> super::cache_metering::CacheUsage {
+        let limit = self
+            .client_keys
+            .as_ref()
+            .and_then(|keys| keys.cache_read_limit_percent(key_id));
+        match self.cache_meter_for_key(key_id) {
+            Some(cache) => super::cache_metering::compute_cache_usage(&cache, request, key_id)
+                .await
+                .with_read_limit_percent(limit),
+            None => super::cache_metering::CacheUsage::default(),
+        }
+    }
+
     /// 注入链路追踪存储
     pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
         self.trace_store = store;

@@ -535,6 +535,8 @@ export interface ClientKeyItem {
   isSystem: boolean
   /** 是否做本地缓存计量模拟；false 时输入全部计入 input_tokens，缓存两项为 0 */
   cacheMetering: boolean
+  /** 模拟缓存读取占总输入的百分比上限；null/缺省表示不额外限制。 */
+  cacheReadLimitPercent?: number | null
 }
 
 export interface ClientKeysResponse {
@@ -550,6 +552,7 @@ export interface CreateClientKeyRequest {
   maxCredits?: number
   /** 是否做本地缓存计量模拟（可选，不传表示开启） */
   cacheMetering?: boolean
+  cacheReadLimitPercent?: number | null
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -566,6 +569,8 @@ export interface UpdateClientKeyRequest {
   group?: string
   /** 是否做本地缓存计量模拟（不传表示不修改） */
   cacheMetering?: boolean
+  /** 不传保持设置；null 清除上限。 */
+  cacheReadLimitPercent?: number | null
 }
 
 // ============ 用量统计 ============

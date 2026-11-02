@@ -1697,6 +1697,10 @@ async fn run_web_search_loop_inner(
         None
     };
     let mut presentation: Vec<Value> = Vec::new();
+    let read_limit = hook
+        .client_keys
+        .as_ref()
+        .and_then(|keys| keys.cache_read_limit_percent(key_id));
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
@@ -1718,7 +1722,9 @@ async fn run_web_search_loop_inner(
             ) as i32;
             let round_cache_usage = match cache_meter.as_ref() {
                 Some(cache) => {
-                    super::cache_metering::compute_cache_usage(cache, &payload, key_id).await
+                    super::cache_metering::compute_cache_usage(cache, &payload, key_id)
+                        .await
+                        .with_read_limit_percent(read_limit)
                 }
                 None => CacheUsage::default(),
             };
@@ -3779,6 +3785,7 @@ mod tests {
             cache_read: 50,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            ..Default::default()
         };
         let (provider_usage, provider_source) = provider_round.resolved_token_usage(888, simulated);
         assert_eq!(provider_source, UsageSource::Provider);
@@ -3868,6 +3875,7 @@ mod tests {
             cache_read: 60,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            ..Default::default()
         };
 
         let (usage, source) = round.resolved_token_usage(999, cache_usage);

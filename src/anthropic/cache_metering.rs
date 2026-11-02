@@ -102,18 +102,27 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+    /// 仅对本地模拟的最终拆分生效，None 表示不额外限制。
+    pub read_limit_percent: Option<u8>,
 }
 
 impl CacheUsage {
+    pub fn with_read_limit_percent(mut self, limit: Option<u8>) -> Self {
+        self.read_limit_percent = limit;
+        self
+    }
+
     /// 按真实 total 口径把 prompt 拆成三个互斥的部分，返回
     /// `(input_tokens, cache_creation, cache_read)`，相加严格 == `total_real`。
     ///
-    /// 语义与 Anthropic 官方 usage 字段一致，不做任何计费向的再加工：
+    /// 未设置读取上限时，按本地缓存命中拆分：
     /// - `cache_read`：命中此前写入过的最长前缀（本次无需重新处理的部分）
     /// - `cache_creation`：被断点覆盖但未命中、本次新写入缓存的部分
     /// - `input_tokens`：最深断点之后未被缓存覆盖的尾部
     ///
     /// estimate 口径与真实 total 口径的尺度差异通过无量纲比例分摊消除。
+    /// 设置读取上限后，超过总输入指定百分比的模拟读取量转为普通输入；
+    /// 缓存写入保持不变。上游明确返回的 usage 不经过本方法。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
         let total = total_real.max(0);
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
@@ -132,7 +141,16 @@ impl CacheUsage {
         let cache_read = cache_read.clamp(0, cache_total);
         let cache_creation = cache_total - cache_read;
 
-        (uncached_tail, cache_creation, cache_read)
+        let limited_read = match self.read_limit_percent {
+            Some(percent) => {
+                // 按最终 token 数向下取整，避免小请求因舍入超过配置比例。
+                let maximum = (i64::from(total) * i64::from(percent.min(100)) / 100) as i32;
+                cache_read.min(maximum)
+            }
+            None => cache_read,
+        };
+        // 保持缓存写入和总量不变，超出的读取量转为普通输入。
+        (uncached_tail + cache_read - limited_read, cache_creation, limited_read)
     }
 }
 
@@ -1472,6 +1490,7 @@ pub async fn compute_cache_usage(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        ..Default::default()
     }
 }
 
@@ -1584,6 +1603,7 @@ pub fn compute_cache_usage_sync(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        ..Default::default()
     }
 }
 
@@ -1883,6 +1903,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80,
             prompt_total_est: 100,
+            ..Default::default()
         };
         let (input, creation, read) = u.split_against_total(1000);
         assert_eq!(input + creation + read, 1000);
@@ -1897,8 +1918,37 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    #[test]
+    fn cache_read_limit_moves_excess_to_input_and_preserves_writes() {
+        let usage = CacheUsage { cache_read: 95, cache_covered_est: 100, prompt_total_est: 100, ..Default::default() };
+        assert_eq!(usage.split_against_total(100_000), (0, 5_000, 95_000));
+        assert_eq!(usage.with_read_limit_percent(Some(60)).split_against_total(100_000), (35_000, 5_000, 60_000));
+        assert_eq!(usage.with_read_limit_percent(Some(0)).split_against_total(100_000), (95_000, 5_000, 0));
+        assert_eq!(usage.with_read_limit_percent(Some(100)).split_against_total(100_000), usage.split_against_total(100_000));
+        let low_hit = CacheUsage { cache_read: 20, ..usage };
+        assert_eq!(low_hit.with_read_limit_percent(Some(60)).split_against_total(100), low_hit.split_against_total(100));
+        let cold = CacheUsage { cache_read: 0, ..usage };
+        assert_eq!(cold.with_read_limit_percent(Some(60)).split_against_total(100), (0, 100, 0));
+    }
+
+    #[test]
+    fn cache_read_limit_never_exceeds_percentage_after_rounding() {
+        let usage = CacheUsage { cache_read: 79, cache_covered_est: 95, prompt_total_est: 100, ..Default::default() };
+        for total in [0, 1, 2, 99, 100, 101, i32::MAX] {
+            let (_, original_write, _) = usage.split_against_total(total);
+            for percent in 0..=100 {
+                let (input, write, read) = usage.with_read_limit_percent(Some(percent)).split_against_total(total);
+                assert!(input >= 0 && read >= 0);
+                assert_eq!(write, original_write);
+                assert_eq!(i64::from(input) + i64::from(write) + i64::from(read), i64::from(total));
+                assert!(i64::from(read) * 100 <= i64::from(total) * i64::from(percent));
+            }
+        }
     }
 
     #[test]
@@ -3751,6 +3801,7 @@ mod tests {
             cache_read: 100_000,
             cache_covered_est: 100_000,
             prompt_total_est: 101_000,
+            ..Default::default()
         };
 
         let (input, creation, read) = usage.split_against_total(101_000);

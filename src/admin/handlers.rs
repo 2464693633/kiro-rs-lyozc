@@ -1133,6 +1133,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         group: k.group.clone(),
         is_system: k.is_system,
         cache_metering: k.cache_metering,
+        cache_read_limit_percent: k.cache_read_limit_percent,
     }
 }
 
@@ -1152,6 +1153,18 @@ pub async fn create_client_key(
     Json(payload): Json<CreateClientKeyRequest>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if payload
+        .cache_read_limit_percent
+        .is_some_and(|limit| limit > 100)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "cacheReadLimitPercent 必须是 0 到 100 的整数",
+            )),
+        )
+            .into_response();
+    }
     let name = payload.name.trim();
     if name.is_empty() {
         return (
@@ -1192,6 +1205,9 @@ pub async fn create_client_key(
     // 新 Key 默认开启缓存计量模拟，只在显式关闭时写入
     if payload.cache_metering == Some(false) {
         state.client_keys.set_cache_metering(entry.id, false);
+    }
+    if let Some(limit) = payload.cache_read_limit_percent {
+        state.client_keys.set_cache_read_limit_percent(entry.id, Some(limit));
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1275,6 +1291,19 @@ pub async fn update_client_key(
     Json(payload): Json<UpdateClientKeyRequest>,
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
+    if payload
+        .cache_read_limit_percent
+        .flatten()
+        .is_some_and(|limit| limit > 100)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "cacheReadLimitPercent 必须是 0 到 100 的整数",
+            )),
+        )
+            .into_response();
+    }
     let description = payload
         .description
         .map(|d| if d.is_empty() { None } else { Some(d) });
@@ -1292,6 +1321,9 @@ pub async fn update_client_key(
     {
         if let Some(enabled) = payload.cache_metering {
             state.client_keys.set_cache_metering(id, enabled);
+        }
+        if let Some(limit) = payload.cache_read_limit_percent {
+            state.client_keys.set_cache_read_limit_percent(id, limit);
         }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

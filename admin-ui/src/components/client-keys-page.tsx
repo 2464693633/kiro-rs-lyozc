@@ -48,6 +48,42 @@ function parseMaxCreditsInput(raw: string): number | null | 'invalid' {
   return n
 }
 
+function parseCacheReadLimitInput(raw: string): number | null | 'invalid' {
+  if (!raw.trim()) return null
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 && value <= 100 ? value : 'invalid'
+}
+
+function CacheReadLimitInput({ id, value, onChange, disabled }: {
+  id: string
+  value: string
+  onChange: (value: string) => void
+  disabled: boolean
+}) {
+  return (
+    <div>
+      <label htmlFor={id} className="text-[12px] text-muted-foreground">模拟缓存读取上限（%）</label>
+      <Input
+        id={id}
+        type="number"
+        min="0"
+        max="100"
+        step="1"
+        inputMode="numeric"
+        placeholder="留空表示不额外限制"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
+      />
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        每次请求的模拟缓存读取量占总输入的比例，设置 0–100 的整数。
+        超出部分转为普通输入；缓存写入和实际积分不变。
+        仅在模拟缓存计量开启时生效，上游返回的真实用量保持原值。
+      </p>
+    </div>
+  )
+}
+
 /** 渲染「已用积分 / 上限」列。无上限时仅显示已用量。 */
 function CreditsUsage({ used, max }: { used: number; max?: number }) {
   if (max == null) {
@@ -109,6 +145,7 @@ export function ClientKeysPage() {
   const [createGroup, setCreateGroup] = useState('')
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createCacheMetering, setCreateCacheMetering] = useState(true)
+  const [createCacheReadLimit, setCreateCacheReadLimit] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -119,6 +156,7 @@ export function ClientKeysPage() {
   const [editGroup, setEditGroup] = useState('')
   const [editMaxCredits, setEditMaxCredits] = useState('')
   const [editCacheMetering, setEditCacheMetering] = useState(true)
+  const [editCacheReadLimit, setEditCacheReadLimit] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -132,6 +170,11 @@ export function ClientKeysPage() {
       toast.error('积分上限必须是非负数')
       return
     }
+    const cacheReadLimit = parseCacheReadLimitInput(createCacheReadLimit)
+    if (cacheReadLimit === 'invalid') {
+      toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
+      return
+    }
     try {
       const res = await createKey.mutateAsync({
         name,
@@ -139,6 +182,7 @@ export function ClientKeysPage() {
         group: createGroup.trim() || undefined,
         maxCredits: maxCredits ?? undefined,
         cacheMetering: createCacheMetering,
+        cacheReadLimitPercent: cacheReadLimit,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -147,6 +191,7 @@ export function ClientKeysPage() {
       setCreateGroup('')
       setCreateMaxCredits('')
       setCreateCacheMetering(true)
+      setCreateCacheReadLimit('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -230,6 +275,7 @@ export function ClientKeysPage() {
     setEditGroup(item.group ?? '')
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditCacheMetering(item.cacheMetering)
+    setEditCacheReadLimit(item.cacheReadLimitPercent != null ? String(item.cacheReadLimitPercent) : '')
     setEditOpen(true)
   }
 
@@ -241,6 +287,11 @@ export function ClientKeysPage() {
       toast.error('积分上限必须是非负数')
       return
     }
+    const cacheReadLimit = parseCacheReadLimitInput(editCacheReadLimit)
+    if (cacheReadLimit === 'invalid') {
+      toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
+      return
+    }
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
@@ -249,6 +300,7 @@ export function ClientKeysPage() {
           description: editDesc.trim(),
           group: editGroup.trim(),
           cacheMetering: editCacheMetering,
+          cacheReadLimitPercent: cacheReadLimit,
         },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
@@ -425,7 +477,9 @@ export function ClientKeysPage() {
               全局已关闭
             </span>
           ) : k.cacheMetering ? (
-            <Badge variant="outline">模拟</Badge>
+            <Badge variant="outline">
+              {k.cacheReadLimitPercent != null ? `模拟 ≤${k.cacheReadLimitPercent}%` : '模拟'}
+            </Badge>
           ) : (
             <Badge variant="secondary" title="输入全部计入 input tokens，缓存两项为 0">
               无缓存
@@ -628,7 +682,7 @@ export function ClientKeysPage() {
       {/* 新建对话框 */}
       {createOpen && (
         <Dialog open={createOpen} onOpenChange={(o) => !createKey.isPending && setCreateOpen(o)}>
-          <DialogContent className="sm:max-w-md">
+          <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
             <DialogHeader>
               <DialogTitle>新建客户端 Key</DialogTitle>
               <DialogDescription>
@@ -701,6 +755,12 @@ export function ClientKeysPage() {
                   aria-label="模拟缓存计量"
                 />
               </div>
+              <CacheReadLimitInput
+                id="create-cache-read-limit"
+                value={createCacheReadLimit}
+                onChange={setCreateCacheReadLimit}
+                disabled={createKey.isPending}
+              />
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
                   取消
@@ -772,7 +832,7 @@ export function ClientKeysPage() {
       {/* 编辑对话框 */}
       {editOpen && (
         <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
-          <DialogContent className="sm:max-w-md">
+          <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
             <DialogHeader>
               <DialogTitle>编辑 Key</DialogTitle>
               <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
@@ -832,6 +892,12 @@ export function ClientKeysPage() {
                   aria-label="模拟缓存计量"
                 />
               </div>
+              <CacheReadLimitInput
+                id="edit-cache-read-limit"
+                value={editCacheReadLimit}
+                onChange={setEditCacheReadLimit}
+                disabled={updateKey.isPending || setMaxCredits.isPending}
+              />
               <DialogFooter>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
                 <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>

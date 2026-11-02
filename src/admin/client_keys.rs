@@ -68,6 +68,9 @@ pub struct ClientKey {
     /// 老数据无此字段，默认开启。
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub cache_metering: bool,
+    /// 模拟缓存读取占总输入的百分比上限；None 表示不额外限制。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_limit_percent: Option<u8>,
 }
 
 /// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
@@ -205,6 +208,7 @@ impl ClientKeyManager {
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
             cache_metering: true,
+            cache_read_limit_percent: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -250,6 +254,7 @@ impl ClientKeyManager {
                     group: None,
                     is_system: true,
                     cache_metering: true,
+                    cache_read_limit_percent: None,
                 },
             );
             changed = true;
@@ -344,6 +349,28 @@ impl ClientKeyManager {
             .get(&id)
             .map(|e| e.cache_metering)
             .unwrap_or(true)
+    }
+
+    pub fn set_cache_read_limit_percent(&self, id: u64, limit: Option<u8>) -> bool {
+        if limit.is_some_and(|value| value > 100) {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.cache_read_limit_percent = limit;
+        self.save_locked(&inner);
+        true
+    }
+
+    pub fn cache_read_limit_percent(&self, id: u64) -> Option<u8> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.cache_read_limit_percent)
+            .filter(|value| *value <= 100)
     }
 
     pub fn update_meta(
@@ -853,5 +880,42 @@ mod tests {
             !mgr.cache_metering_enabled(0),
             "config.apiKey 变化只换明文，不应重置计量设置"
         );
+    }
+
+    #[test]
+    fn cache_read_limit_persists_clears_and_stays_with_its_key() {
+        let path = std::env::temp_dir().join(format!("kiro-cache-read-limit-{}.json", uuid::Uuid::new_v4()));
+        let mgr = ClientKeyManager::load(&path).unwrap();
+        let bounded = mgr.create("bounded".into(), None, None);
+        let unchanged = mgr.create("unchanged".into(), None, None);
+        assert!(mgr.set_cache_read_limit_percent(bounded.id, Some(60)));
+        assert!(!mgr.set_cache_read_limit_percent(bounded.id, Some(101)));
+        assert!(!mgr.set_cache_read_limit_percent(999, Some(60)));
+        let reloaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(reloaded.cache_read_limit_percent(bounded.id), Some(60));
+        assert_eq!(reloaded.cache_read_limit_percent(unchanged.id), None);
+        assert_eq!(reloaded.cache_read_limit_percent(999), None);
+        assert!(reloaded.set_cache_read_limit_percent(bounded.id, Some(0)));
+        reloaded.reset_stats(bounded.id);
+        assert_eq!(reloaded.cache_read_limit_percent(bounded.id), Some(0));
+        assert!(reloaded.set_cache_read_limit_percent(bounded.id, Some(100)));
+        assert!(reloaded.set_cache_read_limit_percent(bounded.id, None));
+        assert_eq!(ClientKeyManager::load(&path).unwrap().cache_read_limit_percent(bounded.id), None);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_read_limit_keeps_legacy_defaults_and_survives_key_rotation() {
+        let legacy: ClientKey = serde_json::from_str(r#"{"id":1,"key":"fixture","name":"legacy","createdAt":"2026-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!(legacy.cache_read_limit_percent, None);
+        let mgr = ClientKeyManager::new();
+        let key = mgr.create("rotate".into(), None, None);
+        assert!(mgr.set_cache_read_limit_percent(key.id, Some(60)));
+        mgr.rotate(key.id).unwrap();
+        assert_eq!(mgr.cache_read_limit_percent(key.id), Some(60));
+        mgr.sync_system_key("default".into(), None, "fixture-a".into());
+        assert!(mgr.set_cache_read_limit_percent(0, Some(0)));
+        mgr.sync_system_key("default".into(), None, "fixture-b".into());
+        assert_eq!(mgr.cache_read_limit_percent(0), Some(0));
     }
 }

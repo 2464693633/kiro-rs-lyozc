@@ -806,6 +806,94 @@ async fn gateway_key_without_cache_metering_reports_full_input() {
     assert!(stored.total_input_tokens > 0);
 }
 
+async fn cache_read_limit_message(state: &AppState, key_id: u64, cc: bool, payload: serde_json::Value) -> serde_json::Value {
+    let streaming = payload["stream"].as_bool().unwrap_or(false);
+    let context = KeyContext { key_id, group: None, key_source: TraceKeySource::ClientKey, client_ip: None };
+    let payload = Json(serde_json::from_value(payload).unwrap());
+    let response = if cc {
+        post_messages_cc(axum::extract::State(state.clone()), Extension(context), payload).await
+    } else {
+        post_messages(axum::extract::State(state.clone()), Extension(context), payload).await
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    parsed_protocol_message(response, streaming).await
+}
+
+#[tokio::test]
+async fn gateway_cache_read_limit_matches_streams_logs_and_tool_paths() {
+    use crate::{admin::{client_keys::ClientKeyManager, usage_stats::UsageAggregator}, anthropic::cache_metering::CacheMeter};
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for server_tools in [false, true] {
+                let f = fixture(Mode::ContextUsageOnly).await;
+                let keys = Arc::new(ClientKeyManager::new());
+                let key = keys.create("bounded".into(), None, None);
+                let aggregator = Arc::new(UsageAggregator::new());
+                let state = f.state.clone().with_usage(Some(keys.clone()), None, Some(aggregator.clone()))
+                    .with_cache_meter(Some(Arc::new(CacheMeter::new(None))));
+                let mut payload = json!({"model":"claude-opus-5-5","max_tokens":64,"stream":streaming,
+                    "cache_control":{"type":"ephemeral"},
+                    "system":[{"type":"text","text":"Stable cache limit fixture instructions. ".repeat(80)}],
+                    "messages":[{"role":"user","content":"first question"},
+                        {"role":"assistant","content":"previous answer"},
+                        {"role":"user","content":"current question"}]});
+                if server_tools { payload["tools"] = json!([{"type":"web_search_20250305","name":"web_search"}]); }
+                // Populate the exact prefix before comparing the same warm request.
+                cache_read_limit_message(&state, key.id, cc, payload.clone()).await;
+                let baseline = cache_read_limit_message(&state, key.id, cc, payload.clone()).await["usage"].clone();
+                let total = |usage: &serde_json::Value| ["input_tokens","cache_creation_input_tokens","cache_read_input_tokens"]
+                    .iter().map(|field| usage[*field].as_u64().unwrap()).sum::<u64>();
+                let baseline_total = total(&baseline);
+                assert!(baseline["cache_read_input_tokens"].as_u64().unwrap() * 100 > baseline_total * 60);
+                keys.set_cache_read_limit_percent(key.id, Some(60));
+                let before = keys.list()[0].clone();
+                let before_aggregate = aggregator.overview();
+                let capped = cache_read_limit_message(&state, key.id, cc, payload.clone()).await["usage"].clone();
+                let read = capped["cache_read_input_tokens"].as_u64().unwrap();
+                let input = capped["input_tokens"].as_u64().unwrap();
+                assert_eq!(total(&capped), baseline_total);
+                assert_eq!(read, baseline_total * 60 / 100);
+                assert_eq!(capped["cache_creation_input_tokens"], baseline["cache_creation_input_tokens"]);
+                assert_eq!(capped["output_tokens"], baseline["output_tokens"]);
+                let after = keys.list()[0].clone();
+                assert_eq!(after.total_cache_read_tokens - before.total_cache_read_tokens, read);
+                assert_eq!(after.total_input_tokens - before.total_input_tokens, input);
+                assert_eq!(aggregator.overview().today_input_tokens - before_aggregate.today_input_tokens, input);
+                keys.set_cache_read_limit_percent(key.id, Some(0));
+                let zero = cache_read_limit_message(&state, key.id, cc, payload.clone()).await["usage"].clone();
+                assert_eq!(zero["cache_read_input_tokens"], 0);
+                assert_eq!(total(&zero), baseline_total);
+                keys.set_cache_read_limit_percent(key.id, None);
+                let restored = cache_read_limit_message(&state, key.id, cc, payload).await["usage"].clone();
+                assert_eq!(restored, baseline);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_cache_read_limit_preserves_provider_reported_usage() {
+    use crate::{admin::client_keys::ClientKeyManager, anthropic::cache_metering::CacheMeter};
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            let f = fixture(Mode::CachedUsage).await;
+            let keys = Arc::new(ClientKeyManager::new());
+            let key = keys.create("provider".into(), None, None);
+            keys.set_cache_read_limit_percent(key.id, Some(0));
+            let state = f.state.clone().with_usage(Some(keys), None, None)
+                .with_cache_meter(Some(Arc::new(CacheMeter::new(None))));
+            let message = cache_read_limit_message(&state, key.id, cc, json!({
+                "model":"claude-opus-5-5","max_tokens":64,"stream":streaming,
+                "cache_control":{"type":"ephemeral"},"messages":[{"role":"user","content":"hello"}]
+            })).await;
+            assert_eq!(message["usage"]["input_tokens"], 0);
+            assert_eq!(message["usage"]["cache_read_input_tokens"], 18224);
+            assert_eq!(message["usage"]["cache_creation_input_tokens"], 4);
+            assert_eq!(message["usage"]["output_tokens"], 17);
+        }
+    }
+}
+
 fn enable_semantic_identity(f: &mut Fixture) -> Arc<crate::admin::usage_stats::UsageAggregator> {
     let usage = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
     f.state.usage_aggregator = Some(usage.clone());

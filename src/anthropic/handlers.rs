@@ -1095,12 +1095,7 @@ pub(super) async fn post_messages_inner(
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
     // Key 关闭缓存计量模拟时不查不写，输入全部计入 input_tokens。
-    let cache_usage = match state.cache_meter_for_key(key_ctx.key_id) {
-        Some(cache) => {
-            super::cache_metering::compute_cache_usage(&cache, &payload, key_ctx.key_id).await
-        }
-        None => super::cache_metering::CacheUsage::default(),
-    };
+    let cache_usage = state.compute_cache_usage_for_key(&payload, key_ctx.key_id).await;
 
     if payload.stream {
         // 流式响应
@@ -2357,12 +2352,7 @@ pub(super) async fn post_messages_cc_inner(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
     // Key 关闭缓存计量模拟时不查不写，输入全部计入 input_tokens。
-    let cache_usage = match state.cache_meter_for_key(key_ctx.key_id) {
-        Some(cache) => {
-            super::cache_metering::compute_cache_usage(&cache, &payload, key_ctx.key_id).await
-        }
-        None => super::cache_metering::CacheUsage::default(),
-    };
+    let cache_usage = state.compute_cache_usage_for_key(&payload, key_ctx.key_id).await;
 
     if payload.stream {
         // Stream content immediately; final usage arrives in message_delta.
@@ -3190,6 +3180,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
         let provider = TokenUsage {
             uncached_input_tokens: 3,
@@ -3210,6 +3201,7 @@ mod tests {
             cache_read: 25,
             cache_covered_est: 50,
             prompt_total_est: 100,
+            ..Default::default()
         };
 
         // context 80 - output 9 = 71，再按 50/100 分摊：35 / 18 / 18。
