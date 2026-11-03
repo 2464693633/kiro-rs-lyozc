@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef } from 'react'
 import { toast } from 'sonner'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload } from 'lucide-react'
 import {
   Dialog,
@@ -13,12 +13,14 @@ import { Button } from '@/components/ui/button'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   batchImportCredentials,
-  getProxyPool,
   type BatchImportItemEvent,
   type BatchImportSummary,
 } from '@/api/credentials'
 import type { AddCredentialRequest } from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
+
+import { ImportProxyField } from '@/components/import-proxy-field'
+import { importProxyFields, type ImportProxyChoice, type CredentialProxyFields } from '@/lib/credential-proxy'
 
 interface KamImportDialogProps {
   open: boolean
@@ -26,12 +28,12 @@ interface KamImportDialogProps {
 }
 
 // KAM 导出 JSON 中的账号结构
-interface KamAccount {
+interface KamAccount extends CredentialProxyFields {
   email?: string
   userId?: string | null
   nickname?: string
   idp?: string
-  credentials: {
+  credentials: CredentialProxyFields & {
     refreshToken: string
     accessToken?: string
     profileArn?: string
@@ -116,6 +118,10 @@ function normalizeKamAccount(item: unknown): unknown {
     const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
 
     return {
+      proxyId: obj.proxyId,
+      proxyUrl: obj.proxyUrl,
+      proxyUsername: obj.proxyUsername,
+      proxyPassword: obj.proxyPassword,
       email,
       userId,
       nickname,
@@ -195,6 +201,7 @@ function parseKamJson(raw: string): KamAccount[] {
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [proxyChoice, setProxyChoice] = useState<ImportProxyChoice>({ kind: 'preserve' })
   const [importing, setImporting] = useState(false)
   const [skipErrorAccounts, setSkipErrorAccounts] = useState(true)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
@@ -207,14 +214,10 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
   const { data: existingCredentials } = useCredentials()
   const queryClient = useQueryClient()
-  const { data: proxyPool } = useQuery({
-    queryKey: ['proxy-pool'],
-    queryFn: getProxyPool,
-    enabled: open,
-  })
 
   const resetForm = () => {
     setJsonInput('')
+    setProxyChoice({ kind: 'preserve' })
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -328,8 +331,6 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
-      const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
-
       // 本地预处理：跳过 error 账号、去重、校验、构造请求。
       // 通过的收集进 toImport（记录原始下标），不通过的行直接标终态。
       const toImport: { index: number; req: AddCredentialRequest }[] = []
@@ -380,10 +381,12 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           account.idp?.trim() ||
           (isExternalIdp ? 'AzureAD' : undefined)
 
-        // KAM 账号没有代理字段：IP 管理中有可用代理时随机关联一个
-        const proxyId = enabledProxies.length > 0
-          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].id
-          : undefined
+        const proxyFields = importProxyFields(proxyChoice, {
+          proxyId: account.proxyId ?? cred.proxyId,
+          proxyUrl: account.proxyUrl ?? cred.proxyUrl,
+          proxyUsername: account.proxyUsername ?? cred.proxyUsername,
+          proxyPassword: account.proxyPassword ?? cred.proxyPassword,
+        })
 
         toImport.push({
           index: i,
@@ -404,7 +407,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             scopes: cred.scopes?.trim() || undefined,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
-            proxyId,
+            ...proxyFields,
           },
         })
       }
@@ -576,6 +579,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          <ImportProxyField value={proxyChoice} onChange={setProxyChoice} disabled={importing} />
+
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <label className="text-sm font-medium">KAM 导出 JSON</label>

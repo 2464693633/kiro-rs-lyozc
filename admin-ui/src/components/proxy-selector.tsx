@@ -14,44 +14,8 @@ import {
 import { checkAllProxies, checkProxy, getGlobalProxy, getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl, cn } from '@/lib/utils'
 import { ProxyHealthBadge, formatLocation } from '@/components/proxy-format'
-import type { CredentialStatusItem } from '@/types/api'
-
-/** 账号的代理选择：全局代理 / 直连 / IP 管理中的代理 / 未入池的自定义地址（只读，保持原样） */
-export type ProxyChoice =
-  | { kind: 'global' }
-  | { kind: 'direct' }
-  | { kind: 'pool'; id: number }
-  | { kind: 'custom'; url: string }
-
-/** 由账号当前的代理字段推出选择项 */
-export function proxyChoiceOf(credential: CredentialStatusItem): ProxyChoice {
-  if (credential.proxyId != null) return { kind: 'pool', id: credential.proxyId }
-  const url = credential.proxyUrl?.trim() ?? ''
-  if (!url) return { kind: 'global' }
-  if (url.toLowerCase() === 'direct') return { kind: 'direct' }
-  return { kind: 'custom', url }
-}
-
-export function sameProxyChoice(a: ProxyChoice, b: ProxyChoice): boolean {
-  if (a.kind !== b.kind) return false
-  if (a.kind === 'pool' && b.kind === 'pool') return a.id === b.id
-  if (a.kind === 'custom' && b.kind === 'custom') return a.url === b.url
-  return true
-}
-
-/** 添加或编辑账号时提交的代理字段；自定义地址保持原样，不提交 */
-export function proxyRequestFields(choice: ProxyChoice): { proxyId?: number; proxyUrl?: string } {
-  switch (choice.kind) {
-    case 'pool':
-      return { proxyId: choice.id }
-    case 'direct':
-      return { proxyUrl: 'direct' }
-    case 'global':
-      return { proxyUrl: '' }
-    case 'custom':
-      return {}
-  }
-}
+import { sameProxyChoice, type ProxyChoice } from '@/lib/credential-proxy'
+export { proxyChoiceOf, proxyRequestFields, sameProxyChoice, type ProxyChoice } from '@/lib/credential-proxy'
 
 interface ProxySelectorProps {
   value: ProxyChoice

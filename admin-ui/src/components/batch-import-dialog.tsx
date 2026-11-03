@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { toast } from 'sonner'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueryClient } from '@tanstack/react-query'
 import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
 import {
   Dialog,
@@ -13,7 +13,6 @@ import { Button } from '@/components/ui/button'
 import { useCredentials } from '@/hooks/use-credentials'
 import {
   batchImportCredentials,
-  getProxyPool,
   type BatchImportItemEvent,
   type BatchImportSummary,
 } from '@/api/credentials'
@@ -29,12 +28,15 @@ import {
   metadataFieldValues,
 } from '@/components/credential-metadata-field'
 
+import { ImportProxyField } from '@/components/import-proxy-field'
+import { importProxyFields, type ImportProxyChoice, type CredentialProxyFields } from '@/lib/credential-proxy'
+
 interface BatchImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
 }
 
-interface CredentialInput {
+interface CredentialInput extends CredentialProxyFields {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
@@ -47,9 +49,6 @@ interface CredentialInput {
   authMethod?: string
   endpoint?: string
   email?: string
-  proxyUrl?: string
-  proxyUsername?: string
-  proxyPassword?: string
   // 企业 SSO (external_idp)
   tokenEndpoint?: string
   issuerUrl?: string
@@ -72,6 +71,7 @@ interface VerificationResult {
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
   const [jsonInput, setJsonInput] = useState('')
+  const [proxyChoice, setProxyChoice] = useState<ImportProxyChoice>({ kind: 'preserve' })
   const [importing, setImporting] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
@@ -82,14 +82,10 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
 
   const { data: existingCredentials } = useCredentials()
   const queryClient = useQueryClient()
-  const { data: proxyPool } = useQuery({
-    queryKey: ['proxy-pool'],
-    queryFn: getProxyPool,
-    enabled: open,
-  })
 
   const resetForm = () => {
     setJsonInput('')
+    setProxyChoice({ kind: 'preserve' })
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
@@ -143,9 +139,6 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           .filter((hash): hash is string => Boolean(hash)) || []
       )
 
-      // 可用的代理池条目（用于无代理凭据的随机分配）
-      const enabledProxies = proxyPool?.proxies.filter(p => p.enabled) ?? []
-
       // 本地预处理：代理分配 + 去重 + 校验 + 构造请求。
       // 不通过的行直接标终态；通过的收集进 toImport，记录其原始下标，
       // 以便把服务端 SSE 事件（按 toImport 内位置返回 index）映射回对应行。
@@ -175,10 +168,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
           saleStatus: saleStatus as CredentialSaleStatus,
         }
 
-        // 若凭据未指定代理且 IP 管理中有可用代理，随机关联一个
-        const proxyId = !cred.proxyUrl?.trim() && enabledProxies.length > 0
-          ? enabledProxies[Math.floor(Math.random() * enabledProxies.length)].id
-          : undefined
+        const proxyFields = importProxyFields(proxyChoice, cred)
         const isApiKeyCred = !!(cred.kiroApiKey?.trim()) || cred.authMethod === 'api_key'
 
         updateResult(i, { status: 'checking' })
@@ -211,10 +201,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyId,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              ...proxyFields,
               metadata,
             },
           })
@@ -268,10 +255,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
-              proxyId,
-              proxyUrl: cred.proxyUrl?.trim() || undefined,
-              proxyUsername: cred.proxyUsername?.trim() || undefined,
-              proxyPassword: cred.proxyPassword?.trim() || undefined,
+              ...proxyFields,
               metadata,
             },
           })
@@ -436,6 +420,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          <ImportProxyField value={proxyChoice} onChange={setProxyChoice} disabled={importing} />
+
           <div className="space-y-2">
             <label className="text-sm font-medium">
               JSON 格式凭据

@@ -15,6 +15,9 @@ import { startSocialLogin, pollSocialLogin, completeSocialLogin } from '@/api/cr
 import type { StartSocialLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
+import { LoginProxyField } from '@/components/login-proxy-field'
+import { proxyRequestFields, type ProxyChoice } from '@/components/proxy-selector'
+
 interface SocialLoginDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -60,6 +63,7 @@ async function getClipboardWritePermission(): Promise<PermissionState | 'unsuppo
 
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
   const [step, setStep] = useState<Step>('form')
+  const [proxyChoice, setProxyChoice] = useState<ProxyChoice>({ kind: 'global' })
   const [email, setEmail] = useState('')
   const [incognito, setIncognito] = useState(false)
   const [copyState, setCopyState] = useState<CopyState>('idle')
@@ -82,6 +86,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     if (!v) {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
       setStep('form')
+      setProxyChoice({ kind: 'global' })
       setSession(null)
       setCredentialId(null)
       setIsStarting(false)
@@ -134,6 +139,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
     const loginWindow = incognito ? null : window.open('about:blank', '_blank')
     try {
       const resp = await startSocialLogin({
+        ...proxyRequestFields(proxyChoice),
         email: email.trim() || undefined,
       })
       setSession(resp)
@@ -214,7 +220,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>Kiro 账号登录（Google / GitHub）</DialogTitle>
           <DialogDescription>
@@ -249,6 +255,10 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
               </span>
             </label>
           </div>
+        )}
+
+        {step === 'form' && (
+          <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
         )}
 
         {step === 'waiting' && session && (

@@ -63,6 +63,9 @@ use super::types::{
 };
 
 mod proxy;
+mod login_proxy;
+#[cfg(test)]
+mod login_proxy_tests;
 mod proxy_failover;
 mod proxy_link;
 #[cfg(test)]
@@ -356,6 +359,7 @@ struct SocialAuthSession {
     _server_handle: social::ServerHandle,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+    relogin_proxy_override: bool,
 }
 
 /// IdC 设备授权会话状态
@@ -373,6 +377,7 @@ struct IdcAuthSession {
     proxy: Option<ProxyConfig>,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+    relogin_proxy_override: bool,
 }
 
 /// 身份提供商：默认 Start URL 为 AWS Builder ID，自定义 Start URL 为企业 IAM Identity Center
@@ -3707,12 +3712,10 @@ impl AdminService {
         &self,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
-        let global_proxy = self.token_manager.proxy();
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let (mut cred_template, proxy) = self.resolve_login_proxy(req.proxy_id, req.proxy_url.as_deref(), None)?;
+        cred_template.auth_method = Some("social".to_string());
+        cred_template.priority = req.priority;
+        cred_template.email = req.email;
 
         let auth_endpoint = req
             .auth_endpoint
@@ -3734,14 +3737,6 @@ impl AdminService {
         let expires_at = Utc::now() + Duration::minutes(10);
         let session_id = uuid::Uuid::new_v4().to_string();
 
-        let cred_template = KiroCredentials {
-            auth_method: Some("social".to_string()),
-            priority: req.priority,
-            email: req.email,
-            proxy_url: req.proxy_url,
-            ..Default::default()
-        };
-
         let session = SocialAuthSession {
             auth_endpoint,
             state,
@@ -3753,6 +3748,7 @@ impl AdminService {
             proxy,
             _server_handle: server_handle,
             relogin_target_id: None,
+            relogin_proxy_override: false,
         };
 
         self.social_sessions
@@ -3884,6 +3880,9 @@ impl AdminService {
                     "Social 登录未返回 refreshToken，无法更新凭据".to_string(),
                 )
             })?;
+            if session.relogin_proxy_override {
+                self.save_login_proxy(target_id, &session.cred_template)?;
+            }
             self.do_relogin_update(target_id, refresh_token)
                 .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
             tracing::info!("Social 重新登录成功，凭据 #{} Token 已更新", target_id);
@@ -3968,27 +3967,11 @@ impl AdminService {
         &self,
         req: StartIdcLoginRequest,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
-        // 代理：优先用请求级，否则回退全局
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(self.token_manager.proxy());
-
-        let start_url = req
-            .start_url
-            .unwrap_or_else(|| BUILDER_ID_START_URL.to_string());
-
-        // 新建凭据独有的字段，其余由设备授权流程统一填充
-        let cred_template = KiroCredentials {
-            priority: req.priority,
-            email: req.email,
-            proxy_url: req.proxy_url,
-            ..Default::default()
-        };
-
-        self.begin_idc_device_authorization(req.region, start_url, proxy, cred_template, None)
-            .await
+        let (mut cred_template, proxy) = self.resolve_login_proxy(req.proxy_id, req.proxy_url.as_deref(), None)?;
+        cred_template.priority = req.priority;
+        cred_template.email = req.email;
+        let start_url = req.start_url.unwrap_or_else(|| BUILDER_ID_START_URL.to_string());
+        self.begin_idc_device_authorization(req.region, start_url, proxy, cred_template, None, false).await
     }
 
     /// 注册 OIDC 客户端、发起设备授权并登记会话。首次登录与重新登录共用。
@@ -4002,6 +3985,7 @@ impl AdminService {
         proxy: Option<ProxyConfig>,
         mut cred_template: KiroCredentials,
         relogin_target_id: Option<u64>,
+        relogin_proxy_override: bool,
     ) -> Result<StartIdcLoginResponse, AdminServiceError> {
         let config = self.token_manager.config();
 
@@ -4043,6 +4027,7 @@ impl AdminService {
             cred_template,
             proxy,
             relogin_target_id,
+            relogin_proxy_override,
         };
 
         let poll_interval = session.poll_interval;
@@ -4073,6 +4058,7 @@ impl AdminService {
             proxy,
             cred_template,
             relogin_target_id,
+            relogin_proxy_override,
         ) = {
             let sessions = self.idc_sessions.lock();
             let s = sessions
@@ -4093,6 +4079,7 @@ impl AdminService {
                 s.proxy.clone(),
                 s.cred_template.clone(),
                 s.relogin_target_id,
+                s.relogin_proxy_override,
             )
         };
 
@@ -4129,6 +4116,9 @@ impl AdminService {
                         .map(|secs| (Utc::now() + Duration::seconds(secs)).to_rfc3339());
                     let provider = idc_provider_for(&start_url).to_string();
 
+                    if relogin_proxy_override {
+                        self.save_login_proxy(target_id, &cred_template)?;
+                    }
                     self.token_manager
                         .replace_idc_relogin_credentials(
                             target_id,
@@ -4197,20 +4187,10 @@ impl AdminService {
         target_id: u64,
         req: StartSocialLoginRequest,
     ) -> Result<StartSocialLoginResponse, AdminServiceError> {
-        // 验证目标凭据存在
-        {
-            let snapshot = self.token_manager.snapshot();
-            if !snapshot.entries.iter().any(|e| e.id == target_id) {
-                return Err(AdminServiceError::NotFound { id: target_id });
-            }
-        }
-
-        let global_proxy = self.token_manager.proxy();
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(global_proxy);
+        let existing = self.token_manager.clone_credential(target_id)
+            .ok_or(AdminServiceError::NotFound { id: target_id })?;
+        let relogin_proxy_override = req.proxy_id.is_some() || req.proxy_url.is_some();
+        let (cred_template, proxy) = self.resolve_login_proxy(req.proxy_id, req.proxy_url.as_deref(), Some(&existing))?;
 
         let auth_endpoint = req
             .auth_endpoint
@@ -4237,10 +4217,11 @@ impl AdminService {
             redirect_uri,
             expires_at,
             callback_rx: tokio::sync::Mutex::new(rx),
-            cred_template: KiroCredentials::default(),
+            cred_template,
             proxy,
             _server_handle: server_handle,
             relogin_target_id: Some(target_id),
+            relogin_proxy_override,
         };
 
         self.social_sessions
@@ -4265,11 +4246,8 @@ impl AdminService {
             .clone_credential(target_id)
             .ok_or(AdminServiceError::NotFound { id: target_id })?;
 
-        let proxy = req
-            .proxy_url
-            .as_deref()
-            .map(ProxyConfig::new)
-            .or(self.token_manager.proxy());
+        let relogin_proxy_override = req.proxy_id.is_some() || req.proxy_url.is_some();
+        let (cred_template, proxy) = self.resolve_login_proxy(req.proxy_id, req.proxy_url.as_deref(), Some(&existing_credential))?;
 
         // 未指定时沿用原凭据的接入点，避免重新登录悄悄换到 Builder ID
         let start_url = req
@@ -4294,8 +4272,9 @@ impl AdminService {
             region,
             start_url,
             proxy,
-            KiroCredentials::default(),
+            cred_template,
             Some(target_id),
+            relogin_proxy_override,
         )
         .await
     }

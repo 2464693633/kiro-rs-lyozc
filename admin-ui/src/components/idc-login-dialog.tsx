@@ -16,6 +16,9 @@ import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import type { StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
+import { LoginProxyField } from '@/components/login-proxy-field'
+import { proxyRequestFields, type ProxyChoice } from '@/components/proxy-selector'
+
 interface IdcLoginDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -29,6 +32,7 @@ type Step = 'form' | 'waiting' | 'done'
 export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-id' }: IdcLoginDialogProps) {
   const isEnterprise = mode === 'enterprise'
   const [step, setStep] = useState<Step>('form')
+  const [proxyChoice, setProxyChoice] = useState<ProxyChoice>({ kind: 'global' })
   const [region, setRegion] = useState('us-east-1')
   const [startUrl, setStartUrl] = useState('')
   const [email, setEmail] = useState('')
@@ -51,6 +55,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
     if (!v) {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
       setStep('form')
+      setProxyChoice({ kind: 'global' })
       setSession(null)
       setCredentialId(null)
       setIsStarting(false)
@@ -84,6 +89,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
     setIsStarting(true)
     try {
       const resp = await startIdcLogin({
+        ...proxyRequestFields(proxyChoice),
         region: region.trim(),
         startUrl: startUrl.trim() || undefined,
         email: email.trim() || undefined,
@@ -132,7 +138,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
             {isEnterprise ? 'Enterprise IAM Identity Center SSO 登录' : 'AWS SSO / Builder ID 登录'}
@@ -221,6 +227,10 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
               </span>
             </span>
           </label>
+        )}
+
+        {step === 'form' && (
+          <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
         )}
 
         {step === 'waiting' && session && (

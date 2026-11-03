@@ -27,6 +27,9 @@ import type { CredentialStatusItem, StartSocialLoginResponse, StartIdcLoginRespo
 import { extractErrorMessage } from '@/lib/utils'
 import { useQueryClient } from '@tanstack/react-query'
 
+import { LoginProxyField } from '@/components/login-proxy-field'
+import { proxyChoiceOf, proxyRequestFields, sameProxyChoice, type ProxyChoice } from '@/components/proxy-selector'
+
 interface ReloginDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
@@ -103,6 +106,11 @@ function parseTokenInput(input: string): ParsedTokenData {
 
 export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogProps) {
   const [method, setMethod] = useState<Method>('social')
+  const [proxyChoice, setProxyChoice] = useState<ProxyChoice>(() => proxyChoiceOf(credential))
+  useEffect(() => {
+    if (open) setProxyChoice(proxyChoiceOf(credential))
+  }, [open, credential.id])
+  const loginProxy = sameProxyChoice(proxyChoice, proxyChoiceOf(credential)) ? {} : proxyRequestFields(proxyChoice)
   const [step, setStep] = useState<Step>('select')
 
   // Social/IdC 表单字段
@@ -155,7 +163,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
     // 必须在 await 之前同步打开窗口，否则浏览器弹窗拦截会导致跳转当前页
     const loginWindow = window.open('about:blank', '_blank')
     try {
-      const resp = await startSocialRelogin(credential.id, {})
+      const resp = await startSocialRelogin(credential.id, loginProxy)
       setSocialSession(resp)
       setStep('waiting')
       if (loginWindow) {
@@ -236,6 +244,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
     setIsStarting(true)
     try {
       const resp = await startIdcRelogin(credential.id, {
+        ...loginProxy,
         region: idcRegion.trim(),
         startUrl: idcStartUrl.trim() || undefined,
       })
@@ -336,7 +345,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
 
   return (
     <Dialog open={open} onOpenChange={handleClose}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-lg max-h-[85vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>重新登录 — {displayName}</DialogTitle>
           <DialogDescription>
@@ -390,6 +399,10 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
         )}
 
         {/* Social 等待 */}
+        {step === 'form' && method !== 'manual' && (
+          <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
+        )}
+
         {step === 'waiting' && method === 'social' && socialSession && (
           <div className="space-y-4 py-2">
             <div className="rounded-lg border bg-muted/50 p-4 space-y-3">
