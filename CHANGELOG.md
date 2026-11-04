@@ -6,6 +6,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 上游 v0.9.5 合并
+
+- 合并上游至 `cba46ea`：凭据卡片布局、隐私防护、今日请求数与实时 RPM、并发 RPM 统计修复，以及系统主 Key 的 Token、缓存和积分累计修复。
+- 保留 raw 默认工具模式、凭据本项目积分累计、Key 级模拟缓存上限、IP 管理关联和登录/JSON 导入预选代理。新版卡片继续显示关联代理名称与健康状态，隐私模式遮蔽名称和地址。
+- 保留本分支已有的账号冷却与 RPM 综合等待时间修复；上游模型权限回归测试和本分支 FREE/Opus 测试同时保留。
+- 前端、Docker 和云端构建同步使用上游固定的 pnpm 版本。
+
 ### 客户端工具优先使用 raw
 
 - 工具兼容模式默认改为 `raw`，保留 Claude Code 等客户端提供的工具名、schema 与入参，避免映射过程丢失 `replace_all`、PDF `pages`、后台命令和搜索选项。
@@ -44,6 +51,74 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - 新建与已有 Key 默认开启，行为不变；全局 `cacheMeteringEnabled` 关闭时所有 Key 都不模拟，Key 级开关只在全局开启时有区别。
 - Admin API：`GET /api/admin/client-keys` 返回 `cacheMetering`，`POST /api/admin/client-keys` 与 `PUT /api/admin/client-keys/{id}` 接受可选的 `cacheMetering`。`client_api_keys.json` 只为关闭模拟的 Key 写入该字段，现有文件无需迁移。
 
+
+## [0.9.5] - 2026-11-04
+
+主题：**凭据管理卡片优化、页面隐私防护、单账号请求活跃度统计、模型权限判定修正，以及前端构建工具迁移**。本版包含 `v0.9.4` 之后的 4 笔功能、修复与构建直接提交，没有新增合并 PR；现有配置、凭据与用量日志无需手动迁移。请留意隐私开关的保护范围、RPM 的统计口径，以及源码构建命令的变化。
+
+### 🖥️ 凭据卡片与信息布局
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [凭据管理优化 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)。
+
+- 重新整理凭据卡片的信息层级，将账号、订阅与认证方式、启停状态、调度优先级或权重、失败与成功次数集中展示，余额与额度进度放在卡片底部，便于对比多个账号。
+- 卡片网格按可用宽度自适应排列并保持等高，优化分组、来源、自定义备注、代理状态与添加时间的展示；保留紧凑列表、拖拽调度、优先级编辑及原有管理操作。
+
+### 🛡️ 凭据页面隐私防护
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [隐私开关 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)。
+
+- 凭据管理工具栏新增「隐私」开关，默认关闭，偏好保存在当前浏览器；开启后，卡片、列表及相关悬浮提示会遮蔽邮箱、API Key、代理地址、Profile ARN、分组、来源与自定义备注，搜索输入也切换为遮蔽显示。
+- 开启防护时关闭已打开的单账号编辑、重登、Token 导入与失败日志弹窗，并限制这些明文入口；需要查看或修改时先关闭防护。浏览器无法保存偏好时明确提示，当前页面的开关仍然生效。
+- 该功能仅做页面展示脱敏，不修改凭据原始数据、接口返回或导出内容，不替代管理端鉴权；其他页面和管理弹窗不在保护范围内。
+
+### 📊 今日请求数与实时 RPM
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [请求活跃度统计 `2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、[并发 RPM 计数修复 `a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)。
+
+- 新增 `GET /api/admin/stats/credential-activity`，按凭据批量返回 `todayCalls` 与 `rpm`；管理端卡片和列表每 5 秒刷新一次，不为每张卡片单独发起统计请求。
+- 统计沿用用量日志的请求完成口径，包含成功与失败，归属最终记录的凭据，不把同一次请求的内部重试重复计数；没有归属凭据的记录不计入单账号统计。
+- 「今日」按服务端本地日期计算，RPM 为最近 60 秒完成的请求数，与单账号 RPM 限流开关无关；长请求在结束后计入，窗口内无新增请求时 RPM 也会随时间归零，重启后从保留的用量日志重建。
+- 加载中、开发预览或查询失败时显示「—」，失败会展示原因并提供手动重试与后续定时刷新，不将失败伪装成零请求；补充时间窗口、跨日、乱序记录与日志重建回归测试。
+- 修复并发请求乱序写入时，较早取得时间戳的请求误删已写入的较新 RPM 记录的问题；清理窗口兼顾已记录的最新时间，保留窗口内的新记录，同时继续拒绝本次写入中的未来时间戳，并补充回归测试。
+
+### 🔧 模型权限以上游模型列表为准
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [模型筛选修复 `59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)。
+
+- 移除仅凭订阅名称包含 `FREE` 就排除 Opus 请求的硬编码规则，改为依据上游可用模型列表缓存判断；缓存明确不支持的模型仍会排除对应凭据，尚无明确缓存结论时保留尝试机会。
+- 优先级与均衡调度、当前凭据复用、账号冷却候选及自愈筛选使用一致的模型支持判断；修正限流故障转移中的剩余候选计数，不再把缓存已明确不支持模型的账号算作可用候选。
+- 分组隔离、禁用状态、本地 RPM 限制与上游账号冷却继续生效。此修复只移除本地错误推断，不授予额外模型权限，也不保证所有 Free 账号都能调用 Opus，实际可用性仍由上游决定。
+
+### 🛠️ 前端构建迁移到 pnpm
+
+> 来源：[@ZyphrZero](https://github.com/ZyphrZero) 的直接提交 [构建工具迁移 `4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261)。
+
+- 前端包管理器固定为 `pnpm@12.11.2`，以 `admin-ui/pnpm-lock.yaml` 替代 `bun.lock`；源码构建使用 `pnpm install --frozen-lockfile` 与 `pnpm run build`。
+- 常规构建、Release 工作流与 Docker 前端构建阶段同步切换到 Node.js 24 和 pnpm，项目声明的 Node.js 最低版本为 `22.12.0`；同步更新开发说明与未构建 Admin UI 时的错误提示。
+- 预编译二进制和发布镜像仍内嵌 Admin UI，使用这些产物的部署无需额外安装 Node.js 或 pnpm；多平台二进制、Docker 多架构镜像与校验文件的发布方式不变。
+
+### 🙏 本版贡献者
+
+| 贡献者 | 直接提交 |
+| --- | --- |
+| [@ZyphrZero](https://github.com/ZyphrZero) | 凭据管理与统计 [`2ab1d25`](https://github.com/ZyphrZero/kiro.rs/commit/2ab1d25)、并发 RPM 修复 [`a7a3d89`](https://github.com/ZyphrZero/kiro.rs/commit/a7a3d89)、模型筛选 [`59b6d48`](https://github.com/ZyphrZero/kiro.rs/commit/59b6d48)、构建迁移 [`4481261`](https://github.com/ZyphrZero/kiro.rs/commit/4481261) |
+
+本版没有新增合并 PR，以上直接提交不计入 PR 数量。
+
+### 🤝 Collaborators — 维护与发布
+
+- [@ZyphrZero](https://github.com/ZyphrZero)：整合凭据管理、模型路由与构建调整，补充统计和调度回归测试，维护升级文档与版本发布。
+
+### 📦 升级说明
+
+- `Cargo.toml`、`Cargo.lock` 与 `admin-ui/package.json` 版本统一为 `0.9.5`，无需手动转换现有配置、凭据或用量日志。
+- 前后端应同步更新并重启后端，以提供新的请求活跃度接口；只更新管理端静态文件而保留旧后端会导致统计查询失败。
+- 隐私开关默认关闭且仅对当前浏览器生效，不能当作服务端数据脱敏或访问控制；截图、演示前仍应检查当前页面和弹窗是否包含敏感内容。
+- RPM 展示的是最近 60 秒已完成请求，不是请求进入速率或在途并发量；「今日」边界遵循服务端时区，可能与浏览器所在时区不同。
+- 从源码或自定义镜像构建时，请将原有 Bun 安装和构建命令改为 pnpm，并提交、使用新的锁文件；直接下载 Release 二进制或使用发布镜像的部署不受包管理器迁移影响。
+- 本次发布在纳入并发 RPM 修复后重新构建，`v0.9.5` 标签已更新。若在流水线重启前已获取该标签或拉取 `0.9.5` / `latest` 镜像，请以本次 Release 对应提交为准更新源码，或重新拉取镜像并重建容器；此前的镜像不含该修复，仅比较版本号无法识别这次更新。
+
+完整变更：[v0.9.4...v0.9.5](https://github.com/ZyphrZero/kiro.rs/compare/v0.9.4...v0.9.5)。
 
 ## [0.9.4] - 2026-11-02
 

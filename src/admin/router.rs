@@ -38,7 +38,8 @@ use super::{
         set_protocol_compatibility,
         set_self_heal_config, set_update_config, start_idc_login, start_idc_relogin,
         start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_key, stats_by_model, stats_overview, stats_timeseries,
+        stats_by_credential, stats_by_key, stats_by_model, stats_credential_activity, stats_overview,
+        stats_timeseries,
         test_model,
         trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
@@ -265,6 +266,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/timeseries", get(stats_timeseries))
         .route("/stats/by-model", get(stats_by_model))
         .route("/stats/by-credential", get(stats_by_credential))
+        .route("/stats/credential-activity", get(stats_credential_activity))
         .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
