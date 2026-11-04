@@ -84,6 +84,10 @@ async fn main() {
     }
 
     tracing::info!("已加载 {} 个凭据配置", credentials_list.len());
+    tracing::info!(
+        mode = ?config.tool_compatibility_mode,
+        "客户端工具兼容模式（修改配置后需重启生效）"
+    );
 
     // 仅显示安全的元数据，避免在日志里泄露 token / client_secret
     let first_credentials = credentials_list.first().cloned().unwrap_or_default();

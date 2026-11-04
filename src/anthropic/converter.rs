@@ -783,10 +783,10 @@ fn sorted_ids(ids: &std::collections::HashSet<String>) -> Vec<String> {
 }
 
 /// 将 Anthropic 请求转换为 Kiro 请求
-/// 便捷入口（测试用）：默认按 ClaudeCode 模式转换。
+/// 便捷入口（测试用）：与服务端默认工具模式一致。
 #[cfg(test)]
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
-    convert_request_with_mode(req, ToolCompatibilityMode::ClaudeCode)
+    convert_request_with_mode(req, ToolCompatibilityMode::default())
 }
 
 pub fn convert_request_with_mode(
@@ -3671,7 +3671,7 @@ mod tests {
     }
 
     #[test]
-    fn cc_convert_request_default_maps_builtin_names() {
+    fn cc_convert_request_preserves_names_by_default_and_allows_mapping_fallback() {
         use super::super::types::Message as AnthropicMessage;
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
@@ -3689,10 +3689,120 @@ mod tests {
             metadata: None,
             cache_control: None,
         };
-        // convert_request 测试垫片默认 ClaudeCode 模式。
         let result = convert_request(&req).unwrap();
-        assert_eq!(result.tool_name_map.get("fs_write").map(|s| s.as_str()), Some("Write"));
-        assert_eq!(result.tool_name_map.get("read_file").map(|s| s.as_str()), Some("Read"));
+        assert!(result.tool_name_map.is_empty());
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| tool.tool_specification.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Write", "Read"]);
+
+        let result = convert_request_with_mode(&req, ToolCompatibilityMode::ClaudeCode).unwrap();
+        assert_eq!(
+            result.tool_name_map.get("fs_write").map(|s| s.as_str()),
+            Some("Write")
+        );
+        assert_eq!(
+            result.tool_name_map.get("read_file").map(|s| s.as_str()),
+            Some("Read")
+        );
+    }
+
+    #[test]
+    fn raw_mode_preserves_client_options_in_schema_history_and_response() {
+        use serde_json::json;
+
+        for (name, input) in [
+            (
+                "Edit",
+                json!({"file_path":"/a.txt","old_string":"a","new_string":"b","replace_all":true}),
+            ),
+            (
+                "Read",
+                json!({"file_path":"/a.pdf","pages":"2-3","offset":2,"limit":5}),
+            ),
+            (
+                "Bash",
+                json!({"command":"printf OK","description":"audit","run_in_background":true}),
+            ),
+            ("Glob", json!({"pattern":"**/*.rs","path":"/workspace"})),
+            (
+                "Grep",
+                json!({"pattern":"hello","path":"/workspace","glob":"*.rs","output_mode":"content","-i":true,"-n":true,"multiline":true}),
+            ),
+        ] {
+            let properties: serde_json::Map<_, _> = input
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| {
+                    let kind = if value.is_boolean() {
+                        "boolean"
+                    } else if value.is_number() {
+                        "number"
+                    } else {
+                        "string"
+                    };
+                    (key.clone(), json!({"type":kind}))
+                })
+                .collect();
+            let schema = json!({"type":"object","properties":properties,"required":input.as_object().unwrap().keys().collect::<Vec<_>>(),"additionalProperties":false});
+            let req = request_from_json(json!({
+                "model":"claude-opus-5-5","max_tokens":1024,
+                "tools":[{"name":name,"description":"Client-defined tool.","input_schema":schema}],
+                "messages":[
+                    {"role":"user","content":"Use the tool."},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"tool_audit","name":name,"input":input}]},
+                    {"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_audit","content":"done"}]}
+                ]
+            }));
+            let result = convert_request(&req).unwrap();
+            assert!(result.tool_name_map.is_empty(), "{name}");
+            let declared = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools[0]
+                .tool_specification;
+            assert_eq!(declared.name, name);
+            let emitted_schema = serde_json::to_value(&declared.input_schema).unwrap();
+            assert_eq!(
+                emitted_schema["json"], schema,
+                "{name}: client schema must survive conversion"
+            );
+            let historical = result
+                .conversation_state
+                .history
+                .iter()
+                .find_map(|message| match message {
+                    Message::Assistant(message) => message
+                        .assistant_response_message
+                        .tool_uses
+                        .as_ref()
+                        .and_then(|calls| calls.first()),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(historical.name, name);
+            assert_eq!(
+                historical.input, input,
+                "{name}: historical options must not be dropped"
+            );
+            let (restored_name, restored_input) =
+                restore_tool_use_for_client(name, input.clone(), &result.tool_name_map);
+            assert_eq!(restored_name, name);
+            assert_eq!(
+                restored_input, input,
+                "{name}: returned options must not be rewritten"
+            );
+        }
     }
 
     #[test]
@@ -5281,13 +5391,14 @@ mod tests {
             assert_eq!(restored, input);
 
             // ClaudeCode 模式下确实做过名字映射的工具照旧还原
-            let cc = convert(json!({
+            let cc = convert_request_with_mode(&request_from_json(json!({
                 "model": "claude-opus-5.5",
                 "max_tokens": 1024,
                 "messages": [{"role": "user", "content": "search"}],
                 "tools": [{"name": "WebSearch", "description": "Search",
                            "input_schema": {"type": "object", "properties": {}}}]
-            }));
+            })), ToolCompatibilityMode::ClaudeCode)
+            .unwrap();
             let (name, restored) = restore_tool_use_for_client(
                 "web_search",
                 json!({"query": "q", "extra": 1}),

@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 客户端工具优先使用 raw
+
+- 工具兼容模式默认改为 `raw`，保留 Claude Code 等客户端提供的工具名、schema 与入参，避免映射过程丢失 `replace_all`、PDF `pages`、后台命令和搜索选项。
+- `claude-code` 继续作为显式兼容回退，已有配置中的明确选项保持不变；切换已有实例需修改 `toolCompatibilityMode` 并重启。普通工具仍由客户端执行。
+- raw 保留必要的上游协议规范化、长工具名适配、历史配对与大内容分块提示；不改变服务端搜索和代码执行后端。
+
 ### 登录与 JSON 导入预先选择代理
 
 - Social、AWS Builder ID、企业 SSO 和重新登录支持在发起授权前选择 IP 管理中的代理。服务器的授权、令牌兑换、首次刷新和新凭据均使用所选代理；已禁用或不存在的代理在登录前报错。

@@ -41,14 +41,15 @@ impl ApiDomain {
 
 /// 工具兼容模式。
 ///
-/// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
-///   的工具名与入参双向适配为 Kiro 内置工具（fs_write/str_replace/... ），并替换为 Kiro 内置 schema。
-/// - `Raw`：保留旧行为，直接透传客户端工具名/schema，用于排障。
+/// - `Raw`（默认）：保留客户端工具名、schema 和入参，不替换为 Kiro 内置工具。
+///   仍执行上游协议要求的 schema 规范化与长工具名适配。
+/// - `ClaudeCode`：可选兼容回退，将 Claude Code 工具映射为 Kiro 内置工具并替换 schema。
+///   无法表示的客户端选项可能丢失，不是 Claude Code 客户端的必需模式。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum ToolCompatibilityMode {
-    #[default]
     ClaudeCode,
+    #[default]
     Raw,
 }
 
@@ -390,8 +391,8 @@ pub struct Config {
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
 
-    /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
-    /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
+    /// 工具兼容模式。默认 `raw`，保留客户端工具定义和入参；
+    /// `claude-code` 显式启用 Kiro 内置工具映射，作为兼容回退。
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
@@ -604,7 +605,7 @@ fn default_extract_thinking() -> bool {
 }
 
 fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
-    ToolCompatibilityMode::ClaudeCode
+    ToolCompatibilityMode::default()
 }
 
 fn default_endpoint() -> String {
@@ -778,7 +779,28 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ToolCompatibilityMode};
+
+    #[test]
+    fn tool_mode_defaults_to_raw_and_preserves_explicit_fallback() {
+        assert_eq!(ToolCompatibilityMode::default(), ToolCompatibilityMode::Raw);
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.tool_compatibility_mode, ToolCompatibilityMode::Raw);
+        }
+        for mode in ["raw", "claude-code"] {
+            let config: Config = serde_json::from_value(serde_json::json!({
+                "toolCompatibilityMode": mode
+            }))
+            .unwrap();
+            let saved = serde_json::to_value(&config).unwrap();
+            assert_eq!(saved["toolCompatibilityMode"], mode);
+            let loaded: Config = serde_json::from_value(saved).unwrap();
+            assert_eq!(
+                loaded.tool_compatibility_mode,
+                config.tool_compatibility_mode
+            );
+        }
+    }
 
     #[test]
     fn balance_refresh_interval_defaults_for_existing_configs() {

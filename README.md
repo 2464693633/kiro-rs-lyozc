@@ -384,6 +384,7 @@ Admin API 鉴权同样支持：
 | `selfHealMaxConsecutiveRounds` | `5` | 连续自愈且无成功的最大轮数（`0`=不限），超限即停并提示人工介入 |
 | `modelCacheTtlSecs` | `3600` | 每个凭据的上游可用模型缓存 TTL（秒） |
 | `extractThinking` | `true` | 非流式响应是否把旧 `<thinking>` 文本提取成 thinking block |
+| `toolCompatibilityMode` | `raw` | 保留客户端工具定义；`claude-code` 为可选的 Kiro 内置工具映射回退，修改后重启生效 |
 | `cacheMeteringCapacity` | `262144` | prompt cache 计量条目上限，钳到 `[1024, 8388608]`；见下方「计量容量选型」 |
 | `cacheMeteringPersistEnabled` | `false` | 是否把计量快照落到 `cache_metering.json`（**0.9.x 起默认关闭**） |
 | `cacheMeteringFlushIntervalSecs` | `300` | 快照落盘间隔（秒），钳到 `[10, 3600]`，仅在落盘开启时有意义 |
@@ -697,11 +698,19 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 ### Tool Use
 
+默认使用 `"toolCompatibilityMode": "raw"`，保留 Claude Code 等客户端提供的工具名称、schema 和入参。普通工具由客户端执行，Kiro 返回工具调用后，客户端将执行结果通过 `tool_result` 回传，不需要先改成 Kiro 内置工具名。
+
+`claude-code` 模式保留为兼容回退，会将 `Write`、`Edit`、`Bash` 等工具映射为 Kiro 内置工具并替换 schema。它无法完整表示 `Edit.replace_all`、`Read.pages`、`Bash.run_in_background`、`Glob.path` 和部分 `Grep` 选项，因此不作为默认模式。
+
+已有配置明确写入 `claude-code` 时，升级不会自动覆盖。将 `config.json` 中的 `toolCompatibilityMode` 改为 `raw` 后重启即可切换；建议用新会话验证，避免旧历史工具表示干扰对比。需要回退时将该字段改回 `claude-code` 并重启。
+
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
 
 - 长工具名会被缩短，并在响应流中恢复原始名称。
 - 孤立的 `tool_use` / `tool_result` 会被过滤或修复，避免上游因消息配对错误返回不可恢复错误。
 - tool_result 中的图片会提升到 Kiro 顶层图片字段，并走同一套图片缩放逻辑。
+
+raw 仍保留上游所需的 schema 规范化、工具描述长度限制和大内容分块提示，并非整份 HTTP 请求逐字透传。原生服务端 WebSearch、代码执行的后端支持也不由这个选项控制。
 
 ### WebSearch
 
