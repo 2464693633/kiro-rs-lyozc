@@ -1486,6 +1486,7 @@ pub fn priority_key(priority: u32, invert: bool) -> u32 {
 }
 
 fn credential_matches_request(credentials: &KiroCredentials, group: Option<&str>) -> bool {
+    // Model eligibility is checked separately from the per-credential upstream model cache.
     group_matches(&credentials.groups, group)
 }
 
