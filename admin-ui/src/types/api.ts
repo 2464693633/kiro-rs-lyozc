@@ -591,6 +591,8 @@ export type PollSocialLoginResponse = PollIdcLoginResponse
 
 // ============ 客户端 API Key 分发 ============
 
+export type ClientKeyBillingMode = 'credits' | 'calls'
+
 export interface ClientKeyItem {
   id: number
   /** 脱敏后的 Key（仅展示） */
@@ -601,6 +603,9 @@ export interface ClientKeyItem {
   createdAt: string
   lastUsedAt?: string
   totalCalls: number
+  totalSuccessfulCalls: number
+  billingMode: ClientKeyBillingMode
+  maxCalls?: number
   totalInputTokens: number
   totalOutputTokens: number
   totalCacheCreationTokens: number
@@ -646,6 +651,8 @@ export interface CreateClientKeyRequest {
   /** 是否做本地缓存计量模拟（可选，不传表示开启） */
   cacheMetering?: boolean
   cacheReadLimitPercent?: number | null
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number
 }
 
 /** 创建响应：明文 Key 仅在此处返回一次 */
@@ -664,6 +671,8 @@ export interface UpdateClientKeyRequest {
   cacheMetering?: boolean
   /** 不传保持设置；null 清除上限。 */
   cacheReadLimitPercent?: number | null
+  billingMode?: ClientKeyBillingMode
+  maxCalls?: number | null
 }
 
 // ============ 用量统计 ============

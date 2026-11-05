@@ -4,6 +4,12 @@ use crate::admin::proxy_pool::{ProxyExitInfo, ProxyHealth};
 use crate::kiro::model::credentials::CredentialMetadata;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCompatibilityConfig {
+    pub mode: crate::model::config::ToolCompatibilityMode,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -1312,6 +1318,10 @@ pub struct ClientKeyItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_used_at: Option<String>,
     pub total_calls: u64,
+    pub total_successful_calls: u64,
+    pub billing_mode: super::client_keys::BillingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_calls: Option<u64>,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub total_cache_creation_tokens: u64,
@@ -1422,6 +1432,10 @@ pub struct CreateClientKeyRequest {
     /// 模拟缓存读取上限，整数 0..=100；省略或 null 表示不额外限制。
     #[serde(default)]
     pub cache_read_limit_percent: Option<u8>,
+    #[serde(default)]
+    pub billing_mode: super::client_keys::BillingMode,
+    #[serde(default)]
+    pub max_calls: Option<u64>,
 }
 
 /// 创建客户端 Key 响应（明文 Key 仅在此处返回一次）
@@ -1448,6 +1462,8 @@ pub struct UpdateClientKeyRequest {
     /// 省略保留原设置；null 清除上限；整数 0..=100 设置百分比。
     #[serde(default, deserialize_with = "deserialize_cache_read_limit_patch")]
     pub cache_read_limit_percent: Option<Option<u8>>,
+    pub billing_mode: Option<super::client_keys::BillingMode>,
+    pub max_calls: Option<u64>,
 }
 
 fn deserialize_cache_read_limit_patch<'de, D>(deserializer: D) -> Result<Option<Option<u8>>, D::Error>

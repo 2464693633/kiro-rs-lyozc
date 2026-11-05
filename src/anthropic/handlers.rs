@@ -63,6 +63,7 @@ pub(crate) struct UsageRecordHook {
     pub model: String,
     pub started_at: Instant,
     pub(crate) capture: Option<std::sync::Arc<super::identity_guard::UsageCapture>>,
+    pub count_call: bool,
 }
 
 impl UsageRecordHook {
@@ -80,6 +81,7 @@ impl UsageRecordHook {
             model,
             started_at: Instant::now(),
             capture: state.usage_capture.clone(),
+            count_call: state.count_successful_call,
         }
     }
 
@@ -122,14 +124,7 @@ impl UsageRecordHook {
         }
         if status == "success" {
             if let Some(m) = &self.client_keys {
-                m.record_usage(
-                    self.key_id,
-                    rec.input_tokens,
-                    rec.output_tokens,
-                    rec.cache_creation_tokens,
-                    rec.cache_read_tokens,
-                    rec.credits,
-                );
+                m.record_usage(&rec, self.count_call);
             }
         }
     }
@@ -1062,6 +1057,7 @@ async fn post_messages_inner_impl(
     mut payload: MessagesRequest,
     buffered_sse: bool,
 ) -> Response {
+    let state = state.snapshot_tool_compatibility_mode();
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(
@@ -1546,7 +1542,11 @@ fn create_sse_stream(
                             let final_events = settlement.finish_structured(final_events);
                             settlement.tracer.mark_first_content(&final_events);
                             settlement.update(&ctx, sent_bytes);
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if let Some(message) = ctx.tool_stream_refusal_message() {
+                                settlement.finish(
+                                    "error", "interrupted", Some("upstream_refusal"), Some(message), None,
+                                );
+                            } else if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 settlement.finish(
@@ -2677,6 +2677,7 @@ async fn post_messages_cc_inner_impl(
     mut payload: MessagesRequest,
     buffered_sse: bool,
 ) -> Response {
+    let state = state.snapshot_tool_compatibility_mode();
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,

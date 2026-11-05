@@ -127,5 +127,30 @@ async fn cache_read_limit_api_validates_before_mutation_and_distinguishes_null_f
             .unwrap();
         assert_eq!(listed["keys"][0]["cacheReadLimitPercent"], json!(expected));
     }
+    let response = client.put(&url)
+        .header("x-api-key", "fixture-admin")
+        .json(&json!({"billingMode":"calls","maxCalls":7,"cacheMetering":false,"cacheReadLimitPercent":60}))
+        .send().await.unwrap();
+    assert!(response.status().is_success());
+    for patch in [json!({"name":"both-settings"}), json!({"description":"preserve both"})] {
+        assert!(client.put(&url).header("x-api-key", "fixture-admin")
+            .json(&patch).send().await.unwrap().status().is_success());
+        let row = keys.list().remove(0);
+        assert_eq!(row.billing_mode, crate::admin::client_keys::BillingMode::Calls);
+        assert_eq!(row.max_calls, Some(7));
+        assert!(!row.cache_metering);
+        assert_eq!(row.cache_read_limit_percent, Some(60));
+    }
+    for patch in [
+        json!({"billingMode":"credits","cacheReadLimitPercent":101}),
+        json!({"maxCalls":1,"cacheReadLimitPercent":20}),
+    ] {
+        assert_eq!(client.put(&url).header("x-api-key", "fixture-admin")
+            .json(&patch).send().await.unwrap().status(), axum::http::StatusCode::BAD_REQUEST);
+        let row = keys.list().remove(0);
+        assert_eq!(row.billing_mode, crate::admin::client_keys::BillingMode::Calls);
+        assert_eq!(row.max_calls, Some(7));
+        assert_eq!(row.cache_read_limit_percent, Some(60));
+    }
     drop(server);
 }

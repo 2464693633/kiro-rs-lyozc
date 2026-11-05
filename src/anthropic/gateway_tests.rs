@@ -28,6 +28,9 @@ use bytes::Bytes;
 use futures::{StreamExt, stream};
 use parking_lot::Mutex;
 use serde_json::json;
+
+#[path = "chat_stream_gateway_tests.rs"]
+mod chat_stream_tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -69,6 +72,9 @@ enum Mode {
     },
     ExecutionSchema,
     ExecutionSearch,
+    GatedChatText,
+    GatedToolArguments,
+    CompactionRetry,
     Filtered,
     Stalled,
     SlowHeaders,
@@ -118,7 +124,97 @@ struct Fixture {
     close_headers: Arc<AtomicUsize>,
     /// 上游收到的 Kiro 请求体（JSON）。
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    release_tool_arguments: Arc<tokio::sync::Notify>,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[tokio::test]
+async fn tool_mode_admin_switch_updates_gateway_and_preserves_in_flight_snapshot() {
+    use crate::admin::{
+        AdminService, AdminState, ClientKeyManager, GroupManager, UsageAggregator,
+        create_admin_router,
+    };
+
+    let path = std::env::temp_dir().join(format!("tool-mode-api-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
+    let fixture = fixture_with_config(Mode::Reply(&["ok"]), Config::load(&path).unwrap()).await;
+    let manager = fixture.state.kiro_provider.as_ref().unwrap().token_manager();
+    let state = AdminState::new(
+        "fixture-admin-only",
+        AdminService::new(manager.clone(), vec!["fixture".into()]),
+        Arc::new(ClientKeyManager::new()),
+        Arc::new(UsageAggregator::new()),
+        Arc::new(TraceStore::open_in_memory().unwrap()),
+        Arc::new(GroupManager::new()),
+    );
+    let app = create_admin_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/config/tool-compatibility", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        client.put(&url).json(&json!({"mode":"raw"})).send().await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let initial: serde_json::Value = client.get(&url).header("x-api-key", "fixture-admin-only")
+        .send().await.unwrap().json().await.unwrap();
+    assert_eq!(initial, json!({"mode":"claude-code"}));
+    for invalid in [json!({"mode":"invalid"}), json!({}), json!({"mode":"raw","extra":true})] {
+        let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+            .json(&invalid).send().await.unwrap();
+        assert!(response.status().is_client_error());
+        assert_eq!(manager.tool_compatibility_mode(), ToolCompatibilityMode::ClaudeCode);
+    }
+    let in_flight = fixture.state.clone().snapshot_tool_compatibility_mode();
+    for (mode, name) in [("raw", "Write"), ("claude-code", "fs_write"), ("raw", "Write")] {
+        let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+            .json(&json!({"mode":mode})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.json::<serde_json::Value>().await.unwrap(), json!({"mode":mode}));
+        for endpoint in ["messages", "cc", "chat", "responses"] {
+            for streaming in [false, true] {
+                let mut payload = json!({
+                    "model":"gpt-5.6-sol", "max_tokens":64, "stream":streaming,
+                    "messages":[{"role":"user","content":"hello"}],
+                    "input":[{"role":"user","content":"hello"}],
+                    "tools":[{"name":"Write","description":"fixture", "input_schema":{
+                        "type":"object", "properties":{"file_path":{"type":"string"},"content":{"type":"string"}}
+                    }}]
+                });
+                let parameters = payload["tools"][0]["input_schema"].clone();
+                let response = if endpoint == "chat" {
+                    payload["tools"] = json!([{"type":"function", "function":{
+                        "name":"Write", "description":"fixture", "parameters":parameters
+                    }}]);
+                    post_chat_completions(axum::extract::State(fixture.state.clone()), Extension(key()), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await
+                } else if endpoint == "responses" {
+                    payload["tools"] = json!([{
+                        "type":"function", "name":"Write", "description":"fixture", "parameters":parameters
+                    }]);
+                    post_responses(axum::extract::State(fixture.state.clone()), Extension(key()), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await
+                } else if endpoint == "cc" {
+                    post_messages_cc(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await
+                } else {
+                    post_messages(axum::extract::State(fixture.state.clone()), Extension(key()), Json(serde_json::from_value(payload).unwrap())).await
+                };
+                assert_eq!(response.status(), StatusCode::OK);
+                to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                let bodies = fixture.bodies.lock();
+                let tools = &bodies.last().unwrap()["conversationState"]["currentMessage"]["userInputMessage"]["userInputMessageContext"]["tools"];
+                assert_eq!(tools[0]["toolSpecification"]["name"], name, "{tools}");
+            }
+        }
+    }
+    assert_eq!(in_flight.tool_compatibility_mode, ToolCompatibilityMode::ClaudeCode);
+    assert_eq!(Config::load(&path).unwrap().tool_compatibility_mode, ToolCompatibilityMode::Raw);
+    std::fs::write(&path, "invalid json").unwrap();
+    let response = client.put(&url).header("x-api-key", "fixture-admin-only")
+        .json(&json!({"mode":"claude-code"})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(manager.tool_compatibility_mode(), ToolCompatibilityMode::Raw);
+    server.abort();
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[tokio::test]
@@ -399,11 +495,14 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
     let close_headers = Arc::new(AtomicUsize::new(0));
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let seen_bodies = bodies.clone();
+    let release_tool_arguments = Arc::new(tokio::sync::Notify::new());
+    let release_arguments = release_tool_arguments.clone();
     let (seen_calls, seen_connections, seen_close) =
         (calls.clone(), connections.clone(), close_headers.clone());
     let app = Router::new().route("/", post(move |ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: Bytes| {
         let (calls, connections, close) = (seen_calls.clone(), seen_connections.clone(), seen_close.clone());
         let bodies = seen_bodies.clone();
+        let release_arguments = release_arguments.clone();
         async move {
             let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
             bodies.lock().push(request.clone());
@@ -596,7 +695,42 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 }
                 return Response::new(Body::from(bytes));
             }
-            if matches!(mode, Mode::Tools) {
+            if matches!(mode, Mode::GatedChatText) {
+                let first = frame("assistantResponseEvent", json!({"content": chat_stream_tests::first_text()}));
+                let second = frame("assistantResponseEvent", json!({"content": chat_stream_tests::second_text()}));
+                let metadata = frame("metadataEvent", json!({"tokenUsage": {
+                    "uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2
+                }}));
+                let second_gate = release_arguments.clone();
+                let chunks = stream::once(async move { Ok::<_, Infallible>(first) })
+                    .chain(stream::once(async move {
+                        second_gate.notified().await;
+                        Ok::<_, Infallible>(second)
+                    }))
+                    .chain(stream::once(async move {
+                        release_arguments.notified().await;
+                        Ok::<_, Infallible>(metadata)
+                    }));
+                return Response::new(Body::from_stream(chunks));
+            }
+            if matches!(mode, Mode::GatedToolArguments) {
+                let first = frame("toolUseEvent", json!({
+                    "name":"Write", "toolUseId":"call_1",
+                    "input":"{\"file_path\":\"/not-created\",\"content\":\"first", "stop":false
+                }));
+                let last = frame("toolUseEvent", json!({
+                    "name":"Write", "toolUseId":"call_1", "input":" second\"}", "stop":true
+                }));
+                let chunks = stream::once(async move { Ok::<_, Infallible>(first) })
+                    .chain(stream::once(async move {
+                        release_arguments.notified().await;
+                        Ok::<_, Infallible>(last)
+                    }));
+                return Response::new(Body::from_stream(chunks));
+            }
+            if matches!(mode, Mode::Tools)
+                || (matches!(mode, Mode::CompactionRetry) && calls.load(Ordering::Relaxed) == 1)
+            {
                 let mut bytes = Vec::new();
                 for part in [
                     frame("toolUseEvent", json!({"name":"run", "toolUseId":"call_1", "input":"{\"command\":", "stop":false})),
@@ -678,6 +812,7 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
         connections,
         close_headers,
         bodies,
+        release_tool_arguments,
         task,
     }
 }
@@ -753,11 +888,15 @@ async fn gateway_credential_credit_usage_counts_internal_calls_without_counting_
 }
 
 async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
+    request_with_key(state, endpoint, streaming, key()).await
+}
+
+async fn request_with_key(state: AppState, endpoint: &str, streaming: bool, key_ctx: KeyContext) -> Response {
     let req = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "stream": streaming, "messages": [{"role": "user", "content": "hello"}], "input": [{"role":"user", "content":"hello"}]});
     if endpoint == "chat" {
         post_chat_completions(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             HeaderMap::new(),
             Json(serde_json::from_value(req).unwrap()),
         )
@@ -765,7 +904,7 @@ async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     } else if endpoint == "responses" {
         post_responses(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             HeaderMap::new(),
             Json(serde_json::from_value(req).unwrap()),
         )
@@ -773,14 +912,14 @@ async fn request(state: AppState, endpoint: &str, streaming: bool) -> Response {
     } else if endpoint == "cc" {
         post_messages_cc(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             Json(serde_json::from_value(req).unwrap()),
         )
         .await
     } else {
         post_messages(
             axum::extract::State(state),
-            Extension(key()),
+            Extension(key_ctx),
             Json(serde_json::from_value(req).unwrap()),
         )
         .await
@@ -2413,7 +2552,10 @@ async fn gateway_execution_disconnect_during_backoff_stops_retries() {
 async fn gateway_execution_bridge_returns_unavailable_and_continues_without_fabricating_success() {
     for cc in [false,true] {
         for streaming in [false,true] {
-            let f=fixture(Mode::Execution { client_tool:false }).await;
+            let mut f=fixture(Mode::Execution { client_tool:false }).await;
+            let manager = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+            manager.sync_system_key("system".into(), None, "execution-billing-fixture".into());
+            f.state = f.state.clone().with_usage(Some(manager.clone()), None, None);
             enable_execution_bridge(&f.state);
             let response=compatibility_request(f.state.clone(),cc,execution_request(streaming)).await;
             assert_eq!(response.status(),StatusCode::OK);
@@ -2433,6 +2575,10 @@ async fn gateway_execution_bridge_returns_unavailable_and_continues_without_fabr
             } else { serde_json::from_slice(&bytes).unwrap() };
             assert_eq!(message["usage"]["input_tokens"],26);
             assert_eq!(message["usage"]["output_tokens"],34);
+            let billed = manager.list().remove(0);
+            assert_eq!(billed.total_successful_calls, 1);
+            assert_eq!(billed.total_input_tokens, 26);
+            assert_eq!(billed.total_output_tokens, 34);
         }
     }
 }
@@ -2488,7 +2634,10 @@ async fn gateway_execution_bridge_preserves_client_tool_turns() {
 
 #[tokio::test]
 async fn gateway_execution_bridge_revalidates_the_aggregated_structured_answer() {
-    let f=fixture(Mode::ExecutionSchema).await;
+    let mut f=fixture(Mode::ExecutionSchema).await;
+    let manager = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+    manager.sync_system_key("system".into(), None, "execution-billing-fixture".into());
+    f.state = f.state.clone().with_usage(Some(manager.clone()), None, None);
     enable_execution_bridge(&f.state);
     let mut request=execution_request(false);
     request["output_config"]=json!({"format":{"type":"json_schema","schema":{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}},"additionalProperties":false}}});
@@ -2497,6 +2646,9 @@ async fn gateway_execution_bridge_revalidates_the_aggregated_structured_answer()
     let bytes=to_bytes(response.into_body(),1024*1024).await.unwrap();
     assert!(String::from_utf8_lossy(&bytes).contains("upstream_output_schema_error"));
     assert_eq!(f.calls.load(Ordering::Relaxed),2);
+    let billed = manager.list().remove(0);
+    assert_eq!(billed.total_successful_calls, 0);
+    assert_eq!(billed.total_output_tokens, 34);
 }
 
 #[tokio::test]
@@ -2630,6 +2782,205 @@ async fn gateway_unused_search_tool_has_zero_requests_and_hides_unrequested_reas
             assert_eq!(f.calls.load(Ordering::Relaxed), 1);
         }
     }
+}
+
+#[tokio::test]
+async fn effective_call_billing_counts_completed_requests_across_protocols() {
+    use crate::admin::client_keys::{BillingMode, ClientKeyManager, KeyAuth};
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for streaming in [false, true] {
+            let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            manager.update_meta(entry.id, None, None, None, Some((BillingMode::Calls, Some(1))));
+            let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+            assert_eq!(manager.verify_and_touch_ex(&entry.key), KeyAuth::Ok(entry.id));
+            let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+            let response = request_with_key(state, endpoint, streaming, key_ctx).await;
+            assert_eq!(response.status(), StatusCode::OK, "{endpoint} streaming={streaming}");
+            to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let snapshot = manager.list().remove(0);
+            assert_eq!(snapshot.total_successful_calls, 1, "{endpoint} streaming={streaming}");
+            assert_eq!(snapshot.total_input_tokens, 13);
+            assert_eq!(snapshot.total_output_tokens, 17);
+            assert_eq!(manager.verify_and_touch_ex(&entry.key), KeyAuth::CallsOverLimit {
+                id: entry.id, used: 1, limit: 1,
+            });
+        }
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_does_not_charge_failed_or_interrupted_requests() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        for mode in [Mode::Overloaded, Mode::Interrupted, Mode::Empty, Mode::InvalidFrame] {
+            for streaming in [false, true] {
+                let fixture = fixture(mode).await;
+                let manager = Arc::new(ClientKeyManager::new());
+                let entry = manager.create("billable".into(), None, None);
+                let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+                let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+                let response = request_with_key(state, endpoint, streaming, key_ctx).await;
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+                assert!(status.is_client_error() || status.is_server_error() || String::from_utf8_lossy(&body).contains("error"));
+                assert_eq!(manager.list()[0].total_successful_calls, 0, "{endpoint} streaming={streaming}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_does_not_charge_cancelled_streams() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for endpoint in ["messages", "cc", "chat", "responses"] {
+        let fixture = fixture(Mode::Stalled).await;
+        let manager = Arc::new(ClientKeyManager::new());
+        let entry = manager.create("billable".into(), None, None);
+        let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+        let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+        let mut body = request_with_key(state, endpoint, true, key_ctx).await.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(2), first_content(&mut body)).await.unwrap();
+        drop(body);
+        assert_eq!(manager.list()[0].total_successful_calls, 0, "{endpoint}");
+    }
+}
+
+#[tokio::test]
+async fn effective_call_billing_counts_system_key() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = Arc::new(ClientKeyManager::new());
+    manager.sync_system_key("system".into(), None, "fixture-system-key".into());
+    let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+    let response = request(state, "messages", false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(manager.list()[0].total_successful_calls, 1);
+}
+
+#[tokio::test]
+async fn effective_call_billing_http_quota_and_non_generation_routes() {
+    use crate::admin::client_keys::{BillingMode, ClientKeyManager};
+    use super::middleware::auth_middleware;
+
+    let fixture = fixture(Mode::Normal(Duration::ZERO)).await;
+    let manager = Arc::new(ClientKeyManager::new());
+    let entry = manager.create("billable".into(), None, None);
+    manager.update_meta(entry.id, None, None, None, Some((BillingMode::Calls, Some(1))));
+    let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+    let app = Router::new()
+        .route("/messages", post(post_messages))
+        .route("/count_tokens", post(super::handlers::count_tokens))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let payload = json!({"model": "gpt-5.6-sol", "max_tokens": 64, "messages": [{"role": "user", "content": "hello"}]});
+    let response = client.post(format!("{base}/count_tokens")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(manager.list()[0].total_successful_calls, 0);
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&json!({})).send().await.unwrap();
+    assert!(response.status().is_client_error());
+    assert_eq!(manager.list()[0].total_successful_calls, 0);
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.unwrap();
+    let response = client.post(format!("{base}/messages")).header("x-api-key", &entry.key).json(&payload).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let error: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "rate_limit_error");
+    assert!(error["error"]["message"].as_str().unwrap().contains("有效调用次数"));
+    assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
+    assert_eq!(manager.list()[0].total_successful_calls, 1);
+    task.abort();
+}
+
+#[tokio::test]
+async fn effective_call_billing_compaction_counts_final_success_not_internal_rounds() {
+    use crate::admin::client_keys::ClientKeyManager;
+
+    for streaming in [false, true] {
+        for (mode, expected_calls) in [(Mode::CompactionRetry, 1), (Mode::Tools, 0)] {
+            let fixture = fixture(mode).await;
+            let manager = Arc::new(ClientKeyManager::new());
+            let entry = manager.create("billable".into(), None, None);
+            let state = fixture.state.clone().with_usage(Some(manager.clone()), None, None);
+            let key_ctx = KeyContext { key_id: entry.id, key_source: TraceKeySource::ClientKey, ..key() };
+            let payload = json!({"model": "gpt-5.6-sol", "stream": streaming, "input": [
+                {"role": "user", "content": "Summarize our work"}, {"type": "compaction_trigger"}
+            ]});
+            let response = post_responses(axum::extract::State(state), Extension(key_ctx), HeaderMap::new(), Json(serde_json::from_value(payload).unwrap())).await;
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(body.contains(if expected_calls == 1 { "completed" } else { "compaction_error" }), "{body}");
+            assert_eq!(fixture.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(manager.list()[0].total_successful_calls, expected_calls);
+            assert_eq!(manager.list()[0].total_input_tokens, 26);
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_raw_tool_arguments_arrive_before_upstream_finishes() {
+    let fixture = fixture(Mode::GatedToolArguments).await;
+    let payload = json!({
+        "model":"gpt-5.6-sol", "max_tokens":64, "stream":true,
+        "messages":[{"role":"user", "content":"Write the requested content."}],
+        "tools":[{
+            "name":"Write", "description":"Write exactly the supplied content.",
+            "input_schema":{
+                "type":"object",
+                "properties":{"file_path":{"type":"string"},"content":{"type":"string"}},
+                "required":["file_path","content"]
+            }
+        }]
+    });
+    let response = post_messages(
+        axum::extract::State(fixture.state.clone()),
+        Extension(key()),
+        Json(serde_json::from_value(payload).unwrap()),
+    ).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let mut received = String::new();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(chunk) = body.next().await {
+            received.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if received.contains("input_json_delta") {
+                return;
+            }
+        }
+        panic!("stream ended before the first tool argument fragment");
+    }).await.expect("tool arguments were buffered while upstream waited for the client");
+    let early_events = parse_sse(&received);
+    let start = early_events.iter().find(|(_, event)| event["content_block"]["type"] == "tool_use").unwrap();
+    assert_eq!(start.1["content_block"]["name"], "Write");
+    assert_eq!(start.1["content_block"]["id"], "call_1");
+    let tool_index = start.1["index"].clone();
+    assert!(!early_events.iter().any(|(kind, event)| kind == "content_block_stop" && event["index"] == tool_index));
+    assert!(!received.contains("message_stop"));
+    fixture.release_tool_arguments.notify_one();
+    while let Some(chunk) = body.next().await {
+        received.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    let events = parse_sse(&received);
+    let fragments: Vec<_> = events.iter()
+        .filter(|(_, event)| event["delta"]["type"] == "input_json_delta")
+        .map(|(_, event)| event["delta"]["partial_json"].as_str().unwrap())
+        .collect();
+    assert_eq!(fragments.len(), 2);
+    let input: serde_json::Value = serde_json::from_str(&fragments.concat()).unwrap();
+    assert_eq!(input, json!({"file_path":"/not-created","content":"first second"}));
+    assert_eq!(events.iter().filter(|(kind, event)| kind == "content_block_stop" && event["index"] == tool_index).count(), 1);
+    assert!(events.iter().any(|(kind, event)| kind == "message_delta" && event["delta"]["stop_reason"] == "tool_use"));
+    assert_eq!(events.last().unwrap().0, "message_stop");
 }
 
 #[tokio::test]
@@ -2939,6 +3290,15 @@ async fn gateway_partial_tool_before_refusal_preserves_terminal_reason() {
             let status = response.status();
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             let body = String::from_utf8_lossy(&bytes);
+            if streaming && matches!(mode, Mode::RefusedWithPartialTool) {
+                let events = parse_sse(&body);
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(events.last().unwrap().1["error"]["type"], "permission_error");
+                assert!(body.contains("refusal"));
+                assert!(!body.contains("message_stop"));
+                assert!(!body.contains("upstream_tool_json_error"));
+                continue;
+            }
             if status != StatusCode::OK
                 || !body.contains("\"refusal\"")
                 || body.contains("upstream_tool_json_error")

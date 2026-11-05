@@ -40,7 +40,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 ## ✨ 功能
 
 - **Anthropic Messages API 兼容**：`/v1/messages`、`/v1/models`、`/v1/messages/count_tokens`。
-- **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与合成 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
+- **OpenAI API 兼容**：`/v1/chat/completions` 和 `/v1/responses`，支持非流式响应与逐事件转换的增量 SSE，可供 OpenAI SDK 和新版 Codex CLI 使用。
 - **Claude Code 兼容端点**：`/cc/v1/messages`、`/cc/v1/messages/count_tokens`。
 - **GPT-5.6 模型族**：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`。
 - 流式和非流式响应：支持 Anthropic SSE 与 OpenAI SSE 事件格式。
@@ -59,7 +59,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **Prompt cache 计量**：模拟 Anthropic cache_control 的 `cache_creation` / `cache_read` token 统计。
 - **用量统计**：按客户端 Key、模型、凭据、日期聚合 input/output/cache token 和 credits。
 - **请求链路追踪**：SQLite `traces.db`，记录成功 / 失败请求、尝试链路和错误类型。
-- 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组和统计；鉴权不强制 Key 前缀。
+- 客户端 Key 分发：Admin 面板生成 `sk-...` Key，支持独立启停、轮换、分组、统计，以及按积分或有效调用次数计费；鉴权不强制 Key 前缀。
 - **Admin UI**：概览、凭据管理、客户端 Key、请求日志四个主视图。
 - 代理能力：全局代理、凭据级代理、IP 管理（保存代理后在账号中直接选择）、出口位置与健康检查、轮询分配，支持在用代理自动检测、故障轮换与恢复。
 - **在线更新**：从 GitHub Release / Docker Hub 拉取新版本，支持镜像定时自动更新与手动回退。
@@ -248,6 +248,10 @@ curl http://127.0.0.1:8990/v1/chat/completions \
     ]
   }'
 ```
+
+`stream: true` 会复用 Anthropic 的实时流式链路，将正文分片转换为 `choices[0].delta.content`，工具参数分片转换为 `delta.tool_calls[].function.arguments`；正常结束时发送最终用量、结束原因和 `[DONE]`。流中错误会返回错误事件，不伪装成正常完成。需要完整参数改写的旧工具兼容模式仍存在缓冲边界，见「Tool Use」。
+
+测试流式显示时，使用 `curl -N` 并将请求中的 `stream` 改为 `true`，避免客户端自身缓存输出；网关也发送 `X-Accel-Buffering: no`。SSE 事件与 TCP 包不是一一对应关系，不能仅凭 TCP 包数量判断是否流式；若上游暂时没有正文、只在推理，或最终只提供一个正文片段，网关不会凭空制造文本增量。外层代理还需允许 SSE 透传、关闭响应缓冲。
 
 ### OpenAI Responses / Codex CLI
 
@@ -544,11 +548,33 @@ Enterprise / IdC 账号在流式调用前会按需调用 `ListAvailableProfiles`
 }
 ```
 
-也可以通过环境变量临时注入最高优先级 API Key 凭据：
+也可以通过环境变量补充 API Key 凭据。只有文件中不存在相同完整 Key 时才新增，初始优先级为 `0` 并记录添加时间；已有 Key 沿用原 ID、分组、代理、优先级与禁用状态，不在每次启动时复制，也不会因环境变量重新启用已禁用的凭据。
 
 ```bash
 KIRO_API_KEY=ksk_xxx ./kiro-rs
 ```
+
+### 历史重复凭据清理
+
+早期版本可能在配置 `KIRO_API_KEY` 后，每次启动都将同一 Key 作为新记录写入文件。升级后不再继续新增这些副本；已有重复项不会被静默删除，启动日志会提示。单条添加、批量导入仍统一检查完整 API Key / refreshToken 并明确拒绝重复。
+
+请先停止所有共享此凭据文件的服务、容器和其他写入进程，再运行离线预览（不会启动网关或访问上游）：
+
+```bash
+./kiro-rs --credentials /path/to/credentials.json --deduplicate-credentials
+```
+
+检查输出中的保留 / 移除 ID 和文件条目位置，确认后才执行：
+
+```bash
+./kiro-rs --credentials /path/to/credentials.json --deduplicate-credentials --apply-credential-dedup
+```
+
+- 仅按同一认证类型的完整 `kiroApiKey` 或 `refreshToken` 识别重复，不按邮箱、余额或脱敏尾号合并；不同 API Key、不同 refreshToken 仍保留。
+- 优先保留 `kiro_stats.json` 中有使用记录的条目，再优先有合法添加时间、成功次数较多、原 ID 较小的条目。只保留所选记录的原始字段，包括未知扩展字段；不会合并分组或代理配置，也不会伪造历史添加时间。若预览结果不是你想保留的配置，请先手动整理文件，不要执行清理。
+- 写入前在同目录生成 `credentials.json.pre-dedup-<随机标识>.bak`，有统计文件时也备份 `kiro_stats.json`；这些备份包含敏感凭据 / 统计，请按原文件的安全要求保管，Unix 下以仅所有者可读写权限创建。
+- 清理采用临时文件加原子替换，并生成 `credentials.json.id-watermark` 保留已使用的 ID 上界，避免删除高 ID 副本后新账号重用这些 ID。请随凭据文件一同保留、迁移该侧车文件。
+- 原始统计文件、用量日志和 trace 不自动重写，也不把多个 ID 的累计统计合并成一个 ID；保留项继续沿用原 ID 的统计，其他旧 ID 的历史保持原归属。多进程共享写入不受此命令保护，不能在服务仍写入时执行。
 
 ### 凭据字段
 
@@ -698,11 +724,17 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 ### Tool Use
 
+`toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。
+
+在管理后台「系统设置 → 模型 → 工具兼容模式」点击 `raw` 或 `claude-code` 即可切换。保存成功后写入 `config.json` 并立即对后续请求生效，已经开始的请求保持原模式，无需重启。管理接口为 `GET/PUT /api/admin/config/tool-compatibility`，更新请求体为 `{"mode":"raw"}` 或 `{"mode":"claude-code"}`；需要 Admin API Key，保存失败不会切换运行时模式。
+
+未设置该字段的配置升级后使用 `raw`；已有显式 `"toolCompatibilityMode": "claude-code"` 的配置保持不变。旧模式仍会将 Write/Edit/Bash/Read 等映射为内置工具，并可能丢弃客户端新增字段，建议仅在确认需要该映射时启用。
+
+普通流式响应中，不需要参数改写的原生工具调用会逐片发送 `input_json_delta`，最后才校验完整 JSON；非法 JSON、传输中断或已开始工具调用后的拒答，不会把半截调用标记为可执行的完整结果。旧模式中必须重写参数的工具、从文本识别的 `<invoke>` 调用仍需等参数完整后发送；结构化输出的缓冲行为见上一节。
+
 默认使用 `"toolCompatibilityMode": "raw"`，保留 Claude Code 等客户端提供的工具名称、schema 和入参。普通工具由客户端执行，Kiro 返回工具调用后，客户端将执行结果通过 `tool_result` 回传，不需要先改成 Kiro 内置工具名。
 
 `claude-code` 模式保留为兼容回退，会将 `Write`、`Edit`、`Bash` 等工具映射为 Kiro 内置工具并替换 schema。它无法完整表示 `Edit.replace_all`、`Read.pages`、`Bash.run_in_background`、`Glob.path` 和部分 `Grep` 选项，因此不作为默认模式。
-
-已有配置明确写入 `claude-code` 时，升级不会自动覆盖。将 `config.json` 中的 `toolCompatibilityMode` 改为 `raw` 后重启即可切换；建议用新会话验证，避免旧历史工具表示干扰对比。需要回退时将该字段改回 `claude-code` 并重启。
 
 服务端会把 Anthropic tools 转成 Kiro 工具定义，并处理以下兼容逻辑：
 
@@ -710,7 +742,9 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 - 孤立的 `tool_use` / `tool_result` 会被过滤或修复，避免上游因消息配对错误返回不可恢复错误。
 - tool_result 中的图片会提升到 Kiro 顶层图片字段，并走同一套图片缩放逻辑。
 
-raw 仍保留上游所需的 schema 规范化、工具描述长度限制和大内容分块提示，并非整份 HTTP 请求逐字透传。原生服务端 WebSearch、代码执行的后端支持也不由这个选项控制。
+raw 仍保留上游所需的 schema 规范化、工具描述长度限制，并非整份 HTTP 请求逐字透传。原生服务端 WebSearch、代码执行的后端支持也不由这个选项控制。
+
+可运行忽略的真实上游测试验证当前凭据与模型：设置 `KIRO_RS_LIVE_CONFIG`、`KIRO_RS_LIVE_CREDENTIALS` 为已有配置/凭据文件路径，设置 `KIRO_RS_LIVE_MODEL`，再运行 `cargo test live_tool_modes_preserve_input_and_measure_streaming_without_execution -- --ignored --nocapture`。该测试直接连接 Kiro，不经 Magpie，会消耗真实上游额度；凭据刷新仅在内存中进行，不修改配置/凭据文件，也不执行模型返回的工具。不要为此开启会记录请求头和请求体的全量 debug 日志。
 
 ### WebSearch
 
@@ -886,6 +920,24 @@ JSON 重写的代价线性放大。关闭时启动不读该文件、运行与退
 
 凭据卡片和列表同时展示“今日请求数”和“实时 RPM”，每 5 秒批量刷新一次。统计沿用用量日志的请求完成口径，包含成功和失败，归属最终记录的凭据，不重复计算同一请求的重试次数；“今日”按服务端本地日期计算，RPM 为最近 60 秒完成的请求数，与 RPM 限流开关无关。运行中的长请求会在结束后计入，重启时从保留的用量日志恢复。加载中或查询失败显示“—”，失败时提供重试提示，不会冒充零请求。此功能需要同步更新并重启后端，以提供 `/api/admin/stats/credential-activity` 接口。
 
+### 客户端 Key 计费
+
+在「客户端 Key」的新建或编辑弹窗选择计费方式：
+
+- **按积分计费**（默认）：使用 `totalCredits` 与 `maxCredits` 比较，保持旧版行为。
+- **按有效调用次数计费**：请求成功完成并结算后，`totalSuccessfulCalls` 增加 1，与 `maxCalls` 比较。鉴权失败、参数错误、上游错误、生成过程中断，以及模型列表查询、Token 计数不计费。普通的工具调用回复属于成功请求；内部重试、多轮 WebSearch 和压缩恢复不会重复计次，压缩必须最终生成有效摘要才计次。
+- 两种模式只按各自的额度拦截，不叠加限制；Token 和上游 credits 统计仍保留。`totalCalls` 仍表示鉴权放行次数，**不能当作有效调用量**。
+- 上限留空 / `null` 表示不限制，`0` 表示禁止调用。达到上限返回 HTTP 429。检查发生在请求进入时，已放行的并发请求仍会结算，可能超过上限；这不是预占式硬限额，也不提供多进程共享额度。
+- 切换模式或轮换 Key 不清零统计；「重置统计」会清零有效调用数及原有用量。旧数据默认使用积分模式，有效调用数从升级后开始累积，不根据历史 `totalCalls` 推算。系统 Key `id=0` 同样累计成功用量。
+
+Admin API 创建示例（`POST /api/admin/client-keys` 请求体）：
+
+```json
+{"name":"团队 A 次数包","billingMode":"calls","maxCalls":1000}
+```
+
+`PUT /api/admin/client-keys/{id}` 可使用 `{"billingMode":"calls","maxCalls":2000}` 修改次数额度；提供 `billingMode` 时，`maxCalls` 为 `null` 或省略均表示取消次数上限。仅更新名称、描述或分组时不改变计费配置。切换回积分模式传 `billingMode: "credits"`，积分额度仍由 `/api/admin/client-keys/{id}/max-credits` 设置。这里只管理计费用量和额度，不处理货币单价或支付。
+
 Admin 还提供：
 
 - Social 登录和 IdC / Enterprise 登录流程。
@@ -1009,7 +1061,7 @@ credential.proxyUrl -> config.proxyUrl -> direct
 - 构建并推送 Docker Hub 多架构镜像。
 - 创建 GitHub Release。
 
-当前稳定版：[v0.9.5](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.5)。
+当前稳定版：[v0.9.7](https://github.com/ZyphrZero/kiro.rs/releases/tag/v0.9.7)。
 
 Docker 镜像：
 

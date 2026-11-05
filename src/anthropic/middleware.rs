@@ -55,6 +55,8 @@ pub struct AppState {
     pub trace_store: Option<SharedTraceStore>,
     /// Request-local accounting for internal identity checks and generation.
     pub(crate) usage_capture: Option<Arc<super::identity_guard::UsageCapture>>,
+    /// Internal tool rounds retain usage but settle one successful client call at the outer boundary.
+    pub(crate) count_successful_call: bool,
     /// Runtime protocol settings, shared with the Admin control plane.
     pub protocol_compatibility:
         crate::model::protocol_compatibility::SharedProtocolCompatibility,
@@ -63,6 +65,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub fn snapshot_tool_compatibility_mode(mut self) -> Self {
+        if let Some(provider) = &self.kiro_provider {
+            self.tool_compatibility_mode = provider.token_manager().tool_compatibility_mode();
+        }
+        self
+    }
+
     /// 创建新的应用状态（不含 client_keys 的基础构造，供嵌入 / 测试使用）
     #[allow(dead_code)]
     pub fn new(
@@ -79,6 +88,7 @@ impl AppState {
             cache_meter: None,
             trace_store: None,
             usage_capture: None,
+            count_successful_call: true,
             protocol_compatibility: Arc::new(
                 crate::model::protocol_compatibility::ProtocolCompatibilityRuntime::default(),
             ),
@@ -209,6 +219,16 @@ pub async fn auth_middleware(
                     "rate_limit_error",
                     format!(
                         "该 API Key 已达到积分使用上限（已用 {:.2} / 上限 {:.2}），请联系管理员调整额度或重置统计",
+                        used, limit
+                    ),
+                );
+                return (StatusCode::TOO_MANY_REQUESTS, Json(error)).into_response();
+            }
+            KeyAuth::CallsOverLimit { used, limit, .. } => {
+                let error = ErrorResponse::new(
+                    "rate_limit_error",
+                    format!(
+                        "该 API Key 已达到有效调用次数上限（已用 {} / 上限 {}），请联系管理员调整额度或重置统计",
                         used, limit
                     ),
                 );

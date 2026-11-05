@@ -98,17 +98,22 @@ impl Settlement {
         );
         // A failed review can follow a successfully billed generation. Keep
         // those costs in the key quota too; the regular hook only does this on success.
-        if !success
-            && self.hook.key_id != 0
-            && let Some(keys) = &self.hook.client_keys
-        {
+        if !success && let Some(keys) = &self.hook.client_keys {
             keys.record_usage(
-                self.hook.key_id,
-                usage["input_tokens"].as_u64().unwrap_or(0),
-                usage["output_tokens"].as_u64().unwrap_or(0),
-                usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-                usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
-                usage["credit_usage"].as_f64().unwrap_or(0.0),
+                &UsageRecord {
+                    ts: chrono::Utc::now().to_rfc3339(),
+                    key_id: self.hook.key_id,
+                    credential_id: credential,
+                    model: self.hook.model.clone(),
+                    input_tokens: usage["input_tokens"].as_u64().unwrap_or(0),
+                    output_tokens: usage["output_tokens"].as_u64().unwrap_or(0),
+                    cache_creation_tokens: usage["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+                    cache_read_tokens: usage["cache_read_input_tokens"].as_u64().unwrap_or(0),
+                    credits: usage["credit_usage"].as_f64().unwrap_or(0.0),
+                    duration_ms: self.hook.started_at.elapsed().as_millis() as u64,
+                    status: "error".into(),
+                },
+                false,
             );
         }
     }
@@ -1279,5 +1284,46 @@ mod tests {
         assert_eq!(row.total_credits, 0.25);
         assert_eq!(row.total_input_tokens, 13);
         assert_eq!(row.total_output_tokens, 17);
+        assert_eq!(row.total_successful_calls, 0);
+    }
+
+    #[test]
+    fn captured_internal_rounds_settle_one_successful_call_for_system_and_client_keys() {
+        for system in [false, true] {
+            for success in [false, true] {
+                let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
+                let id = if system {
+                    keys.sync_system_key("fixture".into(), None, "settlement-system-fixture".into());
+                    0
+                } else {
+                    keys.create("fixture".into(), None, None).id
+                };
+                let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::Raw)
+                    .with_usage(Some(keys.clone()), None, None);
+                let capture = Arc::new(UsageCapture::default());
+                for _ in 0..3 {
+                    capture.record(UsageRecord {
+                        ts: chrono::Utc::now().to_rfc3339(), key_id: id, credential_id: 1,
+                        model: "fixture-model".into(), input_tokens: 10, output_tokens: 5,
+                        cache_creation_tokens: 2, cache_read_tokens: 3, credits: 0.25,
+                        duration_ms: 10, status: "success".into(),
+                    });
+                }
+                let mut settlement = Settlement {
+                    hook: UsageRecordHook::from_state(&state, id, "fixture-model".into()),
+                    capture, finished: false,
+                };
+                settlement.finish(success);
+                settlement.finish(success);
+                drop(settlement);
+                let row = keys.list().remove(0);
+                assert_eq!(row.total_successful_calls, u64::from(success));
+                assert_eq!(row.total_input_tokens, 30);
+                assert_eq!(row.total_output_tokens, 15);
+                assert_eq!(row.total_cache_creation_tokens, 6);
+                assert_eq!(row.total_cache_read_tokens, 9);
+                assert_eq!(row.total_credits, 0.75);
+            }
+        }
     }
 }

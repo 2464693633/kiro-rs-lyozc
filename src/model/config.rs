@@ -803,6 +803,16 @@ mod tests {
     }
 
     #[test]
+    fn tool_mode_defaults_to_raw_without_overriding_explicit_compatibility() {
+        for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(config.tool_compatibility_mode, super::ToolCompatibilityMode::Raw);
+        }
+        assert_eq!(super::ToolCompatibilityMode::default(), super::ToolCompatibilityMode::Raw);
+        let explicit: Config = serde_json::from_str(r#"{"toolCompatibilityMode":"claude-code"}"#).unwrap();
+        assert_eq!(explicit.tool_compatibility_mode, super::ToolCompatibilityMode::ClaudeCode);
+    }
+
+    #[test]
     fn balance_refresh_interval_defaults_for_existing_configs() {
         for config in [Config::default(), serde_json::from_str("{}").unwrap()] {
             assert_eq!(config.balance_refresh_interval_secs, None);

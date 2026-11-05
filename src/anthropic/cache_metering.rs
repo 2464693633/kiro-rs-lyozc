@@ -132,14 +132,27 @@ impl CacheUsage {
         // 1. 缓存覆盖前缀占整个 prompt 的比例，换算到真实 total 口径。
         let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
         let cache_total = (((total as f64) * ratio).round() as i32).min(total);
-        let uncached_tail = total - cache_total;
+        let mut uncached_tail = total - cache_total;
 
         // 2. 覆盖前缀内部再按 estimate 口径的命中比例拆成 read 与 creation。
         let cache_read = ((cache_total as f64)
             * (self.cache_read as f64 / self.cache_covered_est as f64))
             .round() as i32;
-        let cache_read = cache_read.clamp(0, cache_total);
-        let cache_creation = cache_total - cache_read;
+        let mut cache_read = cache_read.clamp(0, cache_total);
+        let mut cache_creation = cache_total - cache_read;
+
+        // 3. total > 0 时至少给 input 留 1 个 token。客户端普遍按"零值不覆盖非零"合并
+        //    message_start 与 message_delta 的 usage，input 归零会让 start 里的估算值残留，
+        //    上下文被重复计算（见 #111）。断点打在最后一条 user message 上时 ratio 会到 1.0。
+        //    优先从 creation 挪 1 个给 input，creation 为 0 时再从 read 挪。
+        if total > 0 && uncached_tail == 0 {
+            if cache_creation > 0 {
+                cache_creation -= 1;
+            } else {
+                cache_read -= 1;
+            }
+            uncached_tail = 1;
+        }
 
         let limited_read = match self.read_limit_percent {
             Some(percent) => {
@@ -1969,6 +1982,34 @@ mod tests {
     }
 
     #[test]
+    fn split_against_total_full_coverage_keeps_input_nonzero() {
+        // 断点覆盖整个 prompt（ratio = 1.0）时 input 不能为 0
+        let u = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        let (input, creation, read) = u.split_against_total(94_000);
+        assert_eq!(input, 1);
+        assert_eq!(input + creation + read, 94_000);
+
+        let hit = CacheUsage {
+            cache_read: 100,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        let (input, creation, read) = hit.split_against_total(94_000);
+        assert_eq!(input, 1);
+        assert_eq!(creation, 0);
+        assert_eq!(read, 93_999);
+
+        // total 为 0 时仍然全为 0
+        assert_eq!(u.split_against_total(0), (0, 0, 0));
+    }
+
+    #[test]
     fn split_against_total_no_cache_all_input() {
         let u = CacheUsage {
             cache_read: 0,
@@ -1982,14 +2023,14 @@ mod tests {
     #[test]
     fn cache_read_limit_moves_excess_to_input_and_preserves_writes() {
         let usage = CacheUsage { cache_read: 95, cache_covered_est: 100, prompt_total_est: 100, ..Default::default() };
-        assert_eq!(usage.split_against_total(100_000), (0, 5_000, 95_000));
-        assert_eq!(usage.with_read_limit_percent(Some(60)).split_against_total(100_000), (35_000, 5_000, 60_000));
-        assert_eq!(usage.with_read_limit_percent(Some(0)).split_against_total(100_000), (95_000, 5_000, 0));
+        assert_eq!(usage.split_against_total(100_000), (1, 4_999, 95_000));
+        assert_eq!(usage.with_read_limit_percent(Some(60)).split_against_total(100_000), (35_001, 4_999, 60_000));
+        assert_eq!(usage.with_read_limit_percent(Some(0)).split_against_total(100_000), (95_001, 4_999, 0));
         assert_eq!(usage.with_read_limit_percent(Some(100)).split_against_total(100_000), usage.split_against_total(100_000));
         let low_hit = CacheUsage { cache_read: 20, ..usage };
         assert_eq!(low_hit.with_read_limit_percent(Some(60)).split_against_total(100), low_hit.split_against_total(100));
         let cold = CacheUsage { cache_read: 0, ..usage };
-        assert_eq!(cold.with_read_limit_percent(Some(60)).split_against_total(100), (0, 100, 0));
+        assert_eq!(cold.with_read_limit_percent(Some(60)).split_against_total(100), (1, 99, 0));
     }
 
     #[test]
@@ -2087,9 +2128,10 @@ mod tests {
             assert_eq!(async_usage.cache_covered_est, prefix_tokens as i32);
             assert!(async_usage.cache_covered_est > previous_covered);
             let (input, creation, read) = async_usage.split_against_total(prefix_tokens as i32);
-            assert_eq!(input, 0);
+            // 断点覆盖整个 prompt 时 input 保底为 1，这 1 个从 creation 里扣
+            assert_eq!(input, 1);
             assert_eq!(read, previous_covered);
-            assert_eq!(creation, prefix_tokens as i32 - previous_covered);
+            assert_eq!(creation, prefix_tokens as i32 - previous_covered - 1);
             previous_covered = async_usage.cache_covered_est;
 
             req.messages.extend([

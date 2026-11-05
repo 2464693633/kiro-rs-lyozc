@@ -9,7 +9,7 @@ import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import {
-  Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
+  Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
@@ -26,7 +26,7 @@ import { useGroupOptions } from '@/hooks/use-groups'
 import { useCacheMeteringConfig } from '@/hooks/use-credentials'
 import { listClientKeys } from '@/api/client-keys'
 import { GroupSingleSelect } from '@/components/group-select'
-import type { ClientKeyItem, CreateClientKeyResponse, ClientKeyQueryParams, SortDir } from '@/types/api'
+import type { ClientKeyItem, ClientKeyBillingMode, CreateClientKeyResponse, ClientKeyQueryParams, SortDir } from '@/types/api'
 import { extractErrorMessage, formatCredits } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { ConsoleTable, type ConsoleColumn } from '@/components/console/data-table'
@@ -85,6 +85,62 @@ function CacheReadLimitInput({ id, value, onChange, disabled }: {
         超出部分转为普通输入；缓存写入和实际积分不变。
         仅在模拟缓存计量开启时生效，上游返回的真实用量保持原值。
       </p>
+    </div>
+  )
+}
+
+function parseMaxCallsInput(raw: string): number | null | 'invalid' {
+  const value = parseMaxCreditsInput(raw)
+  if (value === null || value === 'invalid') return value
+  return Number.isSafeInteger(value) ? value : 'invalid'
+}
+
+function BillingFields({ id, mode, onModeChange, limit, onLimitChange, disabled }: {
+  id: string
+  mode: ClientKeyBillingMode
+  onModeChange: (mode: ClientKeyBillingMode) => void
+  limit: string
+  onLimitChange: (value: string) => void
+  disabled: boolean
+}) {
+  const byCalls = mode === 'calls'
+  return (
+    <div className="flex flex-col gap-3">
+      <div>
+        <label htmlFor={`${id}-mode`} className="text-[12px] text-muted-foreground">计费方式</label>
+        <Select value={mode} onValueChange={(value) => onModeChange(value === 'calls' ? 'calls' : 'credits')} disabled={disabled}>
+          <SelectTrigger id={`${id}-mode`}><SelectValue /></SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectItem value="credits">按积分计费</SelectItem>
+              <SelectItem value="calls">按有效调用次数计费</SelectItem>
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      </div>
+      <div>
+        <label htmlFor={`${id}-limit`} className="text-[12px] text-muted-foreground">
+          {byCalls ? '有效调用次数上限（可选）' : '积分上限（可选）'}
+        </label>
+        <Input
+          id={`${id}-limit`}
+          type="number"
+          min="0"
+          max={byCalls ? Number.MAX_SAFE_INTEGER : undefined}
+          step={byCalls ? '1' : 'any'}
+          inputMode={byCalls ? 'numeric' : 'decimal'}
+          placeholder="留空表示不限制"
+          value={limit}
+          onChange={(event) => onLimitChange(event.target.value)}
+          disabled={disabled}
+        />
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          {byCalls
+            ? '成功完成的请求计 1 次，失败、中断、内部重试不额外计次。达到上限后拒绝新请求（HTTP 429）；已放行的并发请求仍会结算，可能超过上限。'
+            : '累计 credit 达到上限后拒绝新请求（HTTP 429）。'}
+          留空表示不限制，0 表示禁止调用。切换计费方式保留统计，重置统计后重新计费。
+        </p>
+      </div>
     </div>
   )
 }
@@ -175,6 +231,8 @@ export function ClientKeysPage() {
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createCacheMetering, setCreateCacheMetering] = useState(true)
   const [createCacheReadLimit, setCreateCacheReadLimit] = useState('')
+  const [createBillingMode, setCreateBillingMode] = useState<ClientKeyBillingMode>('credits')
+  const [createMaxCalls, setCreateMaxCalls] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -186,6 +244,8 @@ export function ClientKeysPage() {
   const [editMaxCredits, setEditMaxCredits] = useState('')
   const [editCacheMetering, setEditCacheMetering] = useState(true)
   const [editCacheReadLimit, setEditCacheReadLimit] = useState('')
+  const [editBillingMode, setEditBillingMode] = useState<ClientKeyBillingMode>('credits')
+  const [editMaxCalls, setEditMaxCalls] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -194,7 +254,7 @@ export function ClientKeysPage() {
       toast.error('请填写名称')
       return
     }
-    const maxCredits = parseMaxCreditsInput(createMaxCredits)
+    const maxCredits = createBillingMode === 'credits' ? parseMaxCreditsInput(createMaxCredits) : null
     if (maxCredits === 'invalid') {
       toast.error('积分上限必须是非负数')
       return
@@ -202,6 +262,11 @@ export function ClientKeysPage() {
     const cacheReadLimit = parseCacheReadLimitInput(createCacheReadLimit)
     if (cacheReadLimit === 'invalid') {
       toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
+      return
+    }
+    const maxCalls = createBillingMode === 'calls' ? parseMaxCallsInput(createMaxCalls) : null
+    if (maxCalls === 'invalid') {
+      toast.error('调用次数上限必须是非负安全整数')
       return
     }
     try {
@@ -212,6 +277,8 @@ export function ClientKeysPage() {
         maxCredits: maxCredits ?? undefined,
         cacheMetering: createCacheMetering,
         cacheReadLimitPercent: cacheReadLimit,
+        billingMode: createBillingMode,
+        maxCalls: maxCalls ?? undefined,
       })
       setCreatedKey(res)
       setCreateOpen(false)
@@ -221,6 +288,8 @@ export function ClientKeysPage() {
       setCreateMaxCredits('')
       setCreateCacheMetering(true)
       setCreateCacheReadLimit('')
+      setCreateBillingMode('credits')
+      setCreateMaxCalls('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -305,13 +374,15 @@ export function ClientKeysPage() {
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditCacheMetering(item.cacheMetering)
     setEditCacheReadLimit(item.cacheReadLimitPercent != null ? String(item.cacheReadLimitPercent) : '')
+    setEditBillingMode(item.billingMode)
+    setEditMaxCalls(item.maxCalls != null ? String(item.maxCalls) : '')
     setEditOpen(true)
   }
 
   const handleEditSave = async (e: React.FormEvent) => {
     e.preventDefault()
     if (!editTarget) return
-    const maxCredits = parseMaxCreditsInput(editMaxCredits)
+    const maxCredits = editBillingMode === 'credits' ? parseMaxCreditsInput(editMaxCredits) : (editTarget.maxCredits ?? null)
     if (maxCredits === 'invalid') {
       toast.error('积分上限必须是非负数')
       return
@@ -319,6 +390,11 @@ export function ClientKeysPage() {
     const cacheReadLimit = parseCacheReadLimitInput(editCacheReadLimit)
     if (cacheReadLimit === 'invalid') {
       toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
+      return
+    }
+    const maxCalls = editBillingMode === 'calls' ? parseMaxCallsInput(editMaxCalls) : (editTarget.maxCalls ?? null)
+    if (maxCalls === 'invalid') {
+      toast.error('调用次数上限必须是非负安全整数')
       return
     }
     try {
@@ -330,6 +406,7 @@ export function ClientKeysPage() {
           group: editGroup.trim(),
           cacheMetering: editCacheMetering,
           cacheReadLimitPercent: cacheReadLimit,
+          billingMode: editBillingMode, maxCalls,
         },
       })
       // 仅在上限发生变化时才调用额度接口，避免无谓写入
@@ -605,6 +682,12 @@ export function ClientKeysPage() {
         cell: (k) => <span className="console-num">{k.totalCalls}</span>,
       },
       {
+        id: 'successfulCalls',
+        header: '有效调用',
+        align: 'right',
+        cell: (item) => <span className="console-num">{item.totalSuccessfulCalls}</span>,
+      },
+      {
         id: 'inputTokens',
         header: '输入',
         align: 'right',
@@ -618,9 +701,13 @@ export function ClientKeysPage() {
       },
       {
         id: 'credits',
-        header: '积分 / 上限',
+        header: '计费 / 上限',
         align: 'right',
-        cell: (k) => <CreditsUsage used={k.totalCredits} max={k.maxCredits} />,
+        cell: (item) => item.billingMode === 'calls' ? (
+          <span className="console-num" title={`有效调用 ${item.totalSuccessfulCalls} 次；上游累计 ${formatCredits(item.totalCredits)} credits`}>
+            {item.totalSuccessfulCalls} / {item.maxCalls ?? '无限制'} 次
+          </span>
+        ) : <CreditsUsage used={item.totalCredits} max={item.maxCredits} />,
       },
       {
         id: 'lastUsed',
@@ -963,22 +1050,14 @@ export function ClientKeysPage() {
                   绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
                 </p>
               </div>
-              <div>
-                <label className="text-[12px] text-muted-foreground">积分上限（可选）</label>
-                <Input
-                  type="number"
-                  min="0"
-                  step="any"
-                  inputMode="decimal"
-                  placeholder="留空表示不限制"
-                  value={createMaxCredits}
-                  onChange={(e) => setCreateMaxCredits(e.target.value)}
-                  disabled={createKey.isPending}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  累计使用的 credit 达到上限后，该 Key 的请求会被拒绝（HTTP 429）。重置统计后重新计费。
-                </p>
-              </div>
+              <BillingFields
+                id="create-billing"
+                mode={createBillingMode}
+                onModeChange={setCreateBillingMode}
+                limit={createBillingMode === 'calls' ? createMaxCalls : createMaxCredits}
+                onLimitChange={createBillingMode === 'calls' ? setCreateMaxCalls : setCreateMaxCredits}
+                disabled={createKey.isPending}
+              />
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <label htmlFor="create-cache-metering" className="text-[12px] text-muted-foreground">
@@ -1072,11 +1151,11 @@ export function ClientKeysPage() {
 
       {/* 编辑对话框 */}
       {editOpen && (
-        <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && setEditOpen(o)}>
+        <Dialog open={editOpen} onOpenChange={(o) => !updateKey.isPending && !setMaxCredits.isPending && setEditOpen(o)}>
           <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-md">
             <DialogHeader>
               <DialogTitle>编辑 Key</DialogTitle>
-              <DialogDescription>修改名称与描述（不影响 Key 值与统计）</DialogDescription>
+              <DialogDescription>修改名称、分组与计费设置（不影响 Key 值与累计统计）</DialogDescription>
             </DialogHeader>
             <form onSubmit={handleEditSave} className="space-y-3 py-2">
               <div>
@@ -1100,22 +1179,14 @@ export function ClientKeysPage() {
                   绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
                 </p>
               </div>
-              <div>
-                <label className="text-[12px] text-muted-foreground">积分上限</label>
-                <Input
-                  type="number"
-                  min="0"
-                  step="any"
-                  inputMode="decimal"
-                  placeholder="留空表示不限制"
-                  value={editMaxCredits}
-                  onChange={(e) => setEditMaxCredits(e.target.value)}
-                  disabled={updateKey.isPending || setMaxCredits.isPending}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  累计 credit 达到上限后该 Key 请求会被拒绝（HTTP 429）。清空则取消限制；重置统计可清零已用量。
-                </p>
-              </div>
+              <BillingFields
+                id="edit-billing"
+                mode={editBillingMode}
+                onModeChange={setEditBillingMode}
+                limit={editBillingMode === 'calls' ? editMaxCalls : editMaxCredits}
+                onLimitChange={editBillingMode === 'calls' ? setEditMaxCalls : setEditMaxCredits}
+                disabled={updateKey.isPending || setMaxCredits.isPending}
+              />
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <label htmlFor="edit-cache-metering" className="text-[12px] text-muted-foreground">
@@ -1140,7 +1211,7 @@ export function ClientKeysPage() {
                 disabled={updateKey.isPending || setMaxCredits.isPending}
               />
               <DialogFooter>
-                <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
+                <Button type="button" variant="outline" onClick={() => setEditOpen(false)} disabled={updateKey.isPending || setMaxCredits.isPending}>取消</Button>
                 <Button type="submit" disabled={updateKey.isPending || setMaxCredits.isPending}>
                   {updateKey.isPending || setMaxCredits.isPending ? '保存中…' : '保存'}
                 </Button>

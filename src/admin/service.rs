@@ -9,6 +9,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[cfg(test)]
+#[path = "service_credential_dedup_tests.rs"]
+mod credential_dedup_tests;
+
 use crate::admin::types::GlobalProxyResponse;
 use crate::http_client::ProxyConfig;
 use crate::kiro::auth::idc::{self, BUILDER_ID_START_URL};
@@ -60,6 +64,7 @@ use super::types::{
     UpdateRefreshTokenRequest,
     ProtocolCompatibilityConfigResponse, ProtocolCompatibilityDiagnostics,
     SetProtocolCompatibilityRequest,
+    ToolCompatibilityConfig,
 };
 
 mod proxy;
@@ -3133,6 +3138,23 @@ impl AdminService {
             .set_api_domain(req.domain)
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
         Ok(self.get_api_domain())
+    }
+
+    pub fn get_tool_compatibility_mode(&self) -> ToolCompatibilityConfig {
+        ToolCompatibilityConfig {
+            mode: self.token_manager.tool_compatibility_mode(),
+        }
+    }
+
+    pub fn set_tool_compatibility_mode(
+        &self,
+        req: ToolCompatibilityConfig,
+    ) -> Result<ToolCompatibilityConfig, AdminServiceError> {
+        let mode = self
+            .token_manager
+            .set_tool_compatibility_mode(req.mode)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(ToolCompatibilityConfig { mode })
     }
 
     /// 获取会话粘性路由配置与运行时统计

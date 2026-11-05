@@ -20,6 +20,7 @@ use super::{
         get_credential_balance, get_credential_metadata_schema, get_credential_models,
         get_current_models, get_global_proxy, get_custom_models, get_custom_headers,
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
+        get_tool_compatibility_mode, set_tool_compatibility_mode,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
         get_protocol_compatibility,
         get_proxy_failover_config, get_proxy_pool, get_quota_reset_recovery_config,
@@ -147,6 +148,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/api-domain",
             get(get_api_domain).put(set_api_domain),
+        )
+        .route(
+            "/config/tool-compatibility",
+            get(get_tool_compatibility_mode).put(set_tool_compatibility_mode),
         )
         .route(
             "/config/account-throttle",

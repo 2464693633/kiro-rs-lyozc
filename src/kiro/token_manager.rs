@@ -30,7 +30,11 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::session_affinity::{RouteDecision, SessionAffinity, StickyOutcome};
-use crate::model::config::{ApiDomain, Config};
+use crate::model::config::{ApiDomain, Config, ToolCompatibilityMode};
+
+#[cfg(test)]
+#[path = "token_manager_tool_compatibility_tests.rs"]
+mod tool_compatibility_tests;
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -1346,6 +1350,7 @@ pub struct MultiTokenManager {
     group_manager: RwLock<Option<crate::admin::SharedGroupManager>>,
     /// 对话 / MCP 上游域名（运行时可修改）
     api_domain: Mutex<ApiDomain>,
+    tool_compatibility_mode: Mutex<ToolCompatibilityMode>,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
     /// 账号级 429 限流故障转移开关（运行时可修改）
@@ -1523,7 +1528,12 @@ impl MultiTokenManager {
     ) -> anyhow::Result<Self> {
         // 计算当前最大 ID，为没有 ID 的凭据分配新 ID
         let max_existing_id = credentials.iter().filter_map(|c| c.id).max().unwrap_or(0);
-        let mut next_id = max_existing_id + 1;
+        let reserved_id = credentials_path.as_deref()
+            .map(super::credential_dedup::reserved_id)
+            .transpose()?
+            .unwrap_or(0);
+        let mut next_id = max_existing_id.max(reserved_id)
+            .checked_add(1).ok_or_else(|| anyhow::anyhow!("凭据 ID 已耗尽"))?;
         let mut has_new_ids = false;
         let mut has_new_machine_ids = false;
         let config_ref = &config;
@@ -1640,6 +1650,7 @@ impl MultiTokenManager {
 
         let load_balancing_mode = config.load_balancing_mode.clone();
         let api_domain = config.api_domain;
+        let tool_compatibility_mode = config.tool_compatibility_mode;
         let session_affinity = SessionAffinity::new(
             config.session_affinity_enabled,
             config.session_affinity_ttl_secs,
@@ -1679,6 +1690,7 @@ impl MultiTokenManager {
             invert_priority: AtomicBool::new(invert_priority),
             group_manager: RwLock::new(None),
             api_domain: Mutex::new(api_domain),
+            tool_compatibility_mode: Mutex::new(tool_compatibility_mode),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
@@ -5189,6 +5201,24 @@ impl MultiTokenManager {
         }
         tracing::info!("上游域名已设置为: {:?}", domain);
         Ok(())
+    }
+
+    pub fn tool_compatibility_mode(&self) -> ToolCompatibilityMode {
+        *self.tool_compatibility_mode.lock()
+    }
+
+    pub fn set_tool_compatibility_mode(
+        &self,
+        mode: ToolCompatibilityMode,
+    ) -> anyhow::Result<ToolCompatibilityMode> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        if self.config.config_path().is_none() {
+            anyhow::bail!("配置文件路径未知，无法保存工具兼容模式");
+        }
+        self.update_config_file(|config| config.tool_compatibility_mode = mode)?;
+        *self.tool_compatibility_mode.lock() = mode;
+        tracing::info!(?mode, "工具兼容模式已保存，对后续请求生效");
+        Ok(mode)
     }
 
     /// 注入分组注册表，用于解析分组级负载均衡覆盖。

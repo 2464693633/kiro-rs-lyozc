@@ -285,7 +285,7 @@ fn aggregate_usage(total: &mut Value, usage: &Value) {
 }
 
 async fn run_rounds(
-    state: AppState,
+    mut state: AppState,
     key: KeyContext,
     mut payload: MessagesRequest,
     cc: bool,
@@ -293,6 +293,8 @@ async fn run_rounds(
     progress: Option<Progress>,
 ) -> Response {
     let started = tokio::time::Instant::now();
+    let count_call = state.count_successful_call;
+    state.count_successful_call = false;
     payload.stream = false;
     let mut presentation = Vec::new();
     let mut usage = json!({});
@@ -452,6 +454,9 @@ async fn run_rounds(
                     Json(ErrorResponse::new("upstream_output_schema_error", reason)),
                 )
                     .into_response();
+            }
+            if count_call && let Some(keys) = &state.client_keys {
+                keys.record_successful_call(key.key_id);
             }
             return Json(message).into_response();
         }
