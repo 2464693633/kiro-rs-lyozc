@@ -366,7 +366,7 @@ pub(super) fn message(payload: &MessagesRequest, text: &str) -> Value {
         "stop_reason": "end_turn", "stop_sequence": null,
         // Local generation is free; the semantic wrapper adds its check costs.
         "usage": {"input_tokens": 0, "output_tokens": 0,
-            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}
+            "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}
     })
 }
 

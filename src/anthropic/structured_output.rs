@@ -54,7 +54,7 @@ async fn buffered_stream(
     let initial = json!({"type":"message_start","message":{
         "id":format!("msg_{}",uuid::Uuid::new_v4().simple()),"type":"message","role":"assistant",
         "model":model,"content":[],"stop_reason":null,"stop_sequence":null,
-        "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}
+        "usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}
     }});
     let (sender, receiver) = mpsc::channel::<Bytes>(16);
     tokio::spawn(async move {

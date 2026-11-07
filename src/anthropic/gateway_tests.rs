@@ -521,7 +521,9 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                     _ => if classification { r#"{"kind":"other","language":"zh","model":false,"route":false,"constrained":false}"# } else { r#"{"edits":[]}"# },
                 };
                 let mut bytes = frame("assistantResponseEvent", json!({"content":text})).to_vec();
-                bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                if !matches!(mode, Mode::NoProviderUsage) {
+                    bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                }
                 if matches!(mode, Mode::Metered { .. }) {
                     bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.125})));
                 }
@@ -1356,6 +1358,33 @@ async fn gateway_cache_creation_breakdown_on_both_routes_and_stream_modes() {
                 assert_eq!(aggregated["cache_creation"], usage["cache_creation"]);
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn gateway_guarded_stream_starts_with_zero_cache_creation_breakdown() {
+    for cc in [false, true] {
+        let mut f = fixture(Mode::NoProviderUsage).await;
+        enable_semantic_identity(&mut f);
+        f.state = f.state.clone().with_cache_meter(Some(Arc::new(super::cache_metering::CacheMeter::new(None))));
+        let response = compatibility_request(f.state.clone(), cc, json!({
+            "model":"claude-opus-5-5","max_tokens":512,"stream":true,
+            "system":[{"type":"text","text":"Cache the prefix. ".repeat(80),"cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[{"role":"user","content":"Reply OK."}]
+        })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&bytes).unwrap().lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|data| serde_json::from_str(data).unwrap()).collect();
+        let initial = &events.iter().find(|event| event["type"] == "message_start").unwrap()["message"]["usage"];
+        assert_eq!(initial["cache_creation_input_tokens"], 0);
+        assert_eq!(initial["cache_creation"], json!({"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}));
+        let final_usage = &events.iter().find(|event| event["type"] == "message_delta").unwrap()["usage"];
+        assert!(final_usage["cache_creation_input_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(final_usage["cache_creation"]["ephemeral_1h_input_tokens"], final_usage["cache_creation_input_tokens"]);
+        assert_eq!(final_usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(events.last().unwrap()["type"], "message_stop");
     }
 }
 
