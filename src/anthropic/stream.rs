@@ -1618,9 +1618,11 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 上游原生 reasoningContentEvent 下发的 thinking 签名
     pending_thinking_signature: Option<String>,
-    /// Whether any nonempty displayed thinking text was emitted. A signature-only
-    /// block is valid and must not by itself imply exhausted thinking tokens.
+    /// Whether substantive reasoning was generated, including hidden native
+    /// reasoning. Signature-only blocks must not trigger empty-answer recovery.
     thinking_text_emitted: bool,
+    visible_output_emitted: bool,
+    no_visible_output: bool,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
     /// 是否需要剥离 thinking 内容开头的换行符
@@ -1739,6 +1741,8 @@ impl StreamContext {
             thinking_block_index: None,
             pending_thinking_signature: None,
             thinking_text_emitted: false,
+            visible_output_emitted: false,
+            no_visible_output: false,
             text_block_index: None,
             strip_thinking_leading_newline: false,
             cache_usage: super::cache_metering::CacheUsage::default(),
@@ -2231,6 +2235,7 @@ impl StreamContext {
         // 在文本出口处过滤：一旦同一短行连续重复超过阈值，丢弃后续复读文本，
         // 既不让它喷给客户端、不烧满 max_tokens，也不写进对话历史（断雪球）。
         let kept = self.repeat_guard_filter(text);
+        self.visible_output_emitted |= !kept.trim().is_empty();
         if kept.is_empty() {
             return events;
         }
@@ -2367,6 +2372,7 @@ impl StreamContext {
         &mut self,
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
+        self.thinking_text_emitted |= reasoning.text.as_deref().is_some_and(|text| !text.trim().is_empty());
         if !self.thinking_enabled {
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
@@ -2442,7 +2448,7 @@ impl StreamContext {
 
     /// 创建 thinking_delta 事件
     fn create_thinking_delta_event(&mut self, index: i32, thinking: &str) -> SseEvent {
-        self.thinking_text_emitted |= !thinking.is_empty();
+        self.thinking_text_emitted |= !thinking.trim().is_empty();
         SseEvent::new(
             "content_block_delta",
             json!({
@@ -2803,9 +2809,24 @@ impl StreamContext {
             return events;
         }
 
-        // M2 / L2 / M5：终止原因以上游原生 stopReason 为准。没有原生截断信号时，只有 thinking 的
-        // 一轮按 end_turn 正常结束，不再伪造 max_tokens，也不补空格正文。
+        // Preserve native terminal reasons. A reasoning-only answer is handled
+        // separately below rather than inventing max_tokens or padding text.
         self.apply_native_stop_reason();
+
+        if self.thinking_text_emitted
+            && !self.visible_output_emitted
+            && !self.state_manager.has_tool_use
+            && self.state_manager.get_stop_reason() == "end_turn"
+        {
+            self.no_visible_output = true;
+            tracing::warn!(native_stop_reason = ?self.native_stop_reason,
+                "Upstream reasoning ended without visible output");
+            events.extend(self.generate_error_events(
+                super::output_recovery::ERROR_TYPE,
+                super::output_recovery::ERROR_MESSAGE,
+            ));
+            return events;
+        }
 
         // 精确 metadata 真值优先；缺失时才使用 contextUsage/估算回退。
         let (final_input_tokens, cache_creation, cache_read) = self.resolved_usage();
@@ -2821,6 +2842,10 @@ impl StreamContext {
         ));
 
         events
+    }
+
+    pub(crate) fn no_visible_output_error_message(&self) -> Option<&'static str> {
+        self.no_visible_output.then_some(super::output_recovery::ERROR_MESSAGE)
     }
 
     /// 上游响应体读取失败时生成异常终态，不 flush 可能已被截断的缓冲内容。
@@ -4770,6 +4795,11 @@ mod tests {
         assert_eq!(text, "world", "text should be 'world', got: {:?}", text);
     }
 
+    fn assert_no_visible_output_error(events: &[SseEvent]) {
+        assert_eq!(events.last().unwrap().data["error"]["type"], super::super::output_recovery::ERROR_TYPE);
+        assert!(!events.iter().any(|event| matches!(event.event.as_str(), "message_delta" | "message_stop")));
+    }
+
     #[test]
     fn native_thinking_only_does_not_fabricate_output_limit() {
         let mut ctx = StreamContext::new_with_thinking("claude-sonnet-5.5", 100, true, HashMap::new(), test_known_tools());
@@ -4784,8 +4814,7 @@ mod tests {
             serde_json::from_value(json!({"stopReason":"END_TURN"})).unwrap(),
         )));
         events.extend(ctx.generate_final_events());
-        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
-        assert_ne!(terminal.data["delta"]["stop_reason"], "max_tokens");
+        assert_no_visible_output_error(&events);
         assert_eq!(collect_text_content(&events), "");
     }
 
@@ -4849,20 +4878,19 @@ mod tests {
         let mut events = ctx.generate_initial_events();
         events.extend(ctx.process_assistant_response("<thinking>abc</thinking>"));
         events.extend(ctx.generate_final_events());
-        let terminal = events.iter().find(|event| event.event == "message_delta").unwrap();
-        assert_eq!(terminal.data["delta"]["stop_reason"], "end_turn");
+        assert_no_visible_output_error(&events);
         assert_eq!(collect_text_content(&events), "");
         assert_eq!(collect_thinking_content(&events), "abc");
     }
 
     #[test]
     fn test_thinking_only_ends_turn_without_padding() {
-        // L2：只有 thinking、上游没有截断信号时按 end_turn 正常结束，不补空格正文。
+        // A substantive reasoning-only generation is an explicit recoverable error.
         let mut ctx = fr_ctx(true);
         let mut all = ctx.generate_initial_events();
         all.extend(ctx.process_assistant_response("<thinking>只是想了想</thinking>"));
         all.extend(ctx.generate_final_events());
-        assert_eq!(fr_stop_reason(&all), json!("end_turn"));
+        assert_no_visible_output_error(&all);
         assert_eq!(collect_text_content(&all), "");
         assert_eq!(collect_thinking_content(&all), "只是想了想");
     }
@@ -5551,11 +5579,7 @@ mod tests {
             events.extend(ctx.generate_final_events());
             assert_eq!(collect_thinking_content(&events), "actual reasoning");
             assert_eq!(collect_text_content(&events), "");
-            let final_event = events
-                .iter()
-                .find(|event| event.event == "message_delta")
-                .unwrap();
-            assert_eq!(final_event.data["delta"]["stop_reason"], "end_turn");
+        assert_no_visible_output_error(&events);
         }
     }
 

@@ -708,11 +708,15 @@ Kiro 上游可能返回原生 `reasoningContentEvent`。`kiro-rs` 会把它转�
 - `text` → 流式 `thinking_delta`，非流式 `thinking` block。
 - `signature` → 流式 `signature_delta`，非流式 `thinking.signature`。
 - `redactedContent` → `redacted_thinking` block。
-- 如果当前请求没有启用 thinking，明文 reasoning 会降级为普通 text；签名和 redacted 内容不会输出。
+- 如果当前请求没有启用 thinking，reasoning、签名和 redacted 内容不会作为正文输出；其消耗仍计入用量。
 
 非流式响应优先使用原生 reasoning 事件；只有没有原生 reasoning 时，才回退到旧的 `<thinking>...</thinking>` 文本提取路径。
 
 结束原因优先采用上游 `metadataEvent.stopReason`。只有 thinking 的响应不会被自动改写成 `max_tokens`，也不会补造空格正文；真实的输出上限仍按上游事件报告。
+
+当上游以 `end_turn` 结束，却只有非空思考、没有正文或工具调用时，返回 `upstream_no_visible_output`，不再将空白回合记作成功。`/v1/messages` 和 `/cc/v1/messages` 的普通 thinking 请求会自动恢复一次：保留原任务、工具和输出格式，将恢复请求的 effort 限制为 `high`（原本为 `low` / `medium` 时保留），并要求生成实际回答或工具调用。正常请求的 effort 不变。
+
+这类流式请求会暂存正文出现前的事件并持续发送 ping；正文或工具调用一出现，就按原顺序放出并继续实时转发。第一次空白尝试的事件会丢弃，避免出现两组消息或残留签名；缓冲上限为 4 MiB，超限明确报错。已经返回正文或工具调用的请求不自动重发，服务端执行工具的请求不进入该恢复机制，拒答、真实输出上限、上下文超限及网络错误保留原有处理。恢复仍失败时返回明确错误，不无限重试。两次尝试的 Token 和积分均累计，但只结算一次成功调用；客户端取消后立即停止后续恢复。
 
 上游返回 `CONTENT_FILTERED` 时按拒答处理：Anthropic 响应 `stop_reason` 为 `refusal`（Chat Completions 为 `content_filter`，Responses 为 `incomplete`）。它表示 Kiro 上游终止了生成，不表示客户端用完了输出 Token，也不会被后续的 `max_tokens` 或上下文窗口事件覆盖。
 

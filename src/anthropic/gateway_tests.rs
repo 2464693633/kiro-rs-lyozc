@@ -31,6 +31,8 @@ use serde_json::json;
 
 #[path = "chat_stream_gateway_tests.rs"]
 mod chat_stream_tests;
+#[path = "output_recovery_tests.rs"]
+mod output_recovery_tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,
@@ -44,6 +46,7 @@ use std::{
 
 #[derive(Clone, Copy)]
 enum Mode {
+    OutputRecovery { outcome: &'static str, legacy: bool },
     ReviewSuspended,
     ReviewRepetition,
     ReviewEndTurn,
@@ -521,6 +524,29 @@ async fn fixture_with_config(mode: Mode, config: Config) -> Fixture {
                 bytes.extend_from_slice(&frame("metadataEvent", json!({"tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
                 if matches!(mode, Mode::Metered { .. }) {
                     bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.125})));
+                }
+                return Response::new(Body::from(bytes));
+            }
+            if let Mode::OutputRecovery { outcome, legacy } = mode {
+                let recovering = request.to_string().contains("The previous generation ended after reasoning");
+                let signature = if recovering { "recovery-signature" } else { "discarded-first-signature" };
+                let mut bytes = if legacy {
+                    frame("assistantResponseEvent", json!({"content":"<thinking>fixture private reasoning</thinking>\n\n"})).to_vec()
+                } else {
+                    frame("reasoningContentEvent", json!({"text":"fixture private reasoning", "signature":signature})).to_vec()
+                };
+                if outcome == "visible" || (recovering && matches!(outcome, "answer" | "structured")) {
+                    bytes.extend_from_slice(&frame("assistantResponseEvent", json!({"content":if outcome == "structured" { "{\"ok\":true}" } else { "recovered answer" }})));
+                } else if recovering && outcome == "tool" {
+                    bytes.extend_from_slice(&frame("toolUseEvent", json!({"name":"Grep", "toolUseId":"recovered-tool", "input":"{\"pattern\":\"hello\",\"-n\":true}", "stop":true})));
+                }
+                bytes.extend_from_slice(&frame("metadataEvent", json!({"stopReason": if outcome == "refusal" { "CONTENT_FILTERED" } else { "END_TURN" }, "tokenUsage":{"uncachedInputTokens":13,"outputTokens":17,"cacheReadInputTokens":3,"cacheWriteInputTokens":2}})));
+                bytes.extend_from_slice(&frame("meteringEvent", json!({"unit":"credit","unitPlural":"credits","usage":0.125})));
+                if outcome == "stall" {
+                    return Response::new(Body::from_stream(
+                        stream::once(async move { Ok::<_, Infallible>(Bytes::from(bytes)) })
+                            .chain(stream::pending::<Result<Bytes, Infallible>>())
+                    ));
                 }
                 return Response::new(Body::from(bytes));
             }

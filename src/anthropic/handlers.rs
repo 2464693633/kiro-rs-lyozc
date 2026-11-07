@@ -1013,11 +1013,7 @@ pub(super) async fn post_compatible_messages_inner(
         payload.stream = false;
     }
     let response = async move {
-        let response = if cc {
-            post_messages_cc_inner_impl(state, key_ctx, payload, buffered_sse).await
-        } else {
-            post_messages_inner_impl(state, key_ctx, payload, buffered_sse).await
-        };
+        let response = super::output_recovery::run(state, key_ctx, payload, cc, buffered_sse).await;
         super::structured_output::present_identity_response(
             response,
             identity_format.as_ref(),
@@ -1051,7 +1047,7 @@ pub(super) async fn post_messages_inner(
     post_messages_inner_impl(state, key_ctx, payload, false).await
 }
 
-async fn post_messages_inner_impl(
+pub(super) async fn post_messages_inner_impl(
     state: AppState,
     key_ctx: KeyContext,
     mut payload: MessagesRequest,
@@ -1555,6 +1551,10 @@ fn create_sse_stream(
                                     Some(outcome::BAD_REQUEST),
                                     Some(&message),
                                     None,
+                                );
+                            } else if let Some(message) = ctx.no_visible_output_error_message() {
+                                settlement.finish(
+                                    "error", "error", Some(super::output_recovery::ERROR_TYPE), Some(message), None,
                                 );
                             } else if let Some(message) = ctx.repeat_guard_error_message() {
                                 settlement.finish(
@@ -2378,6 +2378,7 @@ async fn execute_non_stream_request_with_format(
         0
     };
     // 构建响应内容
+    let substantive_native_reasoning = !native_thinking.trim().is_empty();
     let mut content = build_non_stream_content(
         thinking_enabled,
         text_content,
@@ -2406,8 +2407,23 @@ async fn execute_non_stream_request_with_format(
     {
         super::structured_rewrite::rewrite_content(&mut content, schema, model);
     }
-    let validation_error =
-        super::structured_output::validate(output_format.as_ref(), &content, &stop_reason).err();
+    let no_visible_output = super::output_recovery::is_no_visible_output(
+        &content, &stop_reason, substantive_native_reasoning,
+    );
+    let validation_error = if no_visible_output {
+        Some(super::output_recovery::ERROR_MESSAGE.to_string())
+    } else {
+        super::structured_output::validate(output_format.as_ref(), &content, &stop_reason).err()
+    };
+    let response_error_type = if no_visible_output {
+        super::output_recovery::ERROR_TYPE
+    } else {
+        "upstream_output_schema_error"
+    };
+    if no_visible_output {
+        tracing::warn!(credential_id, native_stop_reason = ?native_stop_reason,
+            %stop_reason, "Upstream reasoning ended without visible output");
+    }
     let status = if validation_error.is_some() {
         "error"
     } else {
@@ -2455,7 +2471,7 @@ async fn execute_non_stream_request_with_format(
         status,
         validation_error
             .as_ref()
-            .map(|_| "upstream_output_schema_error"),
+            .map(|_| response_error_type),
         validation_error.as_deref(),
         None,
         TraceUsage {
@@ -2475,7 +2491,7 @@ async fn execute_non_stream_request_with_format(
         return Err(NonStreamExecutionError::Response(
             (
                 StatusCode::BAD_GATEWAY,
-                Json(ErrorResponse::new("upstream_output_schema_error", message)),
+                Json(ErrorResponse::new(response_error_type, message)),
             )
                 .into_response(),
         ));
@@ -2564,7 +2580,7 @@ fn build_non_stream_content(
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
 ///
 /// 支持原生推理的模型使用 adaptive；保留客户端 budget 和显式 effort。
-fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
+pub(super) fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     let model_lower = payload.model.to_lowercase();
     if !model_lower.contains("thinking") {
         return;
@@ -2671,7 +2687,7 @@ pub(super) async fn post_messages_cc_inner(
     post_messages_cc_inner_impl(state, key_ctx, payload, false).await
 }
 
-async fn post_messages_cc_inner_impl(
+pub(super) async fn post_messages_cc_inner_impl(
     state: AppState,
     key_ctx: KeyContext,
     mut payload: MessagesRequest,

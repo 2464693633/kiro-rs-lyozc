@@ -63,7 +63,7 @@ impl UsageCapture {
         )
     }
 
-    fn merge_usage(&self, target: &mut Value) {
+    pub(super) fn merge_usage(&self, target: &mut Value) {
         if !target.is_object() {
             *target = json!({});
         }
@@ -73,14 +73,18 @@ impl UsageCapture {
     }
 }
 
-struct Settlement {
+pub(super) struct Settlement {
     hook: UsageRecordHook,
     capture: Arc<UsageCapture>,
     finished: bool,
 }
 
 impl Settlement {
-    fn finish(&mut self, success: bool) {
+    pub(super) fn new(hook: UsageRecordHook, capture: Arc<UsageCapture>) -> Self {
+        Self { hook, capture, finished: false }
+    }
+
+    pub(super) fn finish(&mut self, success: bool) {
         if self.finished {
             return;
         }
@@ -98,7 +102,7 @@ impl Settlement {
         );
         // A failed review can follow a successfully billed generation. Keep
         // those costs in the key quota too; the regular hook only does this on success.
-        if !success && let Some(keys) = &self.hook.client_keys {
+        if !success && self.hook.capture.is_none() && let Some(keys) = &self.hook.client_keys {
             keys.record_usage(
                 &UsageRecord {
                     ts: chrono::Utc::now().to_rfc3339(),

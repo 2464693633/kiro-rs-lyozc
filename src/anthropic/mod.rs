@@ -34,6 +34,7 @@ mod model_metadata;
 mod natural_style;
 mod observation;
 mod openai;
+mod output_recovery;
 mod responses;
 mod router;
 pub(crate) mod search_context;
