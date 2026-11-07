@@ -104,9 +104,48 @@ pub struct CacheUsage {
     pub prompt_total_est: i32,
     /// 仅对本地模拟的最终拆分生效，None 表示不额外限制。
     pub read_limit_percent: Option<u8>,
+    /// 本次未命中的 1h 前缀段（estimate 口径），不含已读缓存。
+    pub cache_creation_1h_est: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheCreationUsage {
+    pub ephemeral_5m_input_tokens: u64,
+    pub ephemeral_1h_input_tokens: u64,
+}
+
+impl CacheCreationUsage {
+    pub fn total(self) -> u64 {
+        self.ephemeral_5m_input_tokens.saturating_add(self.ephemeral_1h_input_tokens)
+    }
+
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            ephemeral_5m_input_tokens: self.ephemeral_5m_input_tokens.saturating_add(other.ephemeral_5m_input_tokens),
+            ephemeral_1h_input_tokens: self.ephemeral_1h_input_tokens.saturating_add(other.ephemeral_1h_input_tokens),
+        }
+    }
 }
 
 impl CacheUsage {
+    /// Only split known local writes. Provider totals do not disclose their TTL.
+    pub fn creation_breakdown(&self, creation_tokens: i32, provider_supplied: bool) -> Option<CacheCreationUsage> {
+        let total = i64::from(creation_tokens.max(0));
+        if total == 0 {
+            return Some(CacheCreationUsage::default());
+        }
+        let estimated = i64::from(self.cache_covered_est).saturating_sub(i64::from(self.cache_read)).max(0);
+        if provider_supplied || estimated == 0 {
+            return None;
+        }
+        let one_hour_est = i64::from(self.cache_creation_1h_est).clamp(0, estimated);
+        let one_hour = (total * one_hour_est + estimated / 2) / estimated;
+        Some(CacheCreationUsage {
+            ephemeral_5m_input_tokens: (total - one_hour) as u64,
+            ephemeral_1h_input_tokens: one_hour as u64,
+        })
+    }
+
     pub fn with_read_limit_percent(mut self, limit: Option<u8>) -> Self {
         self.read_limit_percent = limit;
         self
@@ -1554,6 +1593,7 @@ pub async fn compute_cache_usage(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        cache_creation_1h_est: one_hour_creation_estimate(&breakpoints, &cum_tokens, max_read_tokens),
         ..Default::default()
     }
 }
@@ -1667,8 +1707,17 @@ pub fn compute_cache_usage_sync(
         cache_read: max_read_tokens as i32,
         cache_covered_est: covered_tokens as i32,
         prompt_total_est: prompt_total_est as i32,
+        cache_creation_1h_est: one_hour_creation_estimate(&breakpoints, &cum_tokens, max_read_tokens),
         ..Default::default()
     }
+}
+
+fn one_hour_creation_estimate(breakpoints: &[Breakpoint], cum_tokens: &[u32], read: u32) -> i32 {
+    breakpoints.iter()
+        .filter(|point| point.ttl_secs == MAX_TTL_SECS)
+        .map(|point| cum_tokens[point.block_idx])
+        .max().unwrap_or(0)
+        .saturating_sub(read).min(i32::MAX as u32) as i32
 }
 
 /// 生成会话隔离种子，作为前缀哈希链的最前置输入。
@@ -1962,6 +2011,67 @@ mod tests {
         assert!(cr2 > 0, "second call read>0, cr={}", cr2);
         assert_eq!(in2 + cc2 + cr2, total, "互斥口径必须自洽");
         assert_eq!(cc1, cr2);
+    }
+
+    #[test]
+    fn cache_creation_breakdown_preserves_total_rounding_and_read_limits() {
+        let usage = CacheUsage { cache_read: 30, cache_covered_est: 80, prompt_total_est: 100,
+            cache_creation_1h_est: 20, ..Default::default() };
+        for total in [0, 1, 2, 3, 71, 100_000, i32::MAX] {
+            let baseline = usage.split_against_total(total);
+            for limit in [None, Some(0), Some(60), Some(100)] {
+                let capped = usage.with_read_limit_percent(limit);
+                let (input, creation, read) = capped.split_against_total(total);
+                let split = capped.creation_breakdown(creation, false).unwrap();
+                assert_eq!(i64::from(input) + i64::from(creation) + i64::from(read), i64::from(total));
+                assert_eq!(creation, baseline.1);
+                assert_eq!(split.total(), creation as u64);
+                assert_eq!(split.ephemeral_1h_input_tokens, (creation as u64 * 20 + 25) / 50);
+            }
+        }
+        assert_eq!(usage.creation_breakdown(5, true), None, "Provider totals must not inherit local TTL estimates");
+        assert_eq!(usage.creation_breakdown(0, true), Some(CacheCreationUsage::default()));
+        assert_eq!(CacheUsage::default().creation_breakdown(5, false), None);
+        for one_hour in [0, 50] {
+            let split = CacheUsage { cache_creation_1h_est: one_hour, ..usage }.creation_breakdown(7, false).unwrap();
+            assert_eq!(split.ephemeral_1h_input_tokens, if one_hour == 0 { 0 } else { 7 });
+            assert_eq!(split.total(), 7);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_creation_breakdown_tracks_mixed_ttl_cold_warm_and_expiry() {
+        let request: MessagesRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-opus-5-5", "max_tokens":64,
+            "system":[{"type":"text","text":"Long lived prefix. ".repeat(40),"cache_control":{"type":"ephemeral","ttl":"1h"}}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"Short lived suffix. ".repeat(40),"cache_control":{"type":"ephemeral","ttl":"5m"}}]}]
+        })).unwrap();
+        let sync_cache = CacheMeter::new(None);
+        let async_cache = CacheMeter::new(None);
+        for round in 0..3 {
+            let sync = compute_cache_usage_sync(&sync_cache, &request, 1);
+            let asynchronous = compute_cache_usage(&async_cache, &request, 1).await;
+            assert_eq!(sync.cache_creation_1h_est, asynchronous.cache_creation_1h_est);
+            assert_eq!(sync.cache_read, asynchronous.cache_read);
+            let (_, creation, _) = sync.split_against_total(sync.prompt_total_est);
+            let split = sync.creation_breakdown(creation, false).unwrap();
+            assert_eq!(split.total(), creation as u64);
+            if round == 0 {
+                assert!(split.ephemeral_1h_input_tokens > 0);
+                assert!(split.ephemeral_5m_input_tokens > 0);
+            } else if round == 1 {
+                assert_eq!(split.total(), 0, "A full hit writes neither TTL");
+                for cache in [&sync_cache, &async_cache] {
+                    for entry in cache.inner.lock().entries.values_mut() {
+                        if entry.ttl_secs == DEFAULT_TTL_SECS { entry.expires_at -= 350; }
+                    }
+                }
+            } else {
+                assert!(sync.cache_read > 0, "The 1h prefix still hits after 5m expiry");
+                assert_eq!(split.ephemeral_1h_input_tokens, 0, "Do not bill the hit 1h prefix as a new write");
+                assert!(split.ephemeral_5m_input_tokens > 0);
+            }
+        }
     }
 
     #[test]

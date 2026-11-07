@@ -2844,6 +2844,7 @@ mod tests {
         let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
         let hook = UsageRecordHook {
             capture: None,
+            cache_creation: None,
             recorder: None,
             aggregator: Some(aggregator.clone()),
             client_keys: None,
@@ -4040,6 +4041,7 @@ mod tests {
     fn settlement_source_marks_any_simulated_round_as_simulated() {
         let hook = UsageRecordHook {
             capture: None,
+            cache_creation: None,
             recorder: None,
             aggregator: None,
             client_keys: None,
@@ -4161,6 +4163,7 @@ mod tests {
     fn final_responses_sum_credit_usage_across_model_rounds() {
         let hook = UsageRecordHook {
             capture: None,
+            cache_creation: None,
             recorder: None,
             aggregator: None,
             client_keys: None,
@@ -4227,6 +4230,7 @@ mod tests {
                 client_keys: Some(manager.clone()),
                 credit_manager: None,
                 capture: None,
+            cache_creation: None,
                 key_id: entry.id,
                 model: "gpt-5.6-sol".into(),
                 started_at: std::time::Instant::now(),

@@ -64,6 +64,7 @@ pub(crate) struct UsageRecordHook {
     pub started_at: Instant,
     pub(crate) capture: Option<std::sync::Arc<super::identity_guard::UsageCapture>>,
     pub count_call: bool,
+    pub(crate) cache_creation: Option<super::cache_metering::CacheCreationUsage>,
 }
 
 impl UsageRecordHook {
@@ -82,7 +83,13 @@ impl UsageRecordHook {
             started_at: Instant::now(),
             capture: state.usage_capture.clone(),
             count_call: state.count_successful_call,
+            cache_creation: None,
         }
+    }
+
+    pub(crate) fn with_cache_creation(mut self, breakdown: Option<super::cache_metering::CacheCreationUsage>) -> Self {
+        self.cache_creation = breakdown;
+        self
     }
 
     pub fn record(
@@ -113,7 +120,7 @@ impl UsageRecordHook {
             status: status.to_string(),
         };
         if let Some(capture) = &self.capture {
-            capture.record(rec);
+            capture.record(rec, self.cache_creation);
             return;
         }
         if let Some(r) = &self.recorder {
@@ -1661,7 +1668,7 @@ impl StreamSettlement {
     }
 
     fn new(
-        hook: UsageRecordHook,
+        mut hook: UsageRecordHook,
         credential_id: u64,
         tracer: std::sync::Arc<RequestTracer>,
         ctx: &StreamContext,
@@ -1669,6 +1676,7 @@ impl StreamSettlement {
     ) -> Self {
         let mut credit_guard = hook.credit_guard(credential_id);
         credit_guard.set_usage((ctx.metering.is_some() || ctx.credits > 0.0).then_some(ctx.credits));
+        hook.cache_creation = ctx.cache_usage.creation_breakdown(ctx.resolved_usage().1, ctx.provider_token_usage.is_some());
         Self {
             hook,
             credential_id,
@@ -1684,6 +1692,7 @@ impl StreamSettlement {
 
     fn update(&mut self, ctx: &StreamContext, sent_bytes: u64) {
         self.usage = stream_trace_usage(ctx);
+        self.hook.cache_creation = ctx.cache_usage.creation_breakdown(ctx.resolved_usage().1, ctx.provider_token_usage.is_some());
         self.credit_guard.set_usage((ctx.metering.is_some() || ctx.credits > 0.0).then_some(ctx.credits));
         self.sent_bytes = sent_bytes;
     }
@@ -2436,6 +2445,8 @@ async fn execute_non_stream_request_with_format(
         "cache_creation_input_tokens": cache_creation_tokens,
         "cache_read_input_tokens": cache_read_tokens
     });
+    let cache_creation_breakdown = cache_usage.creation_breakdown(cache_creation_tokens, provider_token_usage.is_some());
+    usage_json["cache_creation"] = json!(cache_creation_breakdown);
     // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
     // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
     if let Some(m) = &metering {
@@ -2458,7 +2469,7 @@ async fn execute_non_stream_request_with_format(
     if validation_error.is_none() && !content_is_empty {
         tracer.mark_first_token();
     }
-    hook.record(
+    hook.with_cache_creation(cache_creation_breakdown).record(
         credential_id,
         final_input_tokens,
         output_tokens,

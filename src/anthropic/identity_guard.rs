@@ -35,11 +35,11 @@ const REVIEWER: &str = include_str!("identity_reviewer.txt");
 const CLIENT_RECAP: &str = "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then the one next action. Skip root-cause narrative, fix internals, secondary to-dos, and em-dash tangents.";
 
 #[derive(Default)]
-pub(crate) struct UsageCapture(Mutex<Vec<UsageRecord>>);
+pub(crate) struct UsageCapture(Mutex<Vec<(UsageRecord, Option<super::cache_metering::CacheCreationUsage>)>>);
 
 impl UsageCapture {
-    pub(crate) fn record(&self, record: UsageRecord) {
-        self.0.lock().push(record);
+    pub(crate) fn record(&self, record: UsageRecord, breakdown: Option<super::cache_metering::CacheCreationUsage>) {
+        self.0.lock().push((record, breakdown));
     }
 
     fn totals(&self) -> (Value, u64) {
@@ -47,27 +47,35 @@ impl UsageCapture {
         let sum = |get: fn(&UsageRecord) -> u64| {
             records
                 .iter()
-                .fold(0u64, |sum, row| sum.saturating_add(get(row)))
+                .fold(0u64, |sum, (row, _)| sum.saturating_add(get(row)))
         };
-        let credits: f64 = records.iter().map(|row| row.credits).sum();
-        (
-            json!({
+        let credits: f64 = records.iter().map(|(row, _)| row.credits).sum();
+        let breakdown = records.iter().try_fold(super::cache_metering::CacheCreationUsage::default(), |total, (record, split)| {
+            let split = if record.cache_creation_tokens == 0 {
+                super::cache_metering::CacheCreationUsage::default()
+            } else {
+                (*split).filter(|value| value.total() == record.cache_creation_tokens)?
+            };
+            Some(total.saturating_add(split))
+        });
+        let mut usage = json!({
                 "input_tokens": sum(|r| r.input_tokens),
                 "output_tokens": sum(|r| r.output_tokens),
                 "cache_creation_input_tokens": sum(|r| r.cache_creation_tokens),
                 "cache_read_input_tokens": sum(|r| r.cache_read_tokens),
                 "credit_usage": if credits.is_finite() { credits } else { 0.0 },
                 "credit_unit": "credit", "credit_unit_plural": "credits"
-            }),
-            records.last().map_or(0, |r| r.credential_id),
-        )
+            });
+        usage["cache_creation"] = json!(breakdown);
+        (usage, records.last().map_or(0, |(row, _)| row.credential_id))
     }
 
     pub(super) fn merge_usage(&self, target: &mut Value) {
         if !target.is_object() {
             *target = json!({});
         }
-        for (key, value) in self.totals().0.as_object().unwrap() {
+        let usage = self.totals().0;
+        for (key, value) in usage.as_object().unwrap() {
             target[key] = value.clone();
         }
     }
@@ -91,7 +99,7 @@ impl Settlement {
         self.finished = true;
         let (usage, credential) = self.capture.totals();
         let count = |name: &str| usage[name].as_u64().unwrap_or(0).min(i32::MAX as u64) as i32;
-        self.hook.record(
+        self.hook.clone().with_cache_creation(serde_json::from_value(usage["cache_creation"].clone()).ok()).record(
             credential,
             count("input_tokens"),
             count("output_tokens"),
@@ -1255,6 +1263,36 @@ mod tests {
     }
 
     #[test]
+    fn captured_cache_creation_breakdown_survives_nested_settlement_and_unknown_rounds() {
+        use super::super::cache_metering::CacheCreationUsage;
+        let state = AppState::new(false, crate::model::config::ToolCompatibilityMode::Raw);
+        let capture = Arc::new(UsageCapture::default());
+        let mut hook = UsageRecordHook::from_state(&state, 1, "fixture".into());
+        hook.capture = Some(capture.clone());
+        for split in [CacheCreationUsage { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 1 },
+            CacheCreationUsage { ephemeral_5m_input_tokens: 3, ephemeral_1h_input_tokens: 4 }] {
+            hook.clone().with_cache_creation(Some(split)).record(1, 10, 5, split.total() as i32, 7, 0.25, "success");
+        }
+        hook.record(1, 2, 1, 0, 0, 0.1, "success");
+        let mut usage = json!({});
+        capture.merge_usage(&mut usage);
+        assert_eq!(usage["cache_creation_input_tokens"], 10);
+        assert_eq!(usage["cache_creation"], json!({"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":5}));
+        let outer_capture = Arc::new(UsageCapture::default());
+        let mut outer_hook = UsageRecordHook::from_state(&state, 1, "fixture".into());
+        outer_hook.capture = Some(outer_capture.clone());
+        let mut settlement = Settlement::new(outer_hook, capture.clone());
+        settlement.finish(true);
+        let mut outer_usage = json!({});
+        outer_capture.merge_usage(&mut outer_usage);
+        assert_eq!(outer_usage, usage);
+        hook.record(1, 1, 1, 4, 0, 0.1, "success");
+        capture.merge_usage(&mut usage);
+        assert_eq!(usage["cache_creation_input_tokens"], 14);
+        assert_eq!(usage.get("cache_creation"), Some(&Value::Null), "Do not retain a partial split when a provider round has unknown TTL");
+    }
+
+    #[test]
     fn failed_identity_review_settles_incurred_key_credits_once() {
         let keys = Arc::new(crate::admin::client_keys::ClientKeyManager::new());
         let key = keys.create_with_key("fixture".into(), None, None, "identity-fixture-key".into());
@@ -1274,7 +1312,7 @@ mod tests {
             credits: 0.25,
             duration_ms: 10,
             status: "success".into(),
-        });
+        }, None);
         let mut settlement = Settlement {
             hook: UsageRecordHook::from_state(&state, key.id, "claude-opus-5-5".into()),
             capture,
@@ -1311,7 +1349,7 @@ mod tests {
                         model: "fixture-model".into(), input_tokens: 10, output_tokens: 5,
                         cache_creation_tokens: 2, cache_read_tokens: 3, credits: 0.25,
                         duration_ms: 10, status: "success".into(),
-                    });
+                    }, None);
                 }
                 let mut settlement = Settlement {
                     hook: UsageRecordHook::from_state(&state, id, "fixture-model".into()),

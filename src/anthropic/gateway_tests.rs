@@ -1320,6 +1320,46 @@ async fn gateway_cache_read_limit_matches_streams_logs_and_tool_paths() {
 }
 
 #[tokio::test]
+async fn gateway_cache_creation_breakdown_on_both_routes_and_stream_modes() {
+    use crate::anthropic::cache_metering::CacheMeter;
+    for cc in [false, true] {
+        for streaming in [false, true] {
+            for ttl in ["none", "5m", "1h", "mixed"] {
+                let f = fixture(Mode::NoProviderUsage).await;
+                let capture = Arc::new(super::identity_guard::UsageCapture::default());
+                let mut state = f.state.clone().with_cache_meter(Some(Arc::new(CacheMeter::new(None))));
+                state.usage_capture = Some(capture.clone());
+                let mut system = json!({"type":"text","text":"Stable prefix for TTL accounting. ".repeat(40)});
+                if ttl != "none" { system["cache_control"] = json!({"type":"ephemeral","ttl":if ttl == "mixed" { "1h" } else { ttl }}); }
+                let mut user = json!({"type":"text","text":"Current request suffix. ".repeat(40)});
+                if ttl == "mixed" { user["cache_control"] = json!({"type":"ephemeral","ttl":"5m"}); }
+                let payload = json!({"model":"claude-opus-5-5","max_tokens":64,"stream":streaming,
+                    "system":[system],"messages":[{"role":"user","content":[user]}]});
+                let first = cache_read_limit_message(&state, 1, cc, payload.clone()).await;
+                let usage = &first["usage"];
+                let creation = usage["cache_creation_input_tokens"].as_u64().unwrap();
+                let five = usage["cache_creation"]["ephemeral_5m_input_tokens"].as_u64().unwrap();
+                let hour = usage["cache_creation"]["ephemeral_1h_input_tokens"].as_u64().unwrap();
+                assert_eq!(five + hour, creation);
+                match ttl {
+                    "none" => assert_eq!(creation, 0),
+                    "5m" => { assert!(five > 0); assert_eq!(hour, 0); }
+                    "1h" => { assert!(hour > 0); assert_eq!(five, 0); }
+                    _ => { assert!(hour > 0); assert!(five > 0); }
+                }
+                let warm = cache_read_limit_message(&state, 1, cc, payload).await;
+                assert_eq!(warm["usage"]["cache_creation_input_tokens"], 0);
+                assert_eq!(warm["usage"]["cache_creation"], json!({"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}));
+                let mut aggregated = json!({});
+                capture.merge_usage(&mut aggregated);
+                assert_eq!(aggregated["cache_creation_input_tokens"], creation);
+                assert_eq!(aggregated["cache_creation"], usage["cache_creation"]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn gateway_cache_read_limit_preserves_provider_reported_usage() {
     use crate::{admin::client_keys::ClientKeyManager, anthropic::cache_metering::CacheMeter};
     for cc in [false, true] {
@@ -1337,6 +1377,7 @@ async fn gateway_cache_read_limit_preserves_provider_reported_usage() {
             assert_eq!(message["usage"]["input_tokens"], 0);
             assert_eq!(message["usage"]["cache_read_input_tokens"], 18224);
             assert_eq!(message["usage"]["cache_creation_input_tokens"], 4);
+            assert_eq!(message["usage"].get("cache_creation"), Some(&serde_json::Value::Null));
             assert_eq!(message["usage"]["output_tokens"], 17);
         }
     }

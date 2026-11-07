@@ -435,7 +435,7 @@ mod tests {
             credits: 0.125,
             duration_ms: 1,
             status: "success".into(),
-        });
+        }, None);
         let settlement = Settlement::new(
             UsageRecordHook::from_state(&state, client.id, "claude-opus-5-5".into()),
             capture.clone(),

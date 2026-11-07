@@ -1477,6 +1477,7 @@ impl SseStateManager {
         output_tokens: i32,
         cache_creation_input_tokens: i32,
         cache_read_input_tokens: i32,
+        cache_creation: Option<super::cache_metering::CacheCreationUsage>,
         metering: Option<&MeteringEvent>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
@@ -1504,6 +1505,7 @@ impl SseStateManager {
                 "cache_creation_input_tokens": cache_creation_input_tokens,
                 "cache_read_input_tokens": cache_read_input_tokens
             });
+            usage_json["cache_creation"] = json!(cache_creation);
             // 透传上游 meteringEvent 的 credit_* 字段，让客户端拿到与 Kiro
             // 后端口径一致的计费元数据；只在收到过 meteringEvent 时才追加。
             if let Some(m) = metering {
@@ -1807,6 +1809,13 @@ impl StreamContext {
             .provider_token_usage
             .map(|usage| usage.sanitized())
             .unwrap_or_default();
+        let mut usage_json = json!({
+            "input_tokens": usage.uncached_input_tokens,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": usage.cache_write_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens
+        });
+        usage_json["cache_creation"] = json!(self.cache_usage.creation_breakdown(usage.cache_write_input_tokens, self.provider_token_usage.is_some()));
         json!({
             "type": "message_start",
             "message": {
@@ -1817,12 +1826,7 @@ impl StreamContext {
                 "model": self.model,
                 "stop_reason": null,
                 "stop_sequence": null,
-                "usage": {
-                    "input_tokens": usage.uncached_input_tokens,
-                    "output_tokens": 0,
-                    "cache_creation_input_tokens": usage.cache_write_input_tokens,
-                    "cache_read_input_tokens": usage.cache_read_input_tokens
-                }
+                "usage": usage_json
             }
         })
     }
@@ -2838,6 +2842,7 @@ impl StreamContext {
             final_output_tokens,
             cache_creation,
             cache_read,
+            self.cache_usage.creation_breakdown(cache_creation, self.provider_token_usage.is_some()),
             self.metering.as_ref(),
         ));
 
@@ -5766,7 +5771,7 @@ mod tests {
     fn test_generate_final_events_omits_credit_fields_without_metering() {
         // 没有 meteringEvent 时不应在 usage 里写 credit_* 字段。
         let mut manager = SseStateManager::new();
-        let events = manager.generate_final_events(10, 5, 0, 0, None);
+        let events = manager.generate_final_events(10, 5, 0, 0, None, None);
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -5781,7 +5786,7 @@ mod tests {
     fn test_generate_final_events_carries_credit_fields_when_metering_present() {
         let mut manager = SseStateManager::new();
         let metering = parse_metering(r#"{"unit":"credit","unitPlural":"credits","usage":0.75}"#);
-        let events = manager.generate_final_events(10, 5, 0, 0, Some(&metering));
+        let events = manager.generate_final_events(10, 5, 0, 0, None, Some(&metering));
         let delta = events
             .iter()
             .find(|e| e.event == "message_delta")
@@ -6067,7 +6072,8 @@ mod tests {
             .data["message"]["usage"];
         assert_eq!(
             start,
-            &json!({"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0})
+            &json!({"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+                "cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}})
         );
         for input in [18228, 0, 0] {
             ctx.process_kiro_event(&Event::Metadata(MetadataEvent {
