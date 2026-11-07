@@ -306,7 +306,10 @@ fn stream_response(
                         drop(source);
                         return;
                     }
-                    if failed {
+                    // message_stop is authoritative. Do not poll the channel
+                    // again and mistake a client closing a completed message
+                    // for a cancelled generation.
+                    if failed || complete {
                         break 'read;
                     }
                 }
@@ -403,6 +406,78 @@ fn parse_frame(frame: &[u8]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn output_recovery_settles_message_stop_without_waiting_for_transport_eof() {
+        use crate::admin::{
+            client_keys::ClientKeyManager, trace_db::TraceKeySource, usage_stats::UsageRecord,
+        };
+        let keys = Arc::new(ClientKeyManager::new());
+        let client = keys.create("completed stream".into(), None, None);
+        let state = AppState::new(true, crate::model::config::ToolCompatibilityMode::Raw)
+            .with_usage(Some(keys.clone()), None, None);
+        let key = KeyContext {
+            key_id: client.id,
+            group: None,
+            key_source: TraceKeySource::MasterApiKey,
+            client_ip: None,
+        };
+        let capture = Arc::new(UsageCapture::default());
+        capture.record(UsageRecord {
+            ts: chrono::Utc::now().to_rfc3339(),
+            key_id: client.id,
+            credential_id: 1,
+            model: "claude-opus-5-5".into(),
+            input_tokens: 13,
+            output_tokens: 17,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 0,
+            credits: 0.125,
+            duration_ms: 1,
+            status: "success".into(),
+        });
+        let settlement = Settlement::new(
+            UsageRecordHook::from_state(&state, client.id, "claude-opus-5-5".into()),
+            capture.clone(),
+        );
+        let mut wire = Vec::new();
+        for event in [
+            json!({"type":"message_start","message":{"id":"completed","usage":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}),
+            json!({"type":"message_stop"}),
+        ] {
+            wire.extend_from_slice(&sse(&event));
+        }
+        let source = stream::once(async move { Ok::<_, Infallible>(Bytes::from(wire)) })
+            .chain(stream::pending::<Result<Bytes, Infallible>>());
+        let request: MessagesRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5-5","max_tokens":64,"stream":true,
+            "messages":[{"role":"user","content":"task"}],"thinking":{"type":"adaptive"}
+        }))
+        .unwrap();
+        let response = stream_response(
+            Response::new(Body::from_stream(source)),
+            state,
+            key,
+            request,
+            false,
+            capture,
+            settlement,
+        );
+        let bytes = tokio::time::timeout(
+            Duration::from_millis(500),
+            to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("completed SSE must not wait for an idle transport")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("message_stop"));
+        let billed = keys.list()[0].clone();
+        assert_eq!(billed.total_successful_calls, 1);
+        assert_eq!(billed.total_output_tokens, 17);
+        assert_eq!(billed.total_credits, 0.125);
+    }
 
     #[test]
     fn output_recovery_only_classifies_substantive_silent_end_turns() {
