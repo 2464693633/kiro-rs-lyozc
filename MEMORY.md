@@ -35,8 +35,8 @@
   断点必须位于 5 分钟断点之前。
 - 缓存键覆盖完整结构化 block 与模型配置，并遵守 tools -> system -> messages 的
   失效层级；`tool_choice` 和图片存在性只使 message 前缀失效。
-- 本地条目按客户端 Key 与 session 组合隔离；共享系统 Key 缺少 session 时禁用模拟，
-  避免跨用户虚假命中。
+- 本地条目按客户端 Key 与 session 组合隔离；缺少可识别 session 时，按系统提示和
+  第一条 user 消息派生稳定隔离种子。系统 Key 缺少 session 本身不代表模拟关闭。
 - 客户端 Key 的 `cacheMetering`（默认 true，仅为 false 时写入文件）可单独关闭模拟：
   该 Key 不读写 CacheMeter、不计入 hit/miss 统计，输入全部计入 `input_tokens`，
   上游真实用量仍优先。请求路径必须经 `AppState::cache_meter_for_key` 取计量器，
