@@ -1502,6 +1502,9 @@ pub struct StartIdcLoginRequest {
     pub priority: u32,
     #[serde(default)]
     pub email: Option<String>,
+    /// 新账号的分组，在发起登录时固定；重新登录保留原账号分组。
+    #[serde(default)]
+    pub groups: Vec<String>,
     /// IP 管理中的代理，优先于 proxyUrl；登录全过程及新凭据使用同一代理。
     #[serde(default)]
     pub proxy_id: Option<u64>,
@@ -1546,6 +1549,9 @@ pub struct StartSocialLoginRequest {
     /// 用户邮箱（可选）
     #[serde(default)]
     pub email: Option<String>,
+    /// 新账号的分组，在发起登录时固定；重新登录保留原账号分组。
+    #[serde(default)]
+    pub groups: Vec<String>,
     #[serde(default)]
     pub proxy_id: Option<u64>,
     /// 代理 URL（可选）

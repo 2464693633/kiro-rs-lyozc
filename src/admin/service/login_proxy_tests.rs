@@ -73,7 +73,8 @@ async fn json_import_persists_selected_ip_binding_and_ignores_old_auth() {
     let request = serde_json::from_value(serde_json::json!({
         "authMethod": "api_key", "kiroApiKey": "ksk_offline_import_fixture",
         "proxyId": proxy_id, "proxyUrl": "direct",
-        "proxyUsername": "old-user", "proxyPassword": "old-pass"
+        "proxyUsername": "old-user", "proxyPassword": "old-pass",
+        "groups": ["开发", "测试"]
     }))
     .unwrap();
     let event = service
@@ -86,6 +87,7 @@ async fn json_import_persists_selected_ip_binding_and_ignores_old_auth() {
         .clone_credential(event.credential_id.unwrap())
         .unwrap();
     assert_eq!(credential.proxy_id, Some(proxy_id));
+    assert_eq!(credential.groups, vec!["开发", "测试"]);
     assert!(credential.proxy_username.is_none());
     assert!(credential.proxy_password.is_none());
     let endpoint = ProxyEndpoint::parse(&credential.effective_proxy(None).unwrap().url).unwrap();
@@ -101,18 +103,22 @@ async fn social_session_freezes_selection_and_relogin_inherits_account_ip() {
         proxy_url: Some("http://account.invalid:1234".into()),
         proxy_username: Some("account-user".into()),
         proxy_password: Some("account-pass".into()),
+        groups: vec!["原有分组".into()],
         ..Default::default()
     };
     let service = service(vec![credential.clone()]);
     let id = add_proxy(&service, "http://login-user:login-pass@127.0.0.1:3211");
     let response = service
-        .start_social_login(serde_json::from_value(serde_json::json!({"proxyId": id})).unwrap())
+        .start_social_login(serde_json::from_value(serde_json::json!({
+            "proxyId": id, "groups": ["开发", "测试"]
+        })).unwrap())
         .await
         .unwrap();
     {
         let sessions = service.social_sessions.lock();
         let session = &sessions[&response.session_id];
         assert_eq!(session.cred_template.proxy_id, Some(id));
+        assert_eq!(session.cred_template.groups, vec!["开发", "测试"]);
         assert_eq!(
             session.proxy,
             session
@@ -132,6 +138,7 @@ async fn social_session_freezes_selection_and_relogin_inherits_account_ip() {
             credential.effective_proxy(service.token_manager.proxy().as_ref())
         );
         assert!(!session.relogin_proxy_override);
+        assert_eq!(session.cred_template.groups, credential.groups);
     }
     let response = service
         .start_social_relogin(
@@ -149,11 +156,34 @@ async fn social_session_freezes_selection_and_relogin_inherits_account_ip() {
     service.save_login_proxy(1, &template).unwrap();
     let saved = service.token_manager.clone_credential(1).unwrap();
     assert_eq!(saved.proxy_id, Some(id));
+    assert_eq!(saved.groups, credential.groups);
     assert_eq!(saved.effective_proxy(None), template.effective_proxy(None));
     assert_eq!(
         saved.proxy_username, None,
         "old split authentication must not follow a new proxy"
     );
+}
+
+#[test]
+fn login_groups_are_optional_and_reject_invalid_shapes() {
+    let social: StartSocialLoginRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+    let idc: StartIdcLoginRequest = serde_json::from_value(serde_json::json!({
+        "region": "us-east-1"
+    })).unwrap();
+    assert!(social.groups.is_empty());
+    assert!(idc.groups.is_empty());
+    let idc: StartIdcLoginRequest = serde_json::from_value(serde_json::json!({
+        "region": "us-east-1", "groups": ["开发", "测试"]
+    })).unwrap();
+    assert_eq!(idc.groups, vec!["开发", "测试"]);
+    for groups in [serde_json::json!("开发"), serde_json::json!([42])] {
+        assert!(serde_json::from_value::<StartSocialLoginRequest>(serde_json::json!({
+            "groups": groups
+        })).is_err());
+        assert!(serde_json::from_value::<StartIdcLoginRequest>(serde_json::json!({
+            "region": "us-east-1", "groups": groups
+        })).is_err());
+    }
 }
 
 #[tokio::test]

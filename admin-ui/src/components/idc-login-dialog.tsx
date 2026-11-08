@@ -16,6 +16,7 @@ import { startIdcLogin, pollIdcLogin } from '@/api/credentials'
 import type { StartIdcLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
+import { AccountGroupField } from '@/components/account-group-field'
 import { LoginProxyField } from '@/components/login-proxy-field'
 import { proxyRequestFields, type ProxyChoice } from '@/components/proxy-selector'
 
@@ -35,6 +36,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
   const [proxyChoice, setProxyChoice] = useState<ProxyChoice>({ kind: 'global' })
   const [region, setRegion] = useState('us-east-1')
   const [startUrl, setStartUrl] = useState('')
+  const [groups, setGroups] = useState<string[]>([])
   const [email, setEmail] = useState('')
   const [incognito, setIncognito] = useState(false)
   const [linkCopied, setLinkCopied] = useState(false)
@@ -54,6 +56,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
   const handleOpenChange = (v: boolean) => {
     if (!v) {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      setGroups([])
       setStep('form')
       setProxyChoice({ kind: 'global' })
       setSession(null)
@@ -93,6 +96,7 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
         region: region.trim(),
         startUrl: startUrl.trim() || undefined,
         email: email.trim() || undefined,
+        groups,
       })
       setSession(resp)
       setStep('waiting')
@@ -230,7 +234,10 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
         )}
 
         {step === 'form' && (
-          <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
+          <>
+            <AccountGroupField value={groups} onChange={setGroups} disabled={isStarting} />
+            <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
+          </>
         )}
 
         {step === 'waiting' && session && (

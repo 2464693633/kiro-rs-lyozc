@@ -19,6 +19,7 @@ import {
 import type { AddCredentialRequest } from '@/types/api'
 import { extractErrorMessage, sha256Hex, normalizeImportAuthMethod } from '@/lib/utils'
 
+import { AccountGroupField } from '@/components/account-group-field'
 import { ImportProxyField } from '@/components/import-proxy-field'
 import { importProxyFields, type ImportProxyChoice, type CredentialProxyFields } from '@/lib/credential-proxy'
 
@@ -29,11 +30,13 @@ interface KamImportDialogProps {
 
 // KAM 导出 JSON 中的账号结构
 interface KamAccount extends CredentialProxyFields {
+  groups?: string[]
   email?: string
   userId?: string | null
   nickname?: string
   idp?: string
   credentials: CredentialProxyFields & {
+    groups?: string[]
     refreshToken: string
     accessToken?: string
     profileArn?: string
@@ -118,6 +121,7 @@ function normalizeKamAccount(item: unknown): unknown {
     const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
 
     return {
+      groups: obj.groups,
       proxyId: obj.proxyId,
       proxyUrl: obj.proxyUrl,
       proxyUsername: obj.proxyUsername,
@@ -200,6 +204,7 @@ function parseKamJson(raw: string): KamAccount[] {
 }
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
+  const [groups, setGroups] = useState<string[]>([])
   const [jsonInput, setJsonInput] = useState('')
   const [proxyChoice, setProxyChoice] = useState<ImportProxyChoice>({ kind: 'preserve' })
   const [importing, setImporting] = useState(false)
@@ -216,6 +221,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const queryClient = useQueryClient()
 
   const resetForm = () => {
+    setGroups([])
     setJsonInput('')
     setProxyChoice({ kind: 'preserve' })
     setProgress({ current: 0, total: 0 })
@@ -407,6 +413,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             scopes: cred.scopes?.trim() || undefined,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
+            groups: groups.length > 0 ? groups : (account.groups ?? cred.groups),
             ...proxyFields,
           },
         })
@@ -579,6 +586,8 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          <AccountGroupField value={groups} onChange={setGroups} disabled={importing} importing />
+
           <ImportProxyField value={proxyChoice} onChange={setProxyChoice} disabled={importing} />
 
           <div className="space-y-2">

@@ -19,9 +19,8 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { useAddCredential } from '@/hooks/use-credentials'
-import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage } from '@/lib/utils'
-import { GroupMultiSelect } from '@/components/group-select'
+import { AccountGroupField } from '@/components/account-group-field'
 import {
   CredentialMetadataEditor,
   metadataDefaults,
@@ -58,8 +57,6 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
     type: 'normal',
     saleStatus: 'not_for_sale',
   })
-
-  const groupOptions = useGroupOptions()
 
   const { mutate, isPending } = useAddCredential()
 
@@ -187,6 +184,8 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
           />
 
           <div className="space-y-4 py-4 overflow-y-auto flex-1 pr-1">
+            <AccountGroupField value={groups} onChange={setGroups} disabled={isPending} />
+
             {/* 认证方式 */}
             <div className="space-y-2">
               <label htmlFor="authMethod" className="text-sm font-medium">
@@ -424,20 +423,6 @@ function AddCredentialDialogInner({ open, onOpenChange, metadataSchema }: AddCre
               />
               <p className="text-xs text-muted-foreground">
                 可选。决定该凭据走哪套 Kiro API。留空使用全局 defaultEndpoint
-              </p>
-            </div>
-
-            {/* 账号分组 */}
-            <div className="space-y-2">
-              <label className="text-sm font-medium">账号分组</label>
-              <GroupMultiSelect
-                value={groups}
-                options={groupOptions}
-                onChange={setGroups}
-                disabled={isPending}
-              />
-              <p className="text-xs text-muted-foreground">
-                可选。绑定了某分组的客户端 Key 只会调度到含该分组的账号
               </p>
             </div>
 

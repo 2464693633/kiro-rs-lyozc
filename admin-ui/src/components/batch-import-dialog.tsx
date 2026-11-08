@@ -28,6 +28,7 @@ import {
   metadataFieldValues,
 } from '@/components/credential-metadata-field'
 
+import { AccountGroupField } from '@/components/account-group-field'
 import { ImportProxyField } from '@/components/import-proxy-field'
 import { importProxyFields, type ImportProxyChoice, type CredentialProxyFields } from '@/lib/credential-proxy'
 
@@ -37,6 +38,7 @@ interface BatchImportDialogProps {
 }
 
 interface CredentialInput extends CredentialProxyFields {
+  groups?: string[]
   refreshToken?: string
   clientId?: string
   clientSecret?: string
@@ -70,6 +72,7 @@ interface VerificationResult {
 
 
 export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps) {
+  const [groups, setGroups] = useState<string[]>([])
   const [jsonInput, setJsonInput] = useState('')
   const [proxyChoice, setProxyChoice] = useState<ImportProxyChoice>({ kind: 'preserve' })
   const [importing, setImporting] = useState(false)
@@ -84,6 +87,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
   const queryClient = useQueryClient()
 
   const resetForm = () => {
+    setGroups([])
     setJsonInput('')
     setProxyChoice({ kind: 'preserve' })
     setProgress({ current: 0, total: 0 })
@@ -201,6 +205,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
+              groups: groups.length > 0 ? groups : cred.groups,
               ...proxyFields,
               metadata,
             },
@@ -255,6 +260,7 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
               machineId: cred.machineId?.trim() || undefined,
               endpoint: cred.endpoint?.trim() || undefined,
               email: cred.email?.trim() || undefined,
+              groups: groups.length > 0 ? groups : cred.groups,
               ...proxyFields,
               metadata,
             },
@@ -420,6 +426,8 @@ export function BatchImportDialog({ open, onOpenChange }: BatchImportDialogProps
         </DialogHeader>
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
+          <AccountGroupField value={groups} onChange={setGroups} disabled={importing} importing />
+
           <ImportProxyField value={proxyChoice} onChange={setProxyChoice} disabled={importing} />
 
           <div className="space-y-2">

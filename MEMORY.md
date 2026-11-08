@@ -1,5 +1,12 @@
 # 项目实现记录
 
+## 创建账号时选择分组
+
+- 手动添加、Social / Builder ID / 企业 SSO 登录、JSON / KAM 导入共用 `AccountGroupField`，可多选已注册分组。
+- 首次登录请求的 `groups` 默认空数组，在发起授权时存入会话的 `cred_template`，创建凭据时直接保存；不要在登录完成后另发编辑请求。重新登录保留原账号分组。
+- 批量导入选择非空分组时统一覆盖本批账号分组；未选时保留文件中的分组，缺失则不分组。KAM 平铺和嵌套格式均保留文件分组。
+- 前端回归：构建后运行 `admin-ui/scripts/check-account-group-selection.cjs`（需要 Playwright，可用 `PLAYWRIGHT_CHANNEL=chrome`）；所有请求在本地 mock，不访问真实 OAuth 或生产服务。
+
 ## 凭据元数据
 
 - 凭据元数据使用可扩展对象 `metadata`，固定字段 `type` 只接受 `normal` 或 `boom`。

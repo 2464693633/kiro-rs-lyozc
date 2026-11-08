@@ -3755,6 +3755,7 @@ impl AdminService {
         cred_template.auth_method = Some("social".to_string());
         cred_template.priority = req.priority;
         cred_template.email = req.email;
+        cred_template.groups = req.groups;
 
         let auth_endpoint = req
             .auth_endpoint
@@ -4009,6 +4010,7 @@ impl AdminService {
         let (mut cred_template, proxy) = self.resolve_login_proxy(req.proxy_id, req.proxy_url.as_deref(), None)?;
         cred_template.priority = req.priority;
         cred_template.email = req.email;
+        cred_template.groups = req.groups;
         let start_url = req.start_url.unwrap_or_else(|| BUILDER_ID_START_URL.to_string());
         self.begin_idc_device_authorization(req.region, start_url, proxy, cred_template, None, false).await
     }

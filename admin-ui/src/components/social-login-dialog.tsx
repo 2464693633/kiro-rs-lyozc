@@ -15,6 +15,7 @@ import { startSocialLogin, pollSocialLogin, completeSocialLogin } from '@/api/cr
 import type { StartSocialLoginResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 
+import { AccountGroupField } from '@/components/account-group-field'
 import { LoginProxyField } from '@/components/login-proxy-field'
 import { proxyRequestFields, type ProxyChoice } from '@/components/proxy-selector'
 
@@ -64,6 +65,7 @@ async function getClipboardWritePermission(): Promise<PermissionState | 'unsuppo
 export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLoginDialogProps) {
   const [step, setStep] = useState<Step>('form')
   const [proxyChoice, setProxyChoice] = useState<ProxyChoice>({ kind: 'global' })
+  const [groups, setGroups] = useState<string[]>([])
   const [email, setEmail] = useState('')
   const [incognito, setIncognito] = useState(false)
   const [copyState, setCopyState] = useState<CopyState>('idle')
@@ -85,6 +87,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
   const handleOpenChange = (v: boolean) => {
     if (!v) {
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current)
+      setGroups([])
       setStep('form')
       setProxyChoice({ kind: 'global' })
       setSession(null)
@@ -141,6 +144,7 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
       const resp = await startSocialLogin({
         ...proxyRequestFields(proxyChoice),
         email: email.trim() || undefined,
+        groups,
       })
       setSession(resp)
       setStep('waiting')
@@ -258,7 +262,10 @@ export function SocialLoginDialog({ open, onOpenChange, onSuccess }: SocialLogin
         )}
 
         {step === 'form' && (
-          <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
+          <>
+            <AccountGroupField value={groups} onChange={setGroups} disabled={isStarting} />
+            <LoginProxyField value={proxyChoice} onChange={setProxyChoice} disabled={isStarting} />
+          </>
         )}
 
         {step === 'waiting' && session && (

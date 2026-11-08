@@ -546,6 +546,7 @@ export interface StartIdcLoginRequest {
   startUrl?: string
   priority?: number
   email?: string
+  groups?: string[]
   proxyId?: number
   proxyUrl?: string
 }
@@ -568,6 +569,7 @@ export type PollIdcLoginResponse =
 export interface StartSocialLoginRequest {
   priority?: number
   email?: string
+  groups?: string[]
   proxyId?: number
   proxyUrl?: string
   authEndpoint?: string
