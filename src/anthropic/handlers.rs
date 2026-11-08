@@ -174,6 +174,8 @@ pub(crate) enum UsageSource {
     /// 错误早退等无用量场景
     #[default]
     Unknown,
+    /// 已应用配置的输入扣减。
+    Adjusted,
     /// 上游 metadataEvent.tokenUsage
     Provider,
     /// 本地 CacheMeter 按断点估算
@@ -186,6 +188,7 @@ impl UsageSource {
     fn as_db(self) -> Option<&'static str> {
         match self {
             Self::Unknown => Option::None,
+            Self::Adjusted => Some(usage_source::ADJUSTED),
             Self::Provider => Some(usage_source::PROVIDER),
             Self::Simulated => Some(usage_source::SIMULATED),
             Self::None => Some(usage_source::NONE),
@@ -194,7 +197,9 @@ impl UsageSource {
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
     pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
-        if has_provider_usage {
+        if cache_usage.input_token_deduction > 0 {
+            Self::Adjusted
+        } else if has_provider_usage {
             Self::Provider
         } else if cache_usage.cache_covered_est > 0 {
             Self::Simulated
@@ -709,7 +714,7 @@ fn resolve_non_stream_usage(
     provider_usage: Option<TokenUsage>,
 ) -> (i32, i32, i32, i32) {
     if let Some(usage) = provider_usage {
-        let usage = usage.sanitized();
+        let usage = cache_usage.reported_provider_usage(usage);
         return (
             usage.uncached_input_tokens,
             usage.output_tokens,
@@ -2308,7 +2313,7 @@ async fn execute_non_stream_request_with_format(
     if let Some(err) = tool_json_error {
         let message = err.message();
         if let Some(usage) = provider_token_usage {
-            let usage = usage.sanitized();
+            let usage = cache_usage.reported_provider_usage(usage);
             let trace_usage = TraceUsage {
                 input_tokens: usage.uncached_input_tokens as u64,
                 output_tokens: usage.output_tokens as u64,
@@ -2319,7 +2324,7 @@ async fn execute_non_stream_request_with_format(
                 } else {
                     0.0
                 },
-                source: UsageSource::Provider,
+                source: UsageSource::resolve(true, &cache_usage),
             };
             hook.record(
                 credential_id,

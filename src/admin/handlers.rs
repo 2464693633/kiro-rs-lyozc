@@ -34,7 +34,7 @@ use super::{
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        ToolCompatibilityConfig, UpdateProxyRequest, UpdateRefreshTokenRequest,
+        ToolCompatibilityConfig, InputTokenDeductionConfig, UpdateProxyRequest, UpdateRefreshTokenRequest,
         SetCustomHeadersRequest,
         SetCustomModelsRequest,
         SetProtocolCompatibilityRequest,
@@ -722,6 +722,20 @@ pub async fn set_api_domain(
 
 pub async fn get_tool_compatibility_mode(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_tool_compatibility_mode())
+}
+
+pub async fn get_input_token_deduction(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_input_token_deduction())
+}
+
+pub async fn set_input_token_deduction(
+    State(state): State<AdminState>,
+    Json(payload): Json<InputTokenDeductionConfig>,
+) -> impl IntoResponse {
+    match state.service.set_input_token_deduction(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
 }
 
 pub async fn set_tool_compatibility_mode(

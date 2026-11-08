@@ -1671,7 +1671,7 @@ impl StreamContext {
     /// contextUsage/请求估算总量与本地 CacheMeter 比例回退。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         if let Some(usage) = self.provider_token_usage {
-            let usage = usage.sanitized();
+            let usage = self.cache_usage.reported_provider_usage(usage);
             return (
                 usage.uncached_input_tokens,
                 usage.cache_write_input_tokens,
@@ -1807,7 +1807,7 @@ impl StreamContext {
     pub fn create_message_start_event(&self) -> serde_json::Value {
         let usage = self
             .provider_token_usage
-            .map(|usage| usage.sanitized())
+            .map(|usage| self.cache_usage.reported_provider_usage(usage))
             .unwrap_or_default();
         let mut usage_json = json!({
             "input_tokens": usage.uncached_input_tokens,

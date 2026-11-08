@@ -820,7 +820,7 @@ export interface TraceRecord {
 }
 
 export type StickyOutcome = 'hit' | 'miss_first' | 'miss_unavailable' | 'off'
-export type UsageSource = 'provider' | 'simulated' | 'none'
+export type UsageSource = 'provider' | 'simulated' | 'none' | 'adjusted'
 
 /** 链路查询参数 */
 export interface TraceQuery {

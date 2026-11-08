@@ -10,6 +10,13 @@ pub struct ToolCompatibilityConfig {
     pub mode: crate::model::config::ToolCompatibilityMode,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InputTokenDeductionConfig {
+    #[serde(deserialize_with = "crate::model::config::deserialize_input_token_deduction")]
+    pub input_token_deduction: u32,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应

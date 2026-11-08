@@ -208,7 +208,10 @@ impl RoundOutcome {
         cache_usage: CacheUsage,
     ) -> (TokenUsage, UsageSource) {
         if let Some(usage) = self.provider_token_usage {
-            return (usage.sanitized(), UsageSource::Provider);
+            return (
+                cache_usage.reported_provider_usage(usage),
+                UsageSource::resolve(true, &cache_usage),
+            );
         }
 
         let mut output = Vec::new();
@@ -1032,6 +1035,7 @@ impl WebSearchUsageSettlement {
     /// 合并本轮 usage 来源。聚合值只要包含模拟缓存就不能标成 provider 真值。
     fn note_source(&mut self, round_source: UsageSource) {
         self.source = match (self.source, round_source) {
+            (UsageSource::Adjusted, _) | (_, UsageSource::Adjusted) => UsageSource::Adjusted,
             (UsageSource::Unknown, next) => next,
             (current, UsageSource::Unknown) => current,
             (UsageSource::Provider, UsageSource::Provider) => UsageSource::Provider,
@@ -1739,6 +1743,7 @@ async fn run_web_search_loop_inner(
         .client_keys
         .as_ref()
         .and_then(|keys| keys.cache_read_limit_percent(key_id));
+    let input_token_deduction = provider.token_manager().input_token_deduction();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
@@ -1765,7 +1770,8 @@ async fn run_web_search_loop_inner(
                         .with_read_limit_percent(read_limit)
                 }
                 None => CacheUsage::default(),
-            };
+            }
+            .with_input_token_deduction(input_token_deduction);
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,

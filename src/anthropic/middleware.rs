@@ -154,12 +154,16 @@ impl AppState {
             .client_keys
             .as_ref()
             .and_then(|keys| keys.cache_read_limit_percent(key_id));
-        match self.cache_meter_for_key(key_id) {
+        let usage = match self.cache_meter_for_key(key_id) {
             Some(cache) => super::cache_metering::compute_cache_usage(&cache, request, key_id)
                 .await
                 .with_read_limit_percent(limit),
             None => super::cache_metering::CacheUsage::default(),
-        }
+        };
+        usage.with_input_token_deduction(
+            self.kiro_provider.as_ref()
+                .map_or(0, |provider| provider.token_manager().input_token_deduction()),
+        )
     }
 
     /// 注入链路追踪存储

@@ -33,6 +33,8 @@ use serde_json::json;
 mod chat_stream_tests;
 #[path = "output_recovery_tests.rs"]
 mod output_recovery_tests;
+#[path = "input_token_deduction_tests.rs"]
+mod input_token_deduction_tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,

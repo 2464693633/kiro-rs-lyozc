@@ -349,6 +349,11 @@ function StickyMarker({ rec, verbose = false }: { rec: TraceRecord; verbose?: bo
 function UsageSourceBadge({ source }: { source?: UsageSource | null }) {
   if (!source) return null
   const map: Record<UsageSource, { label: string; title: string; cls: string }> = {
+    adjusted: {
+      label: '已扣减',
+      title: '已按配置扣减输入 Token，显示的是调整后的上报量；输出 Token 与实际积分不变',
+      cls: 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-400',
+    },
     provider: {
       label: '上游真值',
       title: 'token / cache 三项来自 Kiro metadataEvent.tokenUsage，精确',
@@ -1028,7 +1033,7 @@ function useTraceColumns(): ConsoleColumn<TraceRecord>[] {
         id: 'usageSource',
         header: '用量来源',
         optional: true,
-        hint: '上游真值 / 本地估算 / 无断点',
+        hint: '上游真值 / 本地估算 / 无断点 / 已扣减',
         cell: (r) => <UsageSourceBadge source={r.usageSource} /> ,
       },
       {

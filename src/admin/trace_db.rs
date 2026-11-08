@@ -160,6 +160,8 @@ pub mod sticky {
 
 /// usage 三项的来源（record.usage_source 取值）
 pub mod usage_source {
+    /// 已应用运营方配置的输入 Token 扣减，不代表上游原始用量。
+    pub const ADJUSTED: &str = "adjusted";
     /// 上游 `metadataEvent.tokenUsage` 精确值
     pub const PROVIDER: &str = "provider";
     /// 本地 CacheMeter 按 cache_control 断点估算

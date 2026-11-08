@@ -64,7 +64,7 @@ use super::types::{
     UpdateRefreshTokenRequest,
     ProtocolCompatibilityConfigResponse, ProtocolCompatibilityDiagnostics,
     SetProtocolCompatibilityRequest,
-    ToolCompatibilityConfig,
+    ToolCompatibilityConfig, InputTokenDeductionConfig,
 };
 
 mod proxy;
@@ -3144,6 +3144,22 @@ impl AdminService {
         ToolCompatibilityConfig {
             mode: self.token_manager.tool_compatibility_mode(),
         }
+    }
+
+    pub fn get_input_token_deduction(&self) -> InputTokenDeductionConfig {
+        InputTokenDeductionConfig {
+            input_token_deduction: self.token_manager.input_token_deduction(),
+        }
+    }
+
+    pub fn set_input_token_deduction(
+        &self,
+        req: InputTokenDeductionConfig,
+    ) -> Result<InputTokenDeductionConfig, AdminServiceError> {
+        self.token_manager
+            .set_input_token_deduction(req.input_token_deduction)
+            .map_err(|error| AdminServiceError::InternalError(error.to_string()))?;
+        Ok(self.get_input_token_deduction())
     }
 
     pub fn set_tool_compatibility_mode(

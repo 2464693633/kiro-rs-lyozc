@@ -106,6 +106,8 @@ pub struct CacheUsage {
     pub read_limit_percent: Option<u8>,
     /// 本次未命中的 1h 前缀段（estimate 口径），不含已读缓存。
     pub cache_creation_1h_est: i32,
+    /// 本次上游调用的输入上报扣减快照；不改变缓存条目和真实积分。
+    pub input_token_deduction: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,6 +130,33 @@ impl CacheCreationUsage {
 }
 
 impl CacheUsage {
+    pub fn with_input_token_deduction(mut self, value: u32) -> Self {
+        self.input_token_deduction = value;
+        self
+    }
+
+    /// 精确 provider 拆分也遵守显式的上报扣减策略，保留三项占比及总量。
+    /// 使用累计边界取整，避免小缓存项为零或极大计数时产生负数/溢出。
+    pub fn reported_provider_usage(
+        &self,
+        usage: crate::kiro::model::events::TokenUsage,
+    ) -> crate::kiro::model::events::TokenUsage {
+        let mut usage = usage.sanitized();
+        let input = i128::from(usage.uncached_input_tokens);
+        let write = i128::from(usage.cache_write_input_tokens);
+        let total = input + write + i128::from(usage.cache_read_input_tokens);
+        if self.input_token_deduction == 0 || total == 0 {
+            return usage;
+        }
+        let remaining = (total - i128::from(self.input_token_deduction)).max(0);
+        let input_boundary = remaining * input / total;
+        let write_boundary = remaining * (input + write) / total;
+        usage.uncached_input_tokens = input_boundary as i32;
+        usage.cache_write_input_tokens = (write_boundary - input_boundary) as i32;
+        usage.cache_read_input_tokens = (remaining - write_boundary) as i32;
+        usage
+    }
+
     /// Only split known local writes. Provider totals do not disclose their TTL.
     pub fn creation_breakdown(&self, creation_tokens: i32, provider_supplied: bool) -> Option<CacheCreationUsage> {
         let total = i64::from(creation_tokens.max(0));
@@ -152,7 +181,7 @@ impl CacheUsage {
     }
 
     /// 按真实 total 口径把 prompt 拆成三个互斥的部分，返回
-    /// `(input_tokens, cache_creation, cache_read)`，相加严格 == `total_real`。
+    /// `(input_tokens, cache_creation, cache_read)`，相加为扣减后的输入总量。
     ///
     /// 未设置读取上限时，按本地缓存命中拆分：
     /// - `cache_read`：命中此前写入过的最长前缀（本次无需重新处理的部分）
@@ -163,7 +192,8 @@ impl CacheUsage {
     /// 设置读取上限后，超过总输入指定百分比的模拟读取量转为普通输入；
     /// 缓存写入保持不变。上游明确返回的 usage 不经过本方法。
     pub fn split_against_total(&self, total_real: i32) -> (i32, i32, i32) {
-        let total = total_real.max(0);
+        let total = (i64::from(total_real.max(0)) - i64::from(self.input_token_deduction))
+            .max(0) as i32;
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
             return (total, 0, 0);
         }

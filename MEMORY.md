@@ -20,6 +20,10 @@
 
 ## Anthropic Prompt Cache 本地计量
 
+- 全局 `inputTokenDeduction` 默认 0，可在「设置 → 模型」热更新。对每次上游调用，
+  先扣输入总量再拆模拟缓存；精确 provider 拆分按累计比例缩减。输出 Token、缓存条目
+  与实际积分不变；内部搜索和恢复逐轮处理，聚合处不得再扣，历史记录不回写。
+
 - 本项目拿不到 Kiro 上游的真实 KV 张量缓存，只能在 provider 未返回精确 usage 时，
   按请求前缀模拟 Anthropic 的 `cache_creation_input_tokens` 与
   `cache_read_input_tokens`；该模拟不会降低上游推理成本。

@@ -4,6 +4,21 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const MAX_INPUT_TOKEN_DEDUCTION: u32 = 1_000_000;
+
+pub fn deserialize_input_token_deduction<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = u32::deserialize(deserializer)?;
+    if value > MAX_INPUT_TOKEN_DEDUCTION {
+        return Err(serde::de::Error::custom(
+            "inputTokenDeduction 必须是 0 到 1000000 的整数",
+        ));
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TlsBackend {
@@ -396,6 +411,10 @@ pub struct Config {
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
+    /// 每次上游模型调用上报前扣除的输入 token；0 保持原计量，实际积分不变。
+    #[serde(default, deserialize_with = "deserialize_input_token_deduction")]
+    pub input_token_deduction: u32,
+
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
@@ -674,6 +693,7 @@ impl Default for Config {
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
+            input_token_deduction: 0,
             default_endpoint: default_endpoint(),
             api_domain: ApiDomain::default(),
             cache_metering_enabled: None,

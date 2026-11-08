@@ -554,6 +554,20 @@ export interface ToolCompatibilityConfig {
   mode: ToolCompatibilityMode
 }
 
+export interface InputTokenDeductionConfig {
+  inputTokenDeduction: number
+}
+
+export async function getInputTokenDeduction(): Promise<InputTokenDeductionConfig> {
+  const { data } = await api.get<InputTokenDeductionConfig>('/config/input-token-deduction')
+  return data
+}
+
+export async function setInputTokenDeduction(inputTokenDeduction: number): Promise<InputTokenDeductionConfig> {
+  const { data } = await api.put<InputTokenDeductionConfig>('/config/input-token-deduction', { inputTokenDeduction })
+  return data
+}
+
 export async function getToolCompatibilityMode(): Promise<ToolCompatibilityConfig> {
   const { data } = await api.get<ToolCompatibilityConfig>('/config/tool-compatibility')
   return data
