@@ -6,6 +6,14 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Kiro CreateResponse 上游协议
+
+- OAuth 凭据按官方 `featureConfiguration` 的 `create_response_api` 实验选择聊天协议，账号隔离缓存 15 分钟；读取失败保留当前登录最近的有效选择，首次失败回退原协议并在 1 分钟后重查。
+- 新接口转换多轮文本、图片、函数工具和结果、reasoning effort；增量解析 SSE，再统一为原有内部事件，复用 Messages、Chat Completions、Responses、内部搜索和计量流程。
+- 保留 thinking 原始签名、精确 token/cache 快照、context usage 和真实积分；不制造缺失计数，终止前断流和非法工具参数报错，失败响应保留已报告的积分。
+- 兼容新接口错误代码和毫秒级退避提示；API Key、企业 IdP 和 MCP 保持既有协议。日志链路将新聊天协议显示为 `create_response`。
+- 该适配不保证消除学生账号的上游 429；没有把某个固定 CLI 版本或模型替换当作限流修复。
+
 ### 上游 v0.9.8 合并
 
 - 合并上游 `5c8c348`：凭据缓存用量与加权命中率、在线更新代理认证、通用 HTTP 客户端代理凭据中的字面百分号修复，以及缓存排查文档校正。

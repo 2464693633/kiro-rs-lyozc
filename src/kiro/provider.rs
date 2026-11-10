@@ -147,9 +147,16 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// The official experiment selection is isolated per sign-in/profile.
+    create_response_features: crate::kiro::create_response::FeatureCache,
 }
 
 impl KiroProvider {
+    #[cfg(test)]
+    pub(crate) fn set_test_create_response_base(&mut self, base: String) {
+        self.create_response_features.test_runtime_base = Some(base);
+    }
+
     /// 返回共享凭据管理器，供模型发现等只读控制面逻辑复用。
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
@@ -192,6 +199,7 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            create_response_features: Default::default(),
         }
     }
 
@@ -492,7 +500,6 @@ impl KiroProvider {
                 }
             };
             let endpoint_name = endpoint.name();
-
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
@@ -912,8 +919,6 @@ impl KiroProvider {
                     continue;
                 }
             };
-            let endpoint_name = endpoint.name();
-
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
                 token: &ctx.token,
@@ -922,27 +927,24 @@ impl KiroProvider {
                 api_domain: self.token_manager.api_domain(),
             };
 
-            let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
-
-            tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
-            tracing::debug!("实际发送请求体: {}", body);
-
             // 一次尝试使用同一个 Client；热更新在下一次请求或重试时生效。
             let client = self.client_for(&ctx.credentials)?;
-            let base = client
-                .post(&url)
-                .body(body)
-                .header("content-type", endpoint.content_type());
-            let request = endpoint.decorate_api(base, &rctx);
-
-            // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
+            let create_response = self.create_response_features.select(&client, &rctx, endpoint.name()).await;
+            let endpoint_name = if create_response { "create_response" } else { endpoint.name() };
+            let (url, request) = if create_response {
+                let url = format!("{}/v1/responses", self.create_response_features.runtime_base(&rctx));
+                let profile = ctx.credentials.streaming_profile_arn();
+                let body = crate::kiro::create_response::transform_body(request_body, profile.as_deref())?;
+                let request = crate::kiro::create_response::decorate_request(client.post(&url).body(body), &rctx);
+                (url, request)
+            } else {
+                let url = endpoint.api_url(&rctx);
+                let body = endpoint.transform_api_body(request_body, &rctx);
+                let base = client.post(&url).body(body).header("content-type", endpoint.content_type());
+                (url, endpoint.decorate_api(base, &rctx))
+            };
+            tracing::debug!("使用端点 [{}] POST {}", endpoint_name, url);
             let request = request.build().map_err(|e| anyhow::anyhow!("构建请求失败: {}", e))?;
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                for (k, v) in request.headers() {
-                    tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
-                }
-            }
             let response = match client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -980,6 +982,16 @@ impl KiroProvider {
                 }
             };
 
+            let response = if create_response && response.status().is_success() {
+                match crate::kiro::create_response::normalize_response(response).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        Self::emit_attempt(sink, attempt, ctx.id, endpoint_name, Some(200),
+                            outcome::NETWORK_ERROR, Some(&error.to_string()), attempt_start);
+                        return Err(error);
+                    }
+                }
+            } else { response };
             let status = response.status();
             let rate_limit_error = (status.as_u16() == 429)
                 .then(|| UpstreamRateLimitError::from_headers(response.headers()));
@@ -1004,6 +1016,7 @@ impl KiroProvider {
             }
 
             let retry_after = UpstreamRateLimitError::from_headers(response.headers());
+            let create_retry_headers = create_response.then(|| response.headers().clone());
             // 失败响应：读取 body 用于日志/错误信息
             let body = match response.text().await {
                 Ok(body) => body,
@@ -1017,6 +1030,13 @@ impl KiroProvider {
                     }
                     return Err(error.into());
                 }
+            };
+            let body = if create_response {
+                crate::kiro::create_response::normalize_error(status.as_u16(), &body)
+            } else { body };
+            let rate_limit_error = match create_retry_headers.as_ref().filter(|_| status.as_u16() == 429) {
+                Some(headers) => Some(crate::kiro::create_response::rate_limit_error(headers, &body)),
+                None => rate_limit_error,
             };
 
             if status.is_server_error()
@@ -1048,7 +1068,8 @@ impl KiroProvider {
             }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
+            if (status.as_u16() == 402 || (create_response && status.as_u16() == 429))
+                && endpoint.is_monthly_request_limit(&body) {
                 tracing::warn!(
                     "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -1084,7 +1105,7 @@ impl KiroProvider {
             }
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
-            if status.as_u16() == 400 {
+            if status.as_u16() == 400 || (create_response && status.as_u16() == 413) {
                 Self::emit_attempt(
                     sink, attempt, ctx.id, endpoint_name, Some(400),
                     outcome::BAD_REQUEST, Some(&body), attempt_start,

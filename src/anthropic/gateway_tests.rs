@@ -35,6 +35,8 @@ mod chat_stream_tests;
 mod output_recovery_tests;
 #[path = "input_token_deduction_tests.rs"]
 mod input_token_deduction_tests;
+#[path = "create_response_gateway_tests.rs"]
+mod create_response_gateway_tests;
 use std::{
     collections::{HashMap, HashSet},
     convert::Infallible,

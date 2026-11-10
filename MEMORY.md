@@ -1,5 +1,14 @@
 # 项目实现记录
 
+## Kiro CreateResponse 协议选择
+
+- `KiroProvider` 在 OAuth `ide` / `cli` 聊天调用前，使用当前账号的同一个 HTTP client / 代理、token、profile 和区域查询 `runtime.<region>.kiro.dev/featureConfiguration`；不改变 MCP、API Key、external_idp 或自定义端点。
+- 官方 `create_response_api` 为 `create_response` 时使用 `/v1/responses`；缓存按账号和登录身份（token/profile/区域/版本/machineId 的哈希）隔离，TTL 15 分钟。查询失败保留同身份最近有效选择，首次失败走原协议；失败后 1 分钟重查。
+- 新接口 JSON 转换、SSE 解码位于 `src/kiro/create_response`，返回仍是统一内部事件，避免为每个下游协议复制工具和计量逻辑。SSE 逐事件转换、限制单事件 4 MiB，必须收到完成/失败终态；调用取消直接释放上游流。
+- 原始 thinking 签名只透传；新接口 usage 缺少精确 token 快照时继续沿用原有估算/缓存模拟，不根据 credits 反推 token。credits 只从上游真实 usage 事件累计，重复终态不重复计费，部分失败保留已收到的积分。
+- 账号卡片的 IDE/CLI 是原协议选择，新接口由官方实验配置决定。trace attempt 显示 `create_response` 可验证实际请求路由；现有卡片“真实测试”仍是账号池测试，不能用它证明当前学生账号成功。
+- 2026-11-10/11 实测已验证新接口可返回学生账号的 Claude 正文、以及 Pro 的工具调用；间歇 429 仍存在，不能承诺切换后全部学生账号稳定恢复。
+
 ## 凭据卡片选择请求端点
 
 - 卡片「编辑凭据 → 基本 → 请求端点」支持跟随全局、IDE、CLI，`PUT /credentials/{id}` 的 `endpoint` 省略/null 表示不修改，空串清除覆盖，非空必须是已注册端点。保存后下一次获取账号上下文即使用新值，不重启、不清冷却或改代理。

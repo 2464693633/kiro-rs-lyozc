@@ -51,6 +51,7 @@ Telegram 讨论群组：[kiro.rs](https://t.me/+SXAjVkZDWFUyMWVl)
 - **profileArn 策略**：流式端点与 MCP（WebSearch）按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类调用跳过占位 ARN。
 - **可切换上游域名**：对话 / MCP 可发往 `q.{region}.amazonaws.com`（默认）或新版 Kiro 客户端使用的 `runtime.{region}.kiro.dev`，Admin 面板热切换。
 - **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
+- **新版 CreateResponse**：OAuth 账号按官方 featureConfiguration 自动选择上游 `/v1/responses`，支持增量正文、工具调用、thinking 和积分；未入选账号继续使用原协议。参见 [上游协议选择](docs/kiro-create-response.md)。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **文档和 JSON Schema 适配**：支持内联文本 PDF/纯文本文档，JSON Schema 提示约束与返回校验；能力范围和错误行为见 [Messages 兼容适配](docs/message-compatibility.md)。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。

@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod credential_dedup;
+pub(crate) mod create_response;
 pub mod endpoint;
 pub mod error;
 pub mod kiro_version;
