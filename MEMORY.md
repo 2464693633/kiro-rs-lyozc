@@ -1,5 +1,12 @@
 # 项目实现记录
 
+## 凭据卡片选择请求端点
+
+- 卡片「编辑凭据 → 基本 → 请求端点」支持跟随全局、IDE、CLI，`PUT /credentials/{id}` 的 `endpoint` 省略/null 表示不修改，空串清除覆盖，非空必须是已注册端点。保存后下一次获取账号上下文即使用新值，不重启、不清冷却或改代理。
+- 状态响应 `endpoint` 仍是生效端点；`endpointOverride` 为显式值或 null，供界面区分继承与固定选择，编辑其它字段不得把继承固化。
+- CLI API / MCP 的 User-Agent 固定采用 `CLI_CLIENT_VERSION = 1.4.121`，独立于全局 `kiroVersion` 默认 2.3.0 与 IDE 自动版本缓存。2026-11-09 官方 stable 桌面元数据 `currentRelease` 为 1.4.121；这里按用户要求固定兼容版本，未声称它是 CLI 安装包版本。
+- 回归脚本 `admin-ui/scripts/check-credential-endpoint-selection.cjs` 使用本地模拟 API；Student 只显示可选 CLI 的提示，不自动切换已有账号。
+
 ## 创建账号时选择分组
 
 - 手动添加、Social / Builder ID / 企业 SSO 登录、JSON / KAM 导入共用 `AccountGroupField`，可多选已注册分组。

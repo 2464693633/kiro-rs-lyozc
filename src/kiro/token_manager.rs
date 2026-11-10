@@ -4698,8 +4698,8 @@ impl MultiTokenManager {
 
     /// 更新凭据的可编辑字段（Admin API）
     ///
-    /// 支持更新 email、proxy_url、proxy_username、proxy_password。
-    /// 传 `None` 表示不修改该字段，传 `Some("")` 表示清除该字段。
+    /// 支持标识、代理、分组、元数据、权重和端点；外层 None 表示不修改。
+    /// endpoint 的 Some(None) 清除覆盖，后续新请求恢复全局默认端点。
     pub fn update_credential(
         &self,
         id: u64,
@@ -4711,6 +4711,7 @@ impl MultiTokenManager {
         source_channel: Option<Option<String>>,
         metadata: Option<crate::kiro::model::credentials::CredentialMetadata>,
         load_factor: Option<u32>,
+        endpoint: Option<Option<String>>,
     ) -> anyhow::Result<()> {
         let invalidate_models =
             proxy_url.is_some() || proxy_username.is_some() || proxy_password.is_some();
@@ -4763,6 +4764,9 @@ impl MultiTokenManager {
             if let Some(lf) = load_factor {
                 entry.credentials.load_factor = lf.max(1);
                 entry.current_weight = 0;
+            }
+            if let Some(value) = endpoint {
+                entry.credentials.endpoint = value;
             }
         }
         if invalidate_models {
@@ -6032,7 +6036,7 @@ mod tests {
         let credential = KiroCredentials { id: Some(1), proxy_url: Some("http://localhost:1234".into()), ..Default::default() };
         let manager = MultiTokenManager::new(Config::default(), vec![credential], None, None, false).unwrap();
         let original = manager.credential_proxy_snapshot().remove(0);
-        manager.update_credential(1, None, Some(Some("http://localhost:5678".into())), None, None, None, None, None, None).unwrap();
+        manager.update_credential(1, None, Some(Some("http://localhost:5678".into())), None, None, None, None, None, None, None).unwrap();
         let stale = ProxyRotationUpdate { id: 1, target: Some("direct".into()), generation: original.generation, global_generation: original.global_generation };
         assert!(manager.apply_proxy_rotation(&[stale]).is_err());
         assert_eq!(manager.clone_credential(1).unwrap().proxy_url.as_deref(), Some("http://localhost:5678"));
@@ -8673,6 +8677,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
 
@@ -8702,7 +8707,7 @@ mod tests {
         };
 
         manager
-            .update_credential(1, None, None, None, None, None, None, Some(metadata), None)
+            .update_credential(1, None, None, None, None, None, None, Some(metadata), None, None)
             .unwrap();
 
         let snapshot = manager.snapshot();

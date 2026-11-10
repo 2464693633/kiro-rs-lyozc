@@ -196,6 +196,8 @@ pub struct CredentialStatusItem {
     pub throttled_remaining_secs: Option<u64>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据显式指定的端点；null 表示跟随全局，区别于上面的有效端点。
+    pub endpoint_override: Option<String>,
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,
@@ -393,6 +395,9 @@ pub struct UpdateRefreshTokenRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateCredentialRequest {
+    /// 请求端点：省略/null 保持不变，空串恢复全局默认，非空值须为已注册端点。
+    #[serde(default)]
+    pub endpoint: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
     /// 凭据级代理 URL（空字符串表示清除）

@@ -71,6 +71,10 @@ mod proxy;
 mod login_proxy;
 #[cfg(test)]
 mod login_proxy_tests;
+
+#[cfg(test)]
+#[path = "service/endpoint_tests.rs"]
+mod endpoint_tests;
 mod proxy_failover;
 mod proxy_link;
 #[cfg(test)]
@@ -965,7 +969,8 @@ impl AdminService {
                     refresh_failure_count: entry.refresh_failure_count,
                     disabled_reason: entry.disabled_reason,
                     throttled_remaining_secs: entry.throttled_remaining_secs,
-                    endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint: entry.endpoint.clone().unwrap_or_else(|| default_endpoint.clone()),
+                    endpoint_override: entry.endpoint,
                     groups: entry.groups,
                     source_channel: entry.source_channel,
                     metadata,
@@ -2199,6 +2204,13 @@ impl AdminService {
         id: u64,
         req: UpdateCredentialRequest,
     ) -> Result<(), AdminServiceError> {
+        // 在修改任何字段前校验端点，防止失败请求只更新了邮箱、分组等部分字段。
+        let endpoint = req.endpoint.map(|value| value.trim().to_string());
+        if let Some(name) = endpoint.as_deref().filter(|name| !name.is_empty()) {
+            if !self.known_endpoints.contains(name) {
+                return Err(AdminServiceError::BadRequest(format!("未知端点 \"{name}\"")));
+            }
+        }
         if let Some(metadata) = req.metadata.as_ref() {
             validate_credential_metadata(metadata, &self.credential_metadata_schema.lock())
                 .map_err(|error| AdminServiceError::InvalidCredential(error.to_string()))?;
@@ -2241,6 +2253,7 @@ impl AdminService {
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
                 req.metadata,
                 req.load_factor,
+                endpoint.map(|value| if value.is_empty() { None } else { Some(value) }),
             )
             .map_err(|e| self.classify_error(e, id))?;
         if let Some(setting) = proxy {
@@ -4881,6 +4894,7 @@ mod tests {
                 1,
                 None,
                 Some(Some(KiroCredentials::PROXY_DIRECT.to_string())),
+                None,
                 None,
                 None,
                 None,

@@ -15,6 +15,10 @@ use super::{KiroEndpoint, RequestContext};
 
 pub const CLI_ENDPOINT_NAME: &str = "cli";
 
+/// CLI 请求使用的固定兼容版本，与全局 IDE 版本及其自动刷新分开。
+/// 2026-11-09 核对官方 stable 元数据 currentRelease 为 1.4.121。
+pub const CLI_CLIENT_VERSION: &str = "1.4.121";
+
 pub struct CliEndpoint;
 
 impl CliEndpoint {
@@ -30,7 +34,7 @@ impl CliEndpoint {
         format!(
             "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
             ctx.config.system_version,
-            ctx.config.kiro_version,
+            CLI_CLIENT_VERSION,
         )
     }
 
@@ -146,6 +150,30 @@ fn set_origin_kiro_cli(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_api_and_mcp_use_compatibility_version_independent_of_global_ide_version() {
+        use crate::kiro::model::credentials::KiroCredentials;
+        use crate::model::config::Config;
+        let client = reqwest::Client::new();
+        let credentials = KiroCredentials::default();
+        let endpoint = CliEndpoint::new();
+        for global_version in ["2.3.0", "1.4.121", "9.9.9"] {
+            let mut config = Config::default();
+            config.kiro_version = global_version.into();
+            let ctx = RequestContext {
+                credentials: &credentials, config: &config, token: "offline-token",
+                machine_id: "offline-machine", api_domain: config.api_domain,
+            };
+            let api = endpoint.decorate_api(client.post(endpoint.api_url(&ctx)), &ctx).build().unwrap();
+            let mcp = endpoint.decorate_mcp(client.post(endpoint.mcp_url(&ctx)), &ctx).build().unwrap();
+            for request in [api, mcp] {
+                let ua = request.headers()["user-agent"].to_str().unwrap();
+                assert!(ua.contains("md/appVersion-1.4.121 app/AmazonQ-For-CLI"));
+                assert!(!ua.contains("appVersion-2.3.0"));
+            }
+        }
+    }
 
     #[test]
     fn test_set_origin_kiro_cli_current_message() {

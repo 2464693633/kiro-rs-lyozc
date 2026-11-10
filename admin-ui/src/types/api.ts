@@ -136,6 +136,8 @@ export interface CredentialStatusItem {
   /** 账号级限流冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
+  /** 显式端点；null 表示跟随全局，endpoint 则是当前实际生效值 */
+  endpointOverride?: string | null
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
   /** 账号来源渠道（纯备注） */
@@ -290,6 +292,8 @@ export interface AddCredentialResponse {
 
 // 更新凭据请求（字段为 undefined 表示不修改，空字符串表示清除）
 export interface UpdateCredentialRequest {
+  /** 省略表示不修改；空串恢复全局默认；ide/cli 显式选择请求端点 */
+  endpoint?: string
   email?: string
   /** 关联 IP 管理中的代理；与 proxyUrl 都省略表示不修改代理 */
   proxyId?: number

@@ -11,6 +11,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useUpdateCredential } from '@/hooks/use-credentials'
 import { useGroupOptions } from '@/hooks/use-groups'
 import { extractErrorMessage, cn } from '@/lib/utils'
@@ -46,6 +47,11 @@ function metadataValues(metadata: CredentialStatusItem['metadata']): Partial<Cre
   ) as Partial<CredentialMetadata>
 }
 
+function endpointChoiceOf(credential: CredentialStatusItem): string {
+  // 老后端只有有效端点；只展示该值，未改动时不提交以免把继承变成覆盖。
+  return credential.endpointOverride === undefined ? credential.endpoint : (credential.endpointOverride ?? '')
+}
+
 export function EditCredentialDialog({
   open,
   onOpenChange,
@@ -54,6 +60,7 @@ export function EditCredentialDialog({
 }: EditCredentialDialogProps) {
   const [activeTab, setActiveTab] = useState<TabKey>('general')
   const [email, setEmail] = useState(credential.email ?? '')
+  const [endpoint, setEndpoint] = useState(() => endpointChoiceOf(credential))
   const [proxyChoice, setProxyChoice] = useState<ProxyChoice>(() => proxyChoiceOf(credential))
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
@@ -68,6 +75,7 @@ export function EditCredentialDialog({
     if (open) {
       setActiveTab('general')
       setEmail(credential.email ?? '')
+      setEndpoint(endpointChoiceOf(credential))
       setProxyChoice(proxyChoiceOf(credential))
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
@@ -89,6 +97,7 @@ export function EditCredentialDialog({
         id: credential.id,
         req: {
           email: email,
+          ...(endpoint === endpointChoiceOf(credential) ? {} : { endpoint }),
           // 只在改了代理选择时提交代理字段
           ...(sameProxyChoice(proxyChoiceOf(credential), proxyChoice) ? {} : proxyRequestFields(proxyChoice)),
           groups: groups,
@@ -112,13 +121,13 @@ export function EditCredentialDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="sm:max-w-md max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle>
             编辑凭据 #{credential.id}
           </DialogTitle>
           <DialogDescription>
-            修改凭据标识、分组、Metadata 与代理配置。
+            修改凭据标识、请求端点、分组、Metadata 与代理配置。
           </DialogDescription>
         </DialogHeader>
 
@@ -143,10 +152,32 @@ export function EditCredentialDialog({
           ))}
         </nav>
 
-        <form onSubmit={handleSubmit}>
-          <div className="min-h-[280px] space-y-4 py-2">
+        <form onSubmit={handleSubmit} className="flex flex-col min-h-0">
+          <div className="min-h-0 overflow-y-auto space-y-4 py-2 pr-1">
             {activeTab === 'general' && (
               <>
+                <div className="space-y-2">
+                  <label htmlFor="credential-endpoint" className="text-sm font-medium">请求端点</label>
+                  <Select value={endpoint || '__global__'} onValueChange={(value) => setEndpoint(value === '__global__' ? '' : value)} disabled={isPending}>
+                    <SelectTrigger id="credential-endpoint" className="h-10 rounded-xl px-3.5">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__global__">跟随全局默认</SelectItem>
+                      <SelectItem value="ide">IDE</SelectItem>
+                      <SelectItem value="cli">CLI（1.4.121）</SelectItem>
+                      {endpoint && !['ide', 'cli'].includes(endpoint) && <SelectItem value={endpoint}>{endpoint}</SelectItem>}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-xs text-muted-foreground">
+                    保存后对该账号的后续请求生效，无需重启。{endpoint === '' && '请求按全局默认端点发送。'}
+                    {endpoint === 'cli' && 'CLI 请求使用固定兼容版本 1.4.121。'}
+                  </p>
+                  {credential.subscriptionTitle?.toUpperCase().includes('STUDENT') && (
+                    <p className="text-xs text-muted-foreground">Student 账号可选择 CLI 端点进行兼容性对照。</p>
+                  )}
+                </div>
+
                 {/* 邮箱 */}
                 <div className="space-y-2">
                   <label htmlFor="email" className="text-sm font-medium">
