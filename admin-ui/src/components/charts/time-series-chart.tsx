@@ -12,6 +12,7 @@ import {
 import type { TimeSeriesPoint, StatsGranularity } from '@/types/api'
 import { tooltipCursorStyle } from './tooltip-style'
 import { formatCredits, formatNumber } from '@/lib/utils'
+import { formatStatsTimestamp as formatTs } from '@/lib/stats-time'
 
 interface Props {
   data: TimeSeriesPoint[]
@@ -38,13 +39,6 @@ const SERIES = [
 interface ChartPoint extends TimeSeriesPoint {
   label: string
   cacheHitRate: number
-}
-
-function formatTs(ts: string, granularity: StatsGranularity): string {
-  const d = new Date(ts)
-  const md = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
-  if (granularity === 'day') return `${d.getFullYear()}-${md}`
-  return `${d.getFullYear()}-${md} ${String(d.getHours()).padStart(2, '0')}:00`
 }
 
 /** 命中率 = cacheRead / (input + cacheCreation + cacheRead)，无 prompt 时为 0 */

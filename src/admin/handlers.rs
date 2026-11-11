@@ -10,7 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
-use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
+use chrono::{Datelike, Duration, FixedOffset, NaiveDate, TimeZone};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -1726,8 +1726,11 @@ fn custom_stats_window(
     if end_date < start_date {
         return Err("endDate 不能早于 startDate".to_string());
     }
-    let start_ts = local_midnight_ts(start_date)?;
-    let end_ts = local_midnight_ts(end_date + Duration::days(1))?;
+    let start_ts = beijing_midnight_ts(start_date)?;
+    let next_date = end_date
+        .checked_add_signed(Duration::days(1))
+        .ok_or_else(|| "endDate 超出支持范围".to_string())?;
+    let end_ts = beijing_midnight_ts(next_date)?;
     Ok(StatsQueryWindow {
         start_ts,
         end_ts,
@@ -1740,12 +1743,33 @@ fn parse_stats_date(value: &str, name: &str) -> Result<NaiveDate, String> {
         .map_err(|_| format!("{} 必须使用 YYYY-MM-DD 格式", name))
 }
 
-fn local_midnight_ts(date: NaiveDate) -> Result<i64, String> {
-    Local
+fn beijing_midnight_ts(date: NaiveDate) -> Result<i64, String> {
+    // Dashboard date filters are defined in Beijing time, independent of the
+    // host/container timezone.
+    FixedOffset::east_opt(8 * 60 * 60)
+        .expect("valid Beijing offset")
         .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
         .single()
         .map(|d| d.timestamp())
-        .ok_or_else(|| format!("日期 {} 无法转换为本地时间", date))
+        .ok_or_else(|| format!("日期 {} 无法转换为北京时间", date))
+}
+
+#[cfg(test)]
+mod stats_timezone_tests {
+    use super::*;
+
+    #[test]
+    fn stats_dates_include_whole_beijing_days_on_utc_servers() {
+        let window =
+            custom_stats_window("2026-11-11", "2026-11-12", StatsGranularity::Hour).unwrap();
+        let expected = |text| chrono::DateTime::parse_from_rfc3339(text).unwrap().timestamp();
+        assert_eq!(window.start_ts, expected("2026-11-10T16:00:00Z"));
+        assert_eq!(window.end_ts, expected("2026-11-12T16:00:00Z"));
+        let same_day =
+            custom_stats_window("2026-11-11", "2026-11-11", StatsGranularity::Day).unwrap();
+        assert_eq!(same_day.end_ts - same_day.start_ts, 86400);
+        assert!(custom_stats_window("2026-11-12", "2026-11-11", StatsGranularity::Hour).is_err());
+    }
 }
 
 fn stats_query_parts(

@@ -24,6 +24,7 @@ import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
 import { KeyBarChart } from '@/components/charts/key-bar-chart'
 import { cn, formatCredits, formatNumber } from '@/lib/utils'
+import { statsDateInput as toDateInputValue, presetStatsStartDate as presetStartDate } from '@/lib/stats-time'
 import { Input } from '@/components/ui/input'
 import {
   Select,
@@ -44,26 +45,12 @@ const GRANULARITIES: { label: string; value: StatsGranularity }[] = [
   { label: '按天', value: 'day' },
 ]
 
-function toDateInputValue(d: Date): string {
-  const year = d.getFullYear()
-  const month = String(d.getMonth() + 1).padStart(2, '0')
-  const day = String(d.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
-}
-
 function customTimeFilter(
   startDate: string,
   endDate: string,
   granularity: StatsGranularity,
 ): StatsTimeFilter {
   return { startDate, endDate, granularity }
-}
-
-function presetStartDate(range: StatsRange, endDate: string): string {
-  const days = range === '24h' ? 1 : range === '7d' ? 6 : 29
-  const d = new Date(`${endDate}T00:00:00`)
-  d.setDate(d.getDate() - days)
-  return toDateInputValue(d)
 }
 
 function formatDateText(value: string): string {
@@ -436,7 +423,7 @@ function TrendTitle({ granularity }: { granularity: StatsGranularity }) {
     <div>
       <h2 className="text-base font-semibold tracking-tight">Token 使用趋势</h2>
       <p className="text-[12px] text-muted-foreground">
-        {granularity === 'day' ? '按天' : '按小时'}聚合 · 输入/输出/缓存读写
+        {granularity === 'day' ? '按天' : '按小时'}聚合 · 北京时间（UTC+8）· 输入/输出/缓存读写
       </p>
     </div>
   )

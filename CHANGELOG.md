@@ -6,6 +6,11 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 仪表概览北京时间修复
+
+- 日期筛选、按天聚合、今日用量与日期滚动统一按北京时间（UTC+8）计算，修复 UTC 服务器上选择日期后从 08:00 起算、漏掉凌晨用量的问题。
+- 日期选择器和趋势图固定使用 `Asia/Shanghai`，并在图表说明中标注北京时间，不受浏览器本地时区影响。历史用量日志在启动时按新边界重新聚合。
+
 ### Kiro CreateResponse 上游协议
 
 - OAuth 凭据按官方 `featureConfiguration` 的 `create_response_api` 实验选择聊天协议，账号隔离缓存 15 分钟；读取失败保留当前登录最近的有效选择，首次失败回退原协议并在 1 分钟后重查。

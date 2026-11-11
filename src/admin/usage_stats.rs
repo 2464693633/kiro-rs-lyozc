@@ -1,7 +1,7 @@
 //! 请求用量记录 + 时序聚合
 //!
 //! 记录每次 `/v1/messages` 请求的 token 消耗与命中信息：
-//! - 落盘：`usage_log.YYYY-MM-DD.jsonl`，每行一条 [`UsageRecord`]，按本地日期滚动
+//! - 落盘：`usage_log.YYYY-MM-DD.jsonl`，每行一条 [`UsageRecord`]，按北京时间日期滚动
 //! - 内存：[`UsageAggregator`] 维护近 31 天的小时桶 + 近 31 天的天桶，按需查询
 //!
 //! 启动时扫描历史 JSONL 文件重建聚合，保证重启后趋势图不丢数据。
@@ -12,7 +12,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,12 @@ const HOUR_BUCKETS: usize = 24 * 31;
 /// 天桶数量（31 天）
 const DAY_BUCKETS: usize = 31;
 const RPM_WINDOW_SECS: i64 = 60;
+const BEIJING_OFFSET_SECS: i32 = 8 * 60 * 60;
+
+/// Dashboard statistics use Beijing time regardless of the server's timezone.
+fn beijing_tz() -> FixedOffset {
+    FixedOffset::east_opt(BEIJING_OFFSET_SECS).expect("valid Beijing offset")
+}
 
 /// 单次请求的用量记录（与 JSONL 一行一一对应）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,7 +110,7 @@ impl UsageRecorder {
                 return;
             }
         };
-        let today = Local::now().date_naive();
+        let today = Utc::now().with_timezone(&beijing_tz()).date_naive();
         let mut state = self.inner.lock();
         if state.current_date != Some(today) || state.writer.is_none() {
             // 切换到当日文件
@@ -144,7 +150,8 @@ impl UsageRecorder {
 
     /// 清理超过保留期的旧文件
     pub fn cleanup_old_logs(&self) {
-        let cutoff = Local::now().date_naive() - Duration::days(self.retention_days());
+        let cutoff = Utc::now().with_timezone(&beijing_tz()).date_naive()
+            - Duration::days(self.retention_days());
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(it) => it,
             Err(_) => return,
@@ -211,7 +218,7 @@ impl BucketStats {
 /// 单个时间桶含分组数据
 #[derive(Debug, Default, Clone)]
 struct BucketEntry {
-    /// 桶起始时间戳（小时桶为整点 Unix 秒；天桶为本地 0 点 Unix 秒）
+    /// 桶起始时间戳（小时桶为整点 Unix 秒；天桶为北京时间 0 点 Unix 秒）
     ts: i64,
     overall: BucketStats,
     by_key: HashMap<u64, BucketStats>,
@@ -396,7 +403,8 @@ impl UsageAggregator {
                 return;
             }
         };
-        let cutoff = Local::now().date_naive() - Duration::days(RETENTION_DAYS);
+        let cutoff = Utc::now().with_timezone(&beijing_tz()).date_naive()
+            - Duration::days(RETENTION_DAYS);
         let mut count = 0u64;
         for entry in entries.flatten() {
             let name = match entry.file_name().into_string() {
@@ -440,14 +448,14 @@ impl UsageAggregator {
             Ok(d) => d.with_timezone(&Utc),
             Err(_) => now,
         };
-        let local = dt.with_timezone(&Local);
+        let local = dt.with_timezone(&beijing_tz());
 
-        // 小时桶起始：当地小时整点 → 转回 UTC unix 秒
-        let hour_start = Local
+        // 小时桶起始：北京时间小时整点 → 转回 UTC unix 秒
+        let hour_start = beijing_tz()
             .with_ymd_and_hms(local.year(), local.month(), local.day(), local.hour(), 0, 0)
             .single();
-        // 天桶起始：本地 0 点 → 转回 UTC unix 秒
-        let day_start = Local
+        // 天桶起始：北京时间 0 点 → 转回 UTC unix 秒
+        let day_start = beijing_tz()
             .with_ymd_and_hms(local.year(), local.month(), local.day(), 0, 0, 0)
             .single();
 
@@ -486,11 +494,11 @@ impl UsageAggregator {
 
     fn query_credential_activity_at(&self, now: DateTime<Utc>) -> HashMap<u64, CredentialActivity> {
         let inner = self.inner.read();
-        let today = now.with_timezone(&Local).date_naive();
+        let today = now.with_timezone(&beijing_tz()).date_naive();
         let mut activity: HashMap<u64, CredentialActivity> = HashMap::new();
         for bucket in &inner.day_buckets {
             let is_today = DateTime::from_timestamp(bucket.ts, 0)
-                .is_some_and(|start| start.with_timezone(&Local).date_naive() == today);
+                .is_some_and(|start| start.with_timezone(&beijing_tz()).date_naive() == today);
             if is_today {
                 for (credential_id, stats) in &bucket.by_credential {
                     activity.entry(*credential_id).or_default().today_calls += stats.calls;
@@ -681,11 +689,12 @@ impl UsageAggregator {
     /// 概览（今日 + 最近 7 天）
     pub fn overview(&self) -> OverviewStats {
         let inner = self.inner.read();
-        let today_start = Local
+        let now_beijing = Utc::now().with_timezone(&beijing_tz());
+        let today_start = beijing_tz()
             .with_ymd_and_hms(
-                Local::now().year(),
-                Local::now().month(),
-                Local::now().day(),
+                now_beijing.year(),
+                now_beijing.month(),
+                now_beijing.day(),
                 0,
                 0,
                 0,
@@ -839,8 +848,44 @@ pub type SharedAggregator = Arc<UsageAggregator>;
 mod tests {
     use super::*;
 
+    #[test]
+    fn beijing_day_includes_early_morning_and_excludes_adjacent_days() {
+        let aggregator = UsageAggregator::new();
+        let now = DateTime::parse_from_rfc3339("2026-11-11T17:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        for timestamp in [
+            "2026-11-10T15:59:59Z", // Beijing Nov 10, 23:59:59
+            "2026-11-10T16:00:00Z", // Beijing Nov 11, 00:00
+            "2026-11-11T15:59:59Z", // Beijing Nov 11, 23:59:59
+            "2026-11-11T16:00:00Z", // Beijing Nov 12, 00:00
+        ] {
+            let time = DateTime::parse_from_rfc3339(timestamp)
+                .unwrap()
+                .with_timezone(&Utc);
+            aggregator.ingest_at(&activity_record(7, time, "success"), now);
+        }
+        let start_ts = DateTime::parse_from_rfc3339("2026-11-11T00:00:00+08:00")
+            .unwrap()
+            .timestamp();
+        let end_ts = start_ts + 86400;
+        for granularity in [StatsGranularity::Hour, StatsGranularity::Day] {
+            let window = StatsQueryWindow {
+                start_ts,
+                end_ts,
+                granularity,
+            };
+            let series = aggregator.query_timeseries(window, None, None);
+            assert_eq!(series.iter().map(|point| point.calls).sum::<u64>(), 2);
+            assert_eq!(series.first().unwrap().ts, "2026-11-10T16:00:00+00:00");
+            assert_eq!(aggregator.query_by_model(window, None)[0].calls, 2);
+            assert_eq!(aggregator.query_by_credential(window, None, None)[0].calls, 2);
+            assert_eq!(aggregator.query_by_key(window, None)[0].calls, 2);
+        }
+    }
+
     fn activity_test_time() -> DateTime<Utc> {
-        Local
+        beijing_tz()
             .with_ymd_and_hms(2026, 11, 4, 12, 0, 0)
             .single()
             .unwrap()
@@ -924,9 +969,9 @@ mod tests {
     }
 
     #[test]
-    fn credential_activity_resets_today_at_local_midnight() {
+    fn credential_activity_resets_today_at_beijing_midnight() {
         let aggregator = UsageAggregator::new();
-        let now = Local
+        let now = beijing_tz()
             .with_ymd_and_hms(2026, 11, 5, 0, 0, 30)
             .single()
             .unwrap()
@@ -1260,9 +1305,9 @@ mod tests {
     #[test]
     fn aggregator_filters_by_custom_window_and_granularity() {
         let agg = UsageAggregator::new();
-        let today = Local::now().date_naive();
+        let today = Utc::now().with_timezone(&beijing_tz()).date_naive();
         let yesterday = today - Duration::days(1);
-        let yesterday_noon = Local
+        let yesterday_noon = beijing_tz()
             .with_ymd_and_hms(
                 yesterday.year(),
                 yesterday.month(),
@@ -1275,7 +1320,7 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc)
             .to_rfc3339();
-        let today_noon = Local
+        let today_noon = beijing_tz()
             .with_ymd_and_hms(today.year(), today.month(), today.day(), 12, 0, 0)
             .single()
             .unwrap()
@@ -1310,12 +1355,12 @@ mod tests {
         agg.ingest(&rec_yesterday);
         agg.ingest(&rec_today);
 
-        let start_ts = Local
+        let start_ts = beijing_tz()
             .with_ymd_and_hms(today.year(), today.month(), today.day(), 0, 0, 0)
             .single()
             .unwrap()
             .timestamp();
-        let end_ts = Local
+        let end_ts = beijing_tz()
             .with_ymd_and_hms(today.year(), today.month(), today.day(), 23, 59, 59)
             .single()
             .unwrap()
