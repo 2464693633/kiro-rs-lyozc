@@ -81,8 +81,8 @@ function CacheReadTargetInput({ id, value, onChange, disabled }: {
         disabled={disabled}
       />
       <p className="mt-1 text-[11px] text-muted-foreground">
-        一律按该比例上报模拟缓存读取，自然命中率不参与计算：设 80% 时，
-        自然 95% 会压到 80%，自然 0% 也会按 80% 上报。其余输入计入缓存写入。
+        先从输入总量预留固定输入 Token，再按「缓存创建 + 缓存读取」的总量计算比例。
+        设 80% 时，读取占 80%，创建占其余 20%，不按自然命中率分配。
         <strong>设置后覆盖下方的读取上限。</strong>
         垫高的部分本地并无对应缓存条目，不改变上游实际积分；仅在模拟缓存计量开启时生效。
       </p>
@@ -112,9 +112,8 @@ function CacheReadLimitInput({ id, value, onChange, disabled }: {
         disabled={disabled}
       />
       <p className="mt-1 text-[11px] text-muted-foreground">
-        每次请求的模拟缓存读取量占总输入的比例，设置 0–100 的整数。
-        超出部分转为普通输入；缓存写入和实际积分不变。
-        仅在模拟缓存计量开启时生效，上游返回的真实用量保持原值。
+        缓存读取占「缓存创建 + 缓存读取」的比例上限，只压低自然命中量，不垫高。
+        超出部分转为缓存创建，固定输入和输出不变。对上游精确用量与本地估算均生效，实际积分不变。
       </p>
     </div>
   )

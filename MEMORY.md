@@ -41,60 +41,17 @@
 - Schema 字段可用 `x-css` 配置卡片值样式；前后端都必须拒绝外链、脚本表达式和
   会让内容脱离卡片边界的布局属性，避免自定义样式成为数据外传或界面劫持入口。
 
-## Anthropic Prompt Cache 本地计量
+## Anthropic Prompt Cache 与输入上报
 
-- 固定上报输入 Token（`reportedInputTokens`，默认 2，0 关闭，上限 1000）把对外的
-  `input_tokens` 钉在配置值：命中的 `cache_read` 原样保留（Key 级读取上限先生效），
-  未缓存尾部并入 `cache_creation`，三项之和仍等于扣减后的真实输入总量。
-  上游精确快照同样套用，避免新旧协议两种形状；并入的尾部按 5m TTL 计。
-  与 `inputTokenDeduction` 叠加时先扣减再固定。关掉缓存计量的 Key 和总开关关闭时不生效。
-  只改上报口径，不动缓存条目、输出 Token 和上游真实积分；trace 标记为「已扣减」。
-
-- 全局 `inputTokenDeduction` 默认 0，可在「设置 → 模型」热更新。对每次上游调用，
-  先扣输入总量再拆模拟缓存；精确 provider 拆分按累计比例缩减。输出 Token、缓存条目
-  与实际积分不变；内部搜索和恢复逐轮处理，聚合处不得再扣，历史记录不回写。
-
-- 本项目拿不到 Kiro 上游的真实 KV 张量缓存，只能在 provider 未返回精确 usage 时，
-  按请求前缀模拟 Anthropic 的 `cache_creation_input_tokens` 与
-  `cache_read_input_tokens`；该模拟不会降低上游推理成本。
-- 只有顶层自动缓存或显式 block `cache_control` 才写入条目；自动断点落在最后一个
-  合格 block，显式断点最多 4 个，读取从各断点回溯最多 20 个位置。
-- 连续 `tool_use` 和连续 `tool_result` 块分别只占一个回溯位置；断点只匹配此前真实
-  写入的前缀，不为未声明的中间 block 建条目。
-- 每个条目独立保存 5 分钟或 1 小时 TTL，命中后按自身 TTL 续期；混用时 1 小时
-  断点必须位于 5 分钟断点之前。
-- 缓存键覆盖完整结构化 block 与模型配置，并遵守 tools -> system -> messages 的
-  失效层级；`tool_choice` 和图片存在性只使 message 前缀失效。
-- 本地条目按客户端 Key 与 session 组合隔离；缺少可识别 session 时，按系统提示和
-  第一条 user 消息派生稳定隔离种子。系统 Key 缺少 session 本身不代表模拟关闭。
-- 客户端 Key 的 `cacheMetering`（默认 true，仅为 false 时写入文件）可单独关闭模拟：
-  该 Key 不读写 CacheMeter、不计入 hit/miss 统计，输入全部计入 `input_tokens`，
-  上游真实用量仍优先。请求路径必须经 `AppState::cache_meter_for_key` 取计量器，
-  `cache_meter` 字段因此是私有的。
-- 代表性三轮夹具的热缓存读取率约 88.21%，仅用于验证目标工作负载；不得随机或
-  硬编码制造 75%～90% 命中率。
-- 已知边界：尚未按模型执行 512～4096 token 的最小缓存阈值；并发请求中条目在
-  上游响应开始前即可见；JSON 解析会规范化对象键序，无法复现原始线序变化导致的失效。
-
-## 模拟缓存读取目标与上限
-
-- Key 级 `cacheReadTargetPercent`（0–100，留空关闭）一律按比例上报模拟缓存读取，
-  自然命中率不参与；`cacheReadLimitPercent` 只封顶不垫高。两者同时设置时目标优先，
-  上限不再二次裁剪，否则「一律按 N%」在上限更低时不成立。
-- 两者都向下取整，三项守恒到扣减后的真实输入总量；`total > 0` 时 input 至少留 1 个 token，
-  所以目标 100% 会让出 1 个。上游精确快照同样套用；未声明 cache_control 时目标也生效。
-- 只在模拟缓存计量开启时生效（Key 级开关与全局开关都算），和固定上报输入同一道门控。
-- 目标垫高的读取量本地没有对应缓存条目：它改的是上报口径，不是真实命中，也不减少上游积分。
-  要真正提高命中率只能动容量、TTL 间隔、稳定前缀、Redis 共享或会话粘性。
-
-## 本地计量生效范围
-
-- 固定上报输入 Token 与 Key 级读取目标 / 上限只对走本地拆分的请求生效
-  （trace 的 `usage_source` 为 `adjusted` / `simulated`）。`provider` 是上游
-  `metadataEvent.tokenUsage` 真值，一律原样上报，本地配置不改写它。
-- `GET /api/admin/traces/usage-source-stats` 按来源聚合 `traces.db` 既有列，
-  设置页 Prompt Cache 分组展示最近 24 小时分布。老记录无来源列，计入 `unknown`；
-  关闭 `traceEnabled` 后统计为空，界面必须如实说明而不是显示 0%。
+- `reportedInputTokens` 默认2（0关闭），从原输入总量预留，其余组成 creation+read 缓存池。总量不足配置值时按总量，不增加 Token。输出 Token 和实际积分不变。
+- 上游精确快照优先提供原总量与自然读数，本地估算作为缺失回退；两者统一应用上报策略，无断点也可固定输入2，此时自然读取0、剩余归creation。关闭 Key 或全局缓存计量时不应用上报策略。
+- Key `cacheReadTargetPercent` 的分母是 creation+read，目标覆盖上限；未设目标时 `cacheReadLimitPercent` 只压低自然read，被裁掉部分归creation。自然模式反映前缀命中，人工目标是计量分配、不是真实缓存命中。
+- 多轮搜索、身份检查、输出恢复先聚合自然用量，在客户端请求边界只预留一次输入并分配比例，响应与Key统计一致，积分逐轮累计不重复。
+- `inputTokenDeduction` 功能已移除，旧JSON字段忽略且后续配置保存时不再写出；不得恢复1900扣减。
+- 上报策略下creation统一按默认5m分类；不调整的自然拆分保留已知TTL。CacheMeter仅按合法cache_control断点写条目（5m/1h，最多4断点、回溯20位置），人工比例不改条目。
+- 自动断点优先落在当前user之前的合格块；每Key隔离，有会话标识时进一步按会话隔离。缺session的系统Key按系统提示与首条user派生种子。
+- 既有边界：无按模型最小缓存阈值，条目在上游成功前可见，模拟不会降低上游积分。
+- trace `adjusted` 表示应用固定输入或比例，可能来自provider或本地估算；历史分类不回写。来源面板展示分布，不能将adjusted占比解释为纯本地估算比例。
 
 ## IP 管理（代理池）
 

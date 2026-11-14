@@ -12,13 +12,6 @@ pub struct ToolCompatibilityConfig {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct InputTokenDeductionConfig {
-    #[serde(deserialize_with = "crate::model::config::deserialize_input_token_deduction")]
-    pub input_token_deduction: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReportedInputTokensConfig {
     #[serde(deserialize_with = "crate::model::config::deserialize_reported_input_tokens")]
     pub reported_input_tokens: u32,

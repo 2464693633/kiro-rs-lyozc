@@ -100,7 +100,7 @@ pub(super) async fn run(
         return dispatch(state, key, payload, cc, buffered_sse).await;
     }
     let hook = UsageRecordHook::from_state(&state, key.key_id, payload.model.clone());
-    let capture = Arc::new(UsageCapture::default());
+    let capture = Arc::new(UsageCapture::with_policy(hook.cache_policy));
     let settlement = Settlement::new(hook, capture.clone());
     state.usage_capture = Some(capture.clone());
     let response = dispatch(

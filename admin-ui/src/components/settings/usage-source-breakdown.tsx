@@ -1,12 +1,12 @@
 import { useUsageSourceStats } from '@/hooks/use-traces'
 import { extractErrorMessage } from '@/lib/utils'
 
-/** 本地计量生效范围：只有走本地拆分的请求才受固定上报与读取目标影响。 */
+/** 计量来源：区分已应用上报策略、自然模拟和未经调整的上游用量。 */
 const BUCKETS = [
   {
     key: 'adjusted',
     label: '已调整',
-    hint: '走了本地拆分，并应用了输入扣减或固定上报口径',
+    hint: '应用了固定输入、缓存读取目标或上限；可能基于上游精确用量或本地估算',
     cls: 'bg-violet-500',
     local: true,
   },
@@ -20,7 +20,7 @@ const BUCKETS = [
   {
     key: 'provider',
     label: '上游真值',
-    hint: '用量来自 Kiro metadataEvent.tokenUsage；固定上报与读取目标对这些请求不生效',
+    hint: '用量来自上游精确快照，未启用固定输入或比例调整',
     cls: 'bg-sky-500',
     local: false,
   },
@@ -70,7 +70,7 @@ export function UsageSourceBreakdown() {
     <div className="space-y-2">
       <div className="flex items-baseline justify-between gap-2">
         <span className="text-[12px] text-muted-foreground">
-          本地计量生效范围（最近 24 小时）
+          用量来源分布（最近 24 小时）
         </span>
         <span className="text-[13px] font-medium tabular-nums">
           {pct(localTotal).toFixed(1)}%
@@ -80,7 +80,7 @@ export function UsageSourceBreakdown() {
       <div
         className="flex h-2 w-full overflow-hidden rounded-full bg-muted"
         role="img"
-        aria-label={`共 ${stats.total} 条请求，其中 ${localTotal} 条走本地拆分`}
+        aria-label={`共 ${stats.total} 条请求，其中 ${localTotal} 条经过上报策略或本地估算`}
       >
         {present.map((bucket) => (
           <div
@@ -108,10 +108,9 @@ export function UsageSourceBreakdown() {
       </dl>
 
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        固定上报输入 Token 与 Key 级的模拟缓存读取目标 / 上限，只对「已调整」和「本地估算」
-        这两类请求生效，共 {localTotal.toLocaleString()} 条。「上游真值」的用量由 Kiro 下发，
-        本地配置不改写它；「无断点」的请求输入全额计入 input_tokens。
-        {localTotal === 0 && ' 当前没有任何请求走本地拆分，调整这些设置不会改变上报数字。'}
+        「已调整」表示应用了固定输入或缓存比例策略，上游精确用量也可以属于这一类。
+        「本地估算」按请求前缀估计自然命中，「上游真值」未经过上报调整。
+        历史记录沿用当时的来源标记，不能用于推断当前配置是否生效。
       </p>
     </div>
   )

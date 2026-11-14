@@ -55,6 +55,7 @@ use super::websearch;
 /// - 客户端 Key 计数（按 Key 累计）
 #[derive(Clone)]
 pub(crate) struct UsageRecordHook {
+    pub(crate) cache_policy: super::cache_metering::CacheUsage,
     pub recorder: Option<SharedRecorder>,
     pub aggregator: Option<SharedAggregator>,
     pub client_keys: Option<SharedClientKeyManager>,
@@ -84,6 +85,8 @@ impl UsageRecordHook {
             capture: state.usage_capture.clone(),
             count_call: state.count_successful_call,
             cache_creation: None,
+            cache_policy: if state.usage_capture.is_some() { super::cache_metering::CacheUsage::default() }
+                else { state.cache_reporting_policy_for_key(key_id) },
         }
     }
 
@@ -174,7 +177,7 @@ pub(crate) enum UsageSource {
     /// 错误早退等无用量场景
     #[default]
     Unknown,
-    /// 已应用配置的输入扣减。
+    /// 已应用固定输入或缓存比例上报策略。
     Adjusted,
     /// 上游 metadataEvent.tokenUsage
     Provider,
@@ -197,10 +200,7 @@ impl UsageSource {
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
     pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
-        if cache_usage.input_token_deduction > 0
-            || cache_usage.reported_input_tokens > 0
-            || cache_usage.read_target_percent.is_some()
-        {
+        if cache_usage.has_reporting_policy() {
             Self::Adjusted
         } else if has_provider_usage {
             Self::Provider

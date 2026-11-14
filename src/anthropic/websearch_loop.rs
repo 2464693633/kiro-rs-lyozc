@@ -1045,7 +1045,7 @@ impl WebSearchUsageSettlement {
     }
 
     fn usage(&self) -> TokenUsage {
-        self.usage.sanitized()
+        self.hook.cache_policy.reported_provider_usage(self.usage)
     }
 
     fn discard(&mut self) {
@@ -1077,7 +1077,7 @@ impl WebSearchUsageSettlement {
         record_aggregated_usage(
             &self.hook,
             self.credential_id,
-            self.usage,
+            self.usage(),
             self.credits,
             usage_status,
         );
@@ -1087,9 +1087,9 @@ impl WebSearchUsageSettlement {
                 trace_status,
                 error_type,
                 error_message,
-                self.usage,
+                self.usage(),
                 self.credits,
-                self.source,
+                if self.hook.cache_policy.has_reporting_policy() { UsageSource::Adjusted } else { self.source },
             );
         }
         self.settled = true;
@@ -1739,16 +1739,6 @@ async fn run_web_search_loop_inner(
         None
     };
     let mut presentation: Vec<Value> = Vec::new();
-    let read_limit = hook
-        .client_keys
-        .as_ref()
-        .and_then(|keys| keys.cache_read_limit_percent(key_id));
-    let read_target = hook
-        .client_keys
-        .as_ref()
-        .and_then(|keys| keys.cache_read_target_percent(key_id));
-    let input_token_deduction = provider.token_manager().input_token_deduction();
-    let reported_input_tokens = provider.token_manager().reported_input_tokens();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
@@ -1768,21 +1758,12 @@ async fn run_web_search_loop_inner(
                 payload.messages.clone(),
                 payload.tools.clone(),
             ) as i32;
+            // Sum natural round usage; reserve fixed input and apply the ratio once
+            // at settlement, so a multi-call response still reports input=2.
             let round_cache_usage = match cache_meter.as_ref() {
-                Some(cache) => {
-                    super::cache_metering::compute_cache_usage(cache, &payload, key_id)
-                        .await
-                        .with_read_limit_percent(read_limit)
-                        .with_read_target_percent(if cache.is_enabled() { read_target } else { None })
-                        .with_reported_input_tokens(if cache.is_enabled() {
-                            reported_input_tokens
-                        } else {
-                            0
-                        })
-                }
+                Some(cache) => super::cache_metering::compute_cache_usage(cache, &payload, key_id).await,
                 None => CacheUsage::default(),
-            }
-            .with_input_token_deduction(input_token_deduction);
+            };
             let (round, credential_id) = match run_round(
                 &provider,
                 &payload,
@@ -2860,6 +2841,7 @@ mod tests {
     async fn receiver_disconnect_settles_accumulated_usage_once() {
         let aggregator = Arc::new(crate::admin::usage_stats::UsageAggregator::new());
         let hook = UsageRecordHook {
+            cache_policy: CacheUsage::default(),
             capture: None,
             cache_creation: None,
             recorder: None,
@@ -4057,6 +4039,7 @@ mod tests {
     #[test]
     fn settlement_source_marks_any_simulated_round_as_simulated() {
         let hook = UsageRecordHook {
+            cache_policy: CacheUsage::default(),
             capture: None,
             cache_creation: None,
             recorder: None,
@@ -4179,6 +4162,7 @@ mod tests {
     #[test]
     fn final_responses_sum_credit_usage_across_model_rounds() {
         let hook = UsageRecordHook {
+            cache_policy: CacheUsage::default(),
             capture: None,
             cache_creation: None,
             recorder: None,
@@ -4242,6 +4226,7 @@ mod tests {
             let manager = Arc::new(ClientKeyManager::new());
             let entry = manager.create("billable".into(), None, None);
             let hook = UsageRecordHook {
+                cache_policy: CacheUsage::default(),
                 recorder: None,
                 aggregator: None,
                 client_keys: Some(manager.clone()),

@@ -23,8 +23,8 @@ export function useTraces(query: TraceQuery, enabled = true) {
 /**
  * 按 usage 来源统计请求条数，用于确认本地计量配置的实际生效范围。
  *
- * 只有 simulated / adjusted 走了本地拆分；provider 是上游真值，固定上报与
- * 读取目标对它不生效。trace 关闭时总数为 0，此时无法判断生效范围。
+ * adjusted 可基于上游精确用量或本地估算应用上报策略；provider 未经调整。
+ * 历史标记不回写，trace 关闭时无法判断当前配置生效范围。
  */
 export function useUsageSourceStats(windowSecs = 86400) {
   return useQuery({

@@ -1351,7 +1351,6 @@ pub struct MultiTokenManager {
     /// 对话 / MCP 上游域名（运行时可修改）
     api_domain: Mutex<ApiDomain>,
     tool_compatibility_mode: Mutex<ToolCompatibilityMode>,
-    input_token_deduction: AtomicU32,
     reported_input_tokens: AtomicU32,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
@@ -1653,7 +1652,6 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let api_domain = config.api_domain;
         let tool_compatibility_mode = config.tool_compatibility_mode;
-        let input_token_deduction = config.input_token_deduction;
         let reported_input_tokens = config.reported_input_tokens;
         let session_affinity = SessionAffinity::new(
             config.session_affinity_enabled,
@@ -1695,7 +1693,6 @@ impl MultiTokenManager {
             group_manager: RwLock::new(None),
             api_domain: Mutex::new(api_domain),
             tool_compatibility_mode: Mutex::new(tool_compatibility_mode),
-            input_token_deduction: AtomicU32::new(input_token_deduction),
             reported_input_tokens: AtomicU32::new(reported_input_tokens),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
@@ -5215,29 +5212,6 @@ impl MultiTokenManager {
 
     pub fn tool_compatibility_mode(&self) -> ToolCompatibilityMode {
         *self.tool_compatibility_mode.lock()
-    }
-
-    pub fn input_token_deduction(&self) -> u32 {
-        self.input_token_deduction.load(Ordering::Relaxed)
-    }
-
-    pub fn set_input_token_deduction(&self, value: u32) -> anyhow::Result<()> {
-        let _update_guard = self.runtime_config_update_lock.lock();
-        anyhow::ensure!(
-            value <= crate::model::config::MAX_INPUT_TOKEN_DEDUCTION,
-            "inputTokenDeduction 必须是 0 到 1000000 的整数"
-        );
-        anyhow::ensure!(
-            self.config.config_path().is_some(),
-            "配置文件路径未知，无法保存输入 Token 扣减值"
-        );
-        self.update_config_file(|config| config.input_token_deduction = value)?;
-        self.input_token_deduction.store(value, Ordering::Relaxed);
-        tracing::info!(
-            input_token_deduction = value,
-            "输入 Token 扣减值已保存，对后续模型调用生效"
-        );
-        Ok(())
     }
 
     pub fn reported_input_tokens(&self) -> u32 {

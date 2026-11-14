@@ -84,11 +84,11 @@ pub struct ClientKey {
     /// 老数据无此字段，默认开启。
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub cache_metering: bool,
-    /// 模拟缓存读取占总输入的百分比上限；None 表示不额外限制。
+    /// 缓存读取占 creation + read 的百分比上限；None 表示不额外限制。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_limit_percent: Option<u8>,
     /// 固定的模拟缓存读取目标占比；None 表示按自然命中率上报。
-    /// 设置后直接决定 read / creation 比例，并覆盖 `cache_read_limit_percent`。
+    /// 先预留固定 input，再决定缓存池内 read / creation 比例，覆盖 `cache_read_limit_percent`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_target_percent: Option<u8>,
 }

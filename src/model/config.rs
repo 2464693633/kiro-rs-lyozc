@@ -4,23 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const MAX_INPUT_TOKEN_DEDUCTION: u32 = 1_000_000;
-
 /// 固定上报输入 token 的上限。超过这个量就不像「几乎全缓存」的请求了。
 pub const MAX_REPORTED_INPUT_TOKENS: u32 = 1_000;
-
-pub fn deserialize_input_token_deduction<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = u32::deserialize(deserializer)?;
-    if value > MAX_INPUT_TOKEN_DEDUCTION {
-        return Err(serde::de::Error::custom(
-            "inputTokenDeduction 必须是 0 到 1000000 的整数",
-        ));
-    }
-    Ok(value)
-}
 
 pub fn deserialize_reported_input_tokens<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
@@ -427,14 +412,10 @@ pub struct Config {
     #[serde(default = "default_tool_compatibility_mode")]
     pub tool_compatibility_mode: ToolCompatibilityMode,
 
-    /// 每次上游模型调用上报前扣除的输入 token；0 保持原计量，实际积分不变。
-    #[serde(default, deserialize_with = "deserialize_input_token_deduction")]
-    pub input_token_deduction: u32,
-
     /// 固定上报的 `input_tokens`；0 关闭，按本地模拟的真实拆分上报。
     ///
-    /// 非 0 时把命中的 `cache_read` 原样保留，未被缓存覆盖的尾部并入
-    /// `cache_creation_input_tokens`，三项之和仍等于扣减后的输入总量。
+    /// 非 0 时从原输入总量预留固定 input，其余分配为缓存创建和读取；新增输入并入
+    /// `cache_creation_input_tokens`，三项之和仍等于原输入总量。
     /// 只改上报口径：不动缓存条目、输出 token 和上游真实积分。
     #[serde(default = "default_reported_input_tokens", deserialize_with = "deserialize_reported_input_tokens")]
     pub reported_input_tokens: u32,
@@ -721,7 +702,6 @@ impl Default for Config {
             model_cache_ttl_secs: default_model_cache_ttl_secs(),
             extract_thinking: default_extract_thinking(),
             tool_compatibility_mode: default_tool_compatibility_mode(),
-            input_token_deduction: 0,
             reported_input_tokens: default_reported_input_tokens(),
             default_endpoint: default_endpoint(),
             api_domain: ApiDomain::default(),

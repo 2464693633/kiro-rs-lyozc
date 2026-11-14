@@ -21,7 +21,6 @@ use super::{
         get_current_models, get_global_proxy, get_custom_models, get_custom_headers,
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_tool_compatibility_mode, set_tool_compatibility_mode,
-        get_input_token_deduction, set_input_token_deduction,
         get_reported_input_tokens, set_reported_input_tokens,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
         get_protocol_compatibility,
@@ -154,10 +153,6 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/tool-compatibility",
             get(get_tool_compatibility_mode).put(set_tool_compatibility_mode),
-        )
-        .route(
-            "/config/input-token-deduction",
-            get(get_input_token_deduction).put(set_input_token_deduction),
         )
         .route(
             "/config/reported-input-tokens",

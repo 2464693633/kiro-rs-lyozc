@@ -33,8 +33,8 @@ use serde_json::json;
 mod chat_stream_tests;
 #[path = "output_recovery_tests.rs"]
 mod output_recovery_tests;
-#[path = "input_token_deduction_tests.rs"]
-mod input_token_deduction_tests;
+#[path = "cache_reporting_tests.rs"]
+mod cache_reporting_tests;
 #[path = "create_response_gateway_tests.rs"]
 mod create_response_gateway_tests;
 use std::{
@@ -1306,8 +1306,9 @@ async fn gateway_cache_read_limit_matches_streams_logs_and_tool_paths() {
                 let read = capped["cache_read_input_tokens"].as_u64().unwrap();
                 let input = capped["input_tokens"].as_u64().unwrap();
                 assert_eq!(total(&capped), baseline_total);
-                assert_eq!(read, baseline_total * 60 / 100);
-                assert_eq!(capped["cache_creation_input_tokens"], baseline["cache_creation_input_tokens"]);
+                assert_eq!(input, 2);
+                assert_eq!(read, (baseline_total - input) * 60 / 100);
+                assert_eq!(capped["cache_creation_input_tokens"], baseline_total - input - read);
                 assert_eq!(capped["output_tokens"], baseline["output_tokens"]);
                 let after = keys.list()[0].clone();
                 assert_eq!(after.total_cache_read_tokens - before.total_cache_read_tokens, read);
@@ -1386,14 +1387,15 @@ async fn gateway_guarded_stream_starts_with_zero_cache_creation_breakdown() {
         assert_eq!(initial["cache_creation"], json!({"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}));
         let final_usage = &events.iter().find(|event| event["type"] == "message_delta").unwrap()["usage"];
         assert!(final_usage["cache_creation_input_tokens"].as_u64().unwrap() > 0);
-        assert_eq!(final_usage["cache_creation"]["ephemeral_1h_input_tokens"], final_usage["cache_creation_input_tokens"]);
-        assert_eq!(final_usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+        assert_eq!(final_usage["input_tokens"], 2);
+        assert_eq!(final_usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+        assert_eq!(final_usage["cache_creation"]["ephemeral_5m_input_tokens"], final_usage["cache_creation_input_tokens"]);
         assert_eq!(events.last().unwrap()["type"], "message_stop");
     }
 }
 
 #[tokio::test]
-async fn gateway_cache_read_limit_preserves_provider_reported_usage() {
+async fn gateway_cache_read_limit_redistributes_provider_usage_without_changing_total() {
     use crate::{admin::client_keys::ClientKeyManager, anthropic::cache_metering::CacheMeter};
     for cc in [false, true] {
         for streaming in [false, true] {
@@ -1407,10 +1409,10 @@ async fn gateway_cache_read_limit_preserves_provider_reported_usage() {
                 "model":"claude-opus-5-5","max_tokens":64,"stream":streaming,
                 "cache_control":{"type":"ephemeral"},"messages":[{"role":"user","content":"hello"}]
             })).await;
-            assert_eq!(message["usage"]["input_tokens"], 0);
-            assert_eq!(message["usage"]["cache_read_input_tokens"], 18224);
-            assert_eq!(message["usage"]["cache_creation_input_tokens"], 4);
-            assert_eq!(message["usage"].get("cache_creation"), Some(&serde_json::Value::Null));
+            assert_eq!(message["usage"]["input_tokens"], 2);
+            assert_eq!(message["usage"]["cache_read_input_tokens"], 0);
+            assert_eq!(message["usage"]["cache_creation_input_tokens"], 18226);
+            assert_eq!(message["usage"]["cache_creation"]["ephemeral_5m_input_tokens"], 18226);
             assert_eq!(message["usage"]["output_tokens"], 17);
         }
     }

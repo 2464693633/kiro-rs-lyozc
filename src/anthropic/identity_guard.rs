@@ -35,9 +35,13 @@ const REVIEWER: &str = include_str!("identity_reviewer.txt");
 const CLIENT_RECAP: &str = "The user stepped away and is coming back. Recap in under 40 words, 1-2 plain sentences, no markdown. Lead with the overall goal and current task, then the one next action. Skip root-cause narrative, fix internals, secondary to-dos, and em-dash tangents.";
 
 #[derive(Default)]
-pub(crate) struct UsageCapture(Mutex<Vec<(UsageRecord, Option<super::cache_metering::CacheCreationUsage>)>>);
+pub(crate) struct UsageCapture(Mutex<Vec<(UsageRecord, Option<super::cache_metering::CacheCreationUsage>)>>, super::cache_metering::CacheUsage);
 
 impl UsageCapture {
+    pub(crate) fn with_policy(policy: super::cache_metering::CacheUsage) -> Self {
+        Self(Mutex::new(Vec::new()), policy)
+    }
+
     pub(crate) fn record(&self, record: UsageRecord, breakdown: Option<super::cache_metering::CacheCreationUsage>) {
         self.0.lock().push((record, breakdown));
     }
@@ -67,6 +71,19 @@ impl UsageCapture {
                 "credit_unit": "credit", "credit_unit_plural": "credits"
             });
         usage["cache_creation"] = json!(breakdown);
+        if self.1.has_reporting_policy() {
+            let count = |key: &str| usage[key].as_u64().unwrap_or(0).min(i32::MAX as u64) as i32;
+            let adjusted = self.1.reported_provider_usage(crate::kiro::model::events::TokenUsage {
+                uncached_input_tokens: count("input_tokens"),
+                cache_write_input_tokens: count("cache_creation_input_tokens"),
+                cache_read_input_tokens: count("cache_read_input_tokens"),
+                output_tokens: 0,
+            });
+            usage["input_tokens"] = json!(adjusted.uncached_input_tokens);
+            usage["cache_creation_input_tokens"] = json!(adjusted.cache_write_input_tokens);
+            usage["cache_read_input_tokens"] = json!(adjusted.cache_read_input_tokens);
+            usage["cache_creation"] = json!(self.1.creation_breakdown(adjusted.cache_write_input_tokens, true));
+        }
         (usage, records.last().map_or(0, |(row, _)| row.credential_id))
     }
 
@@ -364,7 +381,7 @@ pub(super) async fn run(
     input: Input,
 ) -> Response {
     let hook = UsageRecordHook::from_state(&state, key.key_id, payload.model.clone());
-    let capture = Arc::new(UsageCapture::default());
+    let capture = Arc::new(UsageCapture::with_policy(hook.cache_policy));
     state.usage_capture = Some(capture.clone());
     let settlement = Settlement {
         hook,

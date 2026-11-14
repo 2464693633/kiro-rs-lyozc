@@ -23,7 +23,6 @@ import { reportSaveError } from '@/components/settings/report-error'
 import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
 import { ToolCompatibilitySetting } from '@/components/settings/tool-compatibility-setting'
-import { InputTokenDeductionSetting } from '@/components/settings/input-token-deduction-setting'
 import { ReportedInputTokensSetting } from '@/components/settings/reported-input-tokens-setting'
 import { UsageSourceBreakdown } from '@/components/settings/usage-source-breakdown'
 
@@ -211,7 +210,6 @@ export function ModelsSection() {
   return (
     <div className="space-y-6">
       <ToolCompatibilitySetting />
-      <InputTokenDeductionSetting />
       <ReportedInputTokensSetting />
       <SettingGroup
         title="Prompt Cache 提示词缓存"

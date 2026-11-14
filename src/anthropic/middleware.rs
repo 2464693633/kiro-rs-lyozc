@@ -144,44 +144,31 @@ impl AppState {
         }
     }
 
-    /// 按 Key 的开关计算本地模拟用量，并附加该 Key 的读取比例上限。
+    /// Snapshot the reporting policy once for this request; disabled metering keeps native usage.
+    pub(crate) fn cache_reporting_policy_for_key(&self, key_id: u64) -> super::cache_metering::CacheUsage {
+        let enabled = self.cache_meter_for_key(key_id).is_some_and(|cache| cache.is_enabled());
+        if !enabled { return super::cache_metering::CacheUsage::default(); }
+        super::cache_metering::CacheUsage::default()
+            .with_reported_input_tokens(self.kiro_provider.as_ref().map_or(0, |provider| provider.token_manager().reported_input_tokens()))
+            .with_read_limit_percent(self.client_keys.as_ref().and_then(|keys| keys.cache_read_limit_percent(key_id)))
+            .with_read_target_percent(self.client_keys.as_ref().and_then(|keys| keys.cache_read_target_percent(key_id)))
+    }
+
     pub async fn compute_cache_usage_for_key(
         &self,
         request: &super::types::MessagesRequest,
         key_id: u64,
     ) -> super::cache_metering::CacheUsage {
-        let limit = self
-            .client_keys
-            .as_ref()
-            .and_then(|keys| keys.cache_read_limit_percent(key_id));
-        let target = self
-            .client_keys
-            .as_ref()
-            .and_then(|keys| keys.cache_read_target_percent(key_id));
-        // 固定上报只在本 Key 真正启用缓存计量时生效：关掉计量的 Key（或总开关关闭）
-        // 按「输入全额计入 input_tokens」上报，不应该再把输入折进 cache_creation。
-        let mut reported_input_tokens = 0;
+        // Internal calls are aggregated before the outer request reserves its input.
+        let policy = if self.usage_capture.is_some() { super::cache_metering::CacheUsage::default() }
+            else { self.cache_reporting_policy_for_key(key_id) };
         let usage = match self.cache_meter_for_key(key_id) {
-            Some(cache) => {
-                if cache.is_enabled() {
-                    reported_input_tokens = self.kiro_provider.as_ref().map_or(0, |provider| {
-                        provider.token_manager().reported_input_tokens()
-                    });
-                }
-                super::cache_metering::compute_cache_usage(&cache, request, key_id)
-                    .await
-                    .with_read_limit_percent(limit)
-                    // 目标会凭配置合成读取量，关掉计量的 Key 不应参与，和固定上报同一道门。
-                    .with_read_target_percent(if cache.is_enabled() { target } else { None })
-            }
+            Some(cache) => super::cache_metering::compute_cache_usage(&cache, request, key_id).await,
             None => super::cache_metering::CacheUsage::default(),
         };
-        usage
-            .with_input_token_deduction(
-                self.kiro_provider.as_ref()
-                    .map_or(0, |provider| provider.token_manager().input_token_deduction()),
-            )
-            .with_reported_input_tokens(reported_input_tokens)
+        usage.with_reported_input_tokens(policy.reported_input_tokens)
+            .with_read_limit_percent(policy.read_limit_percent)
+            .with_read_target_percent(policy.read_target_percent)
     }
 
     /// 注入链路追踪存储
