@@ -44,7 +44,7 @@ use super::{
         stats_by_credential, stats_by_key, stats_by_model, stats_credential_activity, stats_overview,
         stats_timeseries,
         test_model,
-        trace_failure_stats, update_admin_key, update_client_key, update_credential, update_group,
+        trace_failure_stats, trace_usage_source_stats, update_admin_key, update_client_key, update_credential, update_group,
         update_refresh_token,
         list_proxy_credentials, set_proxy_as_global, update_proxy,
     },
@@ -284,6 +284,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/credential-activity", get(stats_credential_activity))
         .route("/stats/by-key", get(stats_by_key))
         .route("/traces/failure-stats", get(trace_failure_stats))
+        .route("/traces/usage-source-stats", get(trace_usage_source_stats))
         .route("/traces", get(list_traces))
         .layer(middleware::from_fn_with_state(
             state.clone(),

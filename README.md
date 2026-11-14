@@ -760,6 +760,22 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 需要说明的是：目标垫高出来的缓存读取，本地 CacheMeter 里并没有对应条目——它改变的是上报口径，不是真实的缓存命中，也不减少上游实际积分。启用后请求日志标记为「已扣减」。要真正提高命中率，应调整 `cacheMeteringCapacity`（减少淘汰）、把请求间隔压进 TTL、保持稳定的 system/tools 前缀、配置 Redis 共享断点元数据或开启会话粘性路由；日志里的 `cache_meter stats` 行按 `miss_evicted` / `miss_expired` / `miss_no_breakpoint` 区分了原因。
 
+### 本地计量生效范围
+
+「设置 → 模型 → Prompt Cache 提示词缓存」里展示最近 24 小时的请求按用量来源的分布，用于确认固定上报输入 Token 与 Key 级读取目标 / 上限究竟对多少请求生效：
+
+| 来源 | 含义 | 本地配置是否生效 |
+|---|---|---|
+| `adjusted` 已调整 | 走本地拆分，并应用了输入扣减或固定上报口径 | 是 |
+| `simulated` 本地估算 | 上游未下发精确用量，按客户端 `cache_control` 断点在本地模拟 | 是 |
+| `provider` 上游真值 | 用量来自 Kiro `metadataEvent.tokenUsage` | 否，原样上报 |
+| `none` 无断点 | 未声明 `cache_control` 或该 Key 关闭了计量 | 否，全额计入 `input_tokens` |
+| `unknown` 无记录 | 老记录或早退请求没有记录来源 | — |
+
+管理接口为 `GET /api/admin/traces/usage-source-stats?windowSecs=86400`（`0` 表示不限时间，默认 86400），返回各来源的请求条数与总数。数据来自 `traces.db` 的 `usage_source` 列，因此关闭请求日志（`traceEnabled: false`）后这里会显示无记录。请求日志页面每条记录也有同样的来源徽标，可按来源核对单条请求。
+
+`provider` 占比高说明上游在下发精确 token 快照，此时调整本地计量设置不会改变上报数字——这是设计使然：上游真值优先，本地拆分只是缺失时的回退。
+
 ### Tool Use
 
 `toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。

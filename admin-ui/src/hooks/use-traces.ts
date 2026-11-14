@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { getTraces, getFailureStats } from '@/api/traces'
+import { getTraces, getFailureStats, getUsageSourceStats } from '@/api/traces'
 import type { TraceQuery } from '@/types/api'
 
 /**
@@ -17,6 +17,23 @@ export function useTraces(query: TraceQuery, enabled = true) {
     staleTime: 10_000,
     placeholderData: keepPreviousData,
     refetchOnWindowFocus: false,
+  })
+}
+
+/**
+ * 按 usage 来源统计请求条数，用于确认本地计量配置的实际生效范围。
+ *
+ * 只有 simulated / adjusted 走了本地拆分；provider 是上游真值，固定上报与
+ * 读取目标对它不生效。trace 关闭时总数为 0，此时无法判断生效范围。
+ */
+export function useUsageSourceStats(windowSecs = 86400) {
+  return useQuery({
+    queryKey: ['traces', 'usage-source-stats', windowSecs],
+    queryFn: () => getUsageSourceStats(windowSecs),
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+    refetchOnWindowFocus: false,
+    retry: 1,
   })
 }
 

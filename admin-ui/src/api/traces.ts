@@ -42,6 +42,28 @@ export async function getFailureStats(): Promise<FailureStatsMap> {
   return data
 }
 
+export interface UsageSourceStats {
+  windowSecs: number
+  total: number
+  /** 上游下发精确用量：本地计量配置对这些请求不生效 */
+  provider: number
+  /** 本地按断点估算：固定上报与读取目标在这里生效 */
+  simulated: number
+  /** 已应用输入扣减或固定上报口径 */
+  adjusted: number
+  /** 无断点 / 计量关闭：全量计入 input */
+  none: number
+  /** 老记录或早退请求没有记录来源 */
+  unknown: number
+}
+
+export async function getUsageSourceStats(windowSecs = 86400): Promise<UsageSourceStats> {
+  const { data } = await api.get<UsageSourceStats>('/traces/usage-source-stats', {
+    params: { windowSecs: String(windowSecs) },
+  })
+  return data
+}
+
 export interface ObservationConfig {
   enabled: boolean
   keyId: number | null

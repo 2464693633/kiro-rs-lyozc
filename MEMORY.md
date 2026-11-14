@@ -87,6 +87,15 @@
 - 目标垫高的读取量本地没有对应缓存条目：它改的是上报口径，不是真实命中，也不减少上游积分。
   要真正提高命中率只能动容量、TTL 间隔、稳定前缀、Redis 共享或会话粘性。
 
+## 本地计量生效范围
+
+- 固定上报输入 Token 与 Key 级读取目标 / 上限只对走本地拆分的请求生效
+  （trace 的 `usage_source` 为 `adjusted` / `simulated`）。`provider` 是上游
+  `metadataEvent.tokenUsage` 真值，一律原样上报，本地配置不改写它。
+- `GET /api/admin/traces/usage-source-stats` 按来源聚合 `traces.db` 既有列，
+  设置页 Prompt Cache 分组展示最近 24 小时分布。老记录无来源列，计入 `unknown`；
+  关闭 `traceEnabled` 后统计为空，界面必须如实说明而不是显示 0%。
+
 ## IP 管理（代理池）
 
 - 代理池是账号代理配置的唯一来源：账号保存 `proxyId` 与代理配置副本（认证以百分号编码

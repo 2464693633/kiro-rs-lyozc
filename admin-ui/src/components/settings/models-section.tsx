@@ -25,6 +25,7 @@ import type { CustomModelItem, AvailableModelItem } from '@/types/api'
 import { ToolCompatibilitySetting } from '@/components/settings/tool-compatibility-setting'
 import { InputTokenDeductionSetting } from '@/components/settings/input-token-deduction-setting'
 import { ReportedInputTokensSetting } from '@/components/settings/reported-input-tokens-setting'
+import { UsageSourceBreakdown } from '@/components/settings/usage-source-breakdown'
 
 // ──── 厂商定义 ────────────────────────────────────────────────────────────
 
@@ -229,6 +230,11 @@ export function ModelsSection() {
           saved={cacheSaver.isSaved('cacheMetering')}
           disabled={cacheLoading}
         />
+        {cacheMeteringEnabled && (
+          <div className="mt-3 border-t border-border/60 pt-3">
+            <UsageSourceBreakdown />
+          </div>
+        )}
       </SettingGroup>
 
       <SettingGroup

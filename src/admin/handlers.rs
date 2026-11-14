@@ -2136,6 +2136,30 @@ pub async fn list_traces(
 /// GET /api/admin/traces/failure-stats
 /// 按凭据聚合失败次数（鉴权 / 账号风控 / 其他三类），用于卡片分色展示。
 /// 返回 { "<credentialId>": { auth, throttle, other }, ... }
+/// GET /api/admin/traces/usage-source-stats?windowSecs=86400
+/// 按 usage 来源统计请求条数，用于确认本地计量配置的实际生效范围。
+pub async fn trace_usage_source_stats(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    // 默认 24 小时；0 表示不限时间。非法值回落到默认，不报错。
+    let window_secs = params
+        .get("windowSecs")
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(86_400);
+    let stats = state.trace_store.usage_source_stats(window_secs);
+    Json(serde_json::json!({
+        "windowSecs": window_secs,
+        "total": stats.total(),
+        "provider": stats.provider,
+        "simulated": stats.simulated,
+        "adjusted": stats.adjusted,
+        "none": stats.none,
+        "unknown": stats.unknown,
+    }))
+}
+
 pub async fn trace_failure_stats(State(state): State<AdminState>) -> impl IntoResponse {
     let stats = state.trace_store.failure_stats();
     let map: std::collections::HashMap<String, serde_json::Value> = stats

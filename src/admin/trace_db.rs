@@ -158,6 +158,28 @@ pub mod sticky {
     pub const OFF: &str = "off";
 }
 
+/// 按 usage 来源聚合的请求条数（见 [`TraceStore::usage_source_stats`]）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSourceStats {
+    /// 上游 `metadataEvent.tokenUsage` 精确值：本地配置不生效
+    pub provider: u64,
+    /// 本地 CacheMeter 按断点估算：固定上报 / 读取目标在这里生效
+    pub simulated: u64,
+    /// 已应用输入扣减或固定上报口径
+    pub adjusted: u64,
+    /// 无断点 / 计量关闭：全量计入 input
+    pub none: u64,
+    /// 老记录或早退请求没有记录来源
+    pub unknown: u64,
+}
+
+impl UsageSourceStats {
+    pub fn total(&self) -> u64 {
+        self.provider + self.simulated + self.adjusted + self.none + self.unknown
+    }
+}
+
 /// usage 三项的来源（record.usage_source 取值）
 pub mod usage_source {
     /// 已应用运营方配置的输入 Token 扣减，不代表上游原始用量。
@@ -775,6 +797,50 @@ impl TraceStore {
     /// 按凭据聚合失败跳数，归并为三类：鉴权 / 账号风控 / 其他。
     /// 统计 trace_attempts 里 outcome != 'success' 的跳，按 credential_id + outcome 分组。
     /// 返回 credential_id → (auth, throttle, other)。仅 warn 失败，返回空。
+    /// 按 `usage_source` 统计时间窗口内的请求条数。
+    ///
+    /// 用于回答「我配置的固定上报 / 读取目标到底对多少请求生效了」：
+    /// 只有 `simulated` / `adjusted` 走了本地拆分，`provider` 是上游真值、不受配置影响。
+    /// `window_secs` 为 0 表示不限时间。老记录的 `usage_source` 为 NULL，计入 `unknown`。
+    pub fn usage_source_stats(&self, window_secs: i64) -> UsageSourceStats {
+        let mut out = UsageSourceStats::default();
+        let conn = self.conn.lock();
+        let since = if window_secs > 0 {
+            chrono::Utc::now().timestamp() - window_secs
+        } else {
+            0
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT usage_source, COUNT(*) FROM traces WHERE ts_epoch >= ?1 GROUP BY usage_source",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("trace usage_source_stats prepare 失败: {}", e);
+                return out;
+            }
+        };
+        let rows = stmt.query_map([since], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, i64>(1)? as u64))
+        });
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("trace usage_source_stats 查询失败: {}", e);
+                return out;
+            }
+        };
+        for (source, count) in rows.flatten() {
+            match source.as_deref() {
+                Some(usage_source::PROVIDER) => out.provider += count,
+                Some(usage_source::SIMULATED) => out.simulated += count,
+                Some(usage_source::ADJUSTED) => out.adjusted += count,
+                Some(usage_source::NONE) => out.none += count,
+                _ => out.unknown += count,
+            }
+        }
+        out
+    }
+
     pub fn failure_stats(&self) -> std::collections::HashMap<u64, FailureStats> {
         let conn = self.conn.lock();
         let mut out: std::collections::HashMap<u64, FailureStats> =
@@ -891,6 +957,44 @@ mod tests {
         status: &'a str,
         credential_id: u64,
         model: &'a str,
+    }
+
+    /// 聚合口径：按来源分桶、窗口过滤、老记录归入 unknown。
+    #[test]
+    fn usage_source_stats_buckets_by_source_and_respects_the_window() {
+        let store = TraceStore::open_in_memory().unwrap();
+        let mut push = |trace_id: &str, source: Option<&str>| {
+            let mut rec = sample(TraceSample {
+                trace_id,
+                status: "success",
+                credential_id: 1,
+                model: "claude-opus-5-5",
+            });
+            rec.usage_source = source.map(|s| s.to_string());
+            store.insert(&rec);
+        };
+        push("t-prov-1", Some(usage_source::PROVIDER));
+        push("t-prov-2", Some(usage_source::PROVIDER));
+        push("t-sim", Some(usage_source::SIMULATED));
+        push("t-adj", Some(usage_source::ADJUSTED));
+        push("t-none", Some(usage_source::NONE));
+        push("t-legacy", None);
+
+        let stats = store.usage_source_stats(0);
+        assert_eq!(stats.provider, 2);
+        assert_eq!(stats.simulated, 1);
+        assert_eq!(stats.adjusted, 1);
+        assert_eq!(stats.none, 1);
+        assert_eq!(stats.unknown, 1, "老记录没有来源，不能算进任何一类");
+        assert_eq!(stats.total(), 6);
+
+        // 24 小时窗口应覆盖刚写入的记录
+        assert_eq!(store.usage_source_stats(86_400), stats);
+
+        // 空库返回全零，不 panic
+        let empty = TraceStore::open_in_memory().unwrap();
+        assert_eq!(empty.usage_source_stats(0), UsageSourceStats::default());
+        assert_eq!(empty.usage_source_stats(0).total(), 0);
     }
 
     fn sample(input: TraceSample<'_>) -> TraceRecord {

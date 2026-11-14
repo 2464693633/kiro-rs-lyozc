@@ -6,6 +6,12 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### 本地计量生效范围
+
+- 设置页的 Prompt Cache 分组新增最近 24 小时请求的用量来源分布，标明固定上报输入 Token 与 Key 级读取目标 / 上限实际对多少请求生效。无请求记录或全部走上游真值时显式说明「调整不会改变上报数字」。
+- 新增 `GET /api/admin/traces/usage-source-stats?windowSecs=86400`（`0` 不限时间），按 `adjusted` / `simulated` / `provider` / `none` / `unknown` 返回请求条数；数据来自 `traces.db` 既有的 `usage_source` 列，未新增写入路径。
+- 老记录没有来源列，计入 `unknown` 而不并入任何一类；关闭请求日志后统计为空，界面如实说明。
+
 ### 模拟缓存读取目标
 
 - 客户端 Key 新增 `cacheReadTargetPercent`（0–100，留空关闭）：一律按该比例上报模拟缓存读取，自然命中率不参与计算，其余输入计入 `cache_creation_input_tokens`。与现有的只能封顶的读取上限互补，可双向调整上报的缓存读取 / 写入比例。
