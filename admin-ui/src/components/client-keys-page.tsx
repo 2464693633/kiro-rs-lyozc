@@ -59,6 +59,37 @@ function parseCacheReadLimitInput(raw: string): number | null | 'invalid' {
   return Number.isInteger(value) && value >= 0 && value <= 100 ? value : 'invalid'
 }
 
+function CacheReadTargetInput({ id, value, onChange, disabled }: {
+  id: string
+  value: string
+  onChange: (value: string) => void
+  disabled: boolean
+}) {
+  return (
+    <div>
+      <label htmlFor={id} className="text-[12px] text-muted-foreground">模拟缓存读取目标（%）</label>
+      <Input
+        id={id}
+        type="number"
+        min="0"
+        max="100"
+        step="1"
+        inputMode="numeric"
+        placeholder="留空表示按自然命中率"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={disabled}
+      />
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        一律按该比例上报模拟缓存读取，自然命中率不参与计算：设 80% 时，
+        自然 95% 会压到 80%，自然 0% 也会按 80% 上报。其余输入计入缓存写入。
+        <strong>设置后覆盖下方的读取上限。</strong>
+        垫高的部分本地并无对应缓存条目，不改变上游实际积分；仅在模拟缓存计量开启时生效。
+      </p>
+    </div>
+  )
+}
+
 function CacheReadLimitInput({ id, value, onChange, disabled }: {
   id: string
   value: string
@@ -231,6 +262,7 @@ export function ClientKeysPage() {
   const [createMaxCredits, setCreateMaxCredits] = useState('')
   const [createCacheMetering, setCreateCacheMetering] = useState(true)
   const [createCacheReadLimit, setCreateCacheReadLimit] = useState('')
+  const [createCacheReadTarget, setCreateCacheReadTarget] = useState('')
   const [createBillingMode, setCreateBillingMode] = useState<ClientKeyBillingMode>('credits')
   const [createMaxCalls, setCreateMaxCalls] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
@@ -244,6 +276,7 @@ export function ClientKeysPage() {
   const [editMaxCredits, setEditMaxCredits] = useState('')
   const [editCacheMetering, setEditCacheMetering] = useState(true)
   const [editCacheReadLimit, setEditCacheReadLimit] = useState('')
+  const [editCacheReadTarget, setEditCacheReadTarget] = useState('')
   const [editBillingMode, setEditBillingMode] = useState<ClientKeyBillingMode>('credits')
   const [editMaxCalls, setEditMaxCalls] = useState('')
 
@@ -264,6 +297,11 @@ export function ClientKeysPage() {
       toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
       return
     }
+    const cacheReadTarget = parseCacheReadLimitInput(createCacheReadTarget)
+    if (cacheReadTarget === 'invalid') {
+      toast.error('模拟缓存读取目标必须是 0 到 100 的整数')
+      return
+    }
     const maxCalls = createBillingMode === 'calls' ? parseMaxCallsInput(createMaxCalls) : null
     if (maxCalls === 'invalid') {
       toast.error('调用次数上限必须是非负安全整数')
@@ -277,6 +315,7 @@ export function ClientKeysPage() {
         maxCredits: maxCredits ?? undefined,
         cacheMetering: createCacheMetering,
         cacheReadLimitPercent: cacheReadLimit,
+        cacheReadTargetPercent: cacheReadTarget,
         billingMode: createBillingMode,
         maxCalls: maxCalls ?? undefined,
       })
@@ -374,6 +413,7 @@ export function ClientKeysPage() {
     setEditMaxCredits(item.maxCredits != null ? String(item.maxCredits) : '')
     setEditCacheMetering(item.cacheMetering)
     setEditCacheReadLimit(item.cacheReadLimitPercent != null ? String(item.cacheReadLimitPercent) : '')
+    setEditCacheReadTarget(item.cacheReadTargetPercent != null ? String(item.cacheReadTargetPercent) : '')
     setEditBillingMode(item.billingMode)
     setEditMaxCalls(item.maxCalls != null ? String(item.maxCalls) : '')
     setEditOpen(true)
@@ -392,6 +432,11 @@ export function ClientKeysPage() {
       toast.error('模拟缓存读取上限必须是 0 到 100 的整数')
       return
     }
+    const cacheReadTarget = parseCacheReadLimitInput(editCacheReadTarget)
+    if (cacheReadTarget === 'invalid') {
+      toast.error('模拟缓存读取目标必须是 0 到 100 的整数')
+      return
+    }
     const maxCalls = editBillingMode === 'calls' ? parseMaxCallsInput(editMaxCalls) : (editTarget.maxCalls ?? null)
     if (maxCalls === 'invalid') {
       toast.error('调用次数上限必须是非负安全整数')
@@ -406,6 +451,7 @@ export function ClientKeysPage() {
           group: editGroup.trim(),
           cacheMetering: editCacheMetering,
           cacheReadLimitPercent: cacheReadLimit,
+          cacheReadTargetPercent: cacheReadTarget,
           billingMode: editBillingMode, maxCalls,
         },
       })
@@ -657,7 +703,11 @@ export function ClientKeysPage() {
             </span>
           ) : k.cacheMetering ? (
             <Badge variant="outline">
-              {k.cacheReadLimitPercent != null ? `模拟 ≤${k.cacheReadLimitPercent}%` : '模拟'}
+              {k.cacheReadTargetPercent != null
+                ? `模拟 =${k.cacheReadTargetPercent}%`
+                : k.cacheReadLimitPercent != null
+                  ? `模拟 ≤${k.cacheReadLimitPercent}%`
+                  : '模拟'}
             </Badge>
           ) : (
             <Badge variant="secondary" title="输入全部计入 input tokens，缓存两项为 0">
@@ -1075,6 +1125,12 @@ export function ClientKeysPage() {
                   aria-label="模拟缓存计量"
                 />
               </div>
+              <CacheReadTargetInput
+                id="create-cache-read-target"
+                value={createCacheReadTarget}
+                onChange={setCreateCacheReadTarget}
+                disabled={createKey.isPending}
+              />
               <CacheReadLimitInput
                 id="create-cache-read-limit"
                 value={createCacheReadLimit}
@@ -1204,6 +1260,12 @@ export function ClientKeysPage() {
                   aria-label="模拟缓存计量"
                 />
               </div>
+              <CacheReadTargetInput
+                id="edit-cache-read-target"
+                value={editCacheReadTarget}
+                onChange={setEditCacheReadTarget}
+                disabled={updateKey.isPending}
+              />
               <CacheReadLimitInput
                 id="edit-cache-read-limit"
                 value={editCacheReadLimit}

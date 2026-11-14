@@ -197,7 +197,10 @@ impl UsageSource {
 
     /// 由「上游是否给了精确用量」与「本地模拟是否覆盖到前缀」推断来源。
     pub fn resolve(has_provider_usage: bool, cache_usage: &super::cache_metering::CacheUsage) -> Self {
-        if cache_usage.input_token_deduction > 0 {
+        if cache_usage.input_token_deduction > 0
+            || cache_usage.reported_input_tokens > 0
+            || cache_usage.read_target_percent.is_some()
+        {
             Self::Adjusted
         } else if has_provider_usage {
             Self::Provider

@@ -628,6 +628,8 @@ export interface ClientKeyItem {
   cacheMetering: boolean
   /** 模拟缓存读取占总输入的百分比上限；null/缺省表示不额外限制。 */
   cacheReadLimitPercent?: number | null
+  /** 固定的模拟缓存读取目标占比；null/缺省表示按自然命中率。设置后覆盖上限。 */
+  cacheReadTargetPercent?: number | null
 }
 
 export interface ClientKeysResponse {
@@ -657,6 +659,7 @@ export interface CreateClientKeyRequest {
   /** 是否做本地缓存计量模拟（可选，不传表示开启） */
   cacheMetering?: boolean
   cacheReadLimitPercent?: number | null
+  cacheReadTargetPercent?: number | null
   billingMode?: ClientKeyBillingMode
   maxCalls?: number
 }
@@ -677,6 +680,8 @@ export interface UpdateClientKeyRequest {
   cacheMetering?: boolean
   /** 不传保持设置；null 清除上限。 */
   cacheReadLimitPercent?: number | null
+  /** 不传保持设置；null 清除目标。 */
+  cacheReadTargetPercent?: number | null
   billingMode?: ClientKeyBillingMode
   maxCalls?: number | null
 }

@@ -87,6 +87,10 @@ pub struct ClientKey {
     /// 模拟缓存读取占总输入的百分比上限；None 表示不额外限制。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_limit_percent: Option<u8>,
+    /// 固定的模拟缓存读取目标占比；None 表示按自然命中率上报。
+    /// 设置后直接决定 read / creation 比例，并覆盖 `cache_read_limit_percent`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_target_percent: Option<u8>,
 }
 
 /// 鉴权结果：区分「命中」「超额」「未命中」，供中间件返回不同 HTTP 状态。
@@ -229,6 +233,7 @@ impl ClientKeyManager {
             is_system: false,
             cache_metering: true,
             cache_read_limit_percent: None,
+            cache_read_target_percent: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -278,6 +283,7 @@ impl ClientKeyManager {
                     is_system: true,
                     cache_metering: true,
                     cache_read_limit_percent: None,
+                    cache_read_target_percent: None,
                 },
             );
             changed = true;
@@ -393,6 +399,28 @@ impl ClientKeyManager {
             .entries
             .get(&id)
             .and_then(|entry| entry.cache_read_limit_percent)
+            .filter(|value| *value <= 100)
+    }
+
+    pub fn set_cache_read_target_percent(&self, id: u64, target: Option<u8>) -> bool {
+        if target.is_some_and(|value| value > 100) {
+            return false;
+        }
+        let mut inner = self.inner.write();
+        let Some(entry) = inner.entries.get_mut(&id) else {
+            return false;
+        };
+        entry.cache_read_target_percent = target;
+        self.save_locked(&inner);
+        true
+    }
+
+    pub fn cache_read_target_percent(&self, id: u64) -> Option<u8> {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .and_then(|entry| entry.cache_read_target_percent)
             .filter(|value| *value <= 100)
     }
 
@@ -1244,6 +1272,43 @@ mod tests {
         assert!(reloaded.set_cache_read_limit_percent(bounded.id, None));
         assert_eq!(ClientKeyManager::load(&path).unwrap().cache_read_limit_percent(bounded.id), None);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_read_target_persists_validates_and_is_independent_of_the_limit() {
+        let path = std::env::temp_dir().join(format!("kiro-cache-read-target-{}.json", uuid::Uuid::new_v4()));
+        let mgr = ClientKeyManager::load(&path).unwrap();
+        let key = mgr.create("target".into(), None, None);
+
+        // 校验边界：>100 拒绝，不存在的 id 拒绝
+        assert!(mgr.set_cache_read_target_percent(key.id, Some(80)));
+        assert!(!mgr.set_cache_read_target_percent(key.id, Some(101)));
+        assert!(!mgr.set_cache_read_target_percent(999, Some(80)));
+
+        // 落盘后重载仍在
+        let reloaded = ClientKeyManager::load(&path).unwrap();
+        assert_eq!(reloaded.cache_read_target_percent(key.id), Some(80));
+        assert_eq!(reloaded.cache_read_target_percent(999), None);
+
+        // 目标与上限互不干扰：各自独立存取
+        assert!(reloaded.set_cache_read_limit_percent(key.id, Some(10)));
+        assert_eq!(reloaded.cache_read_target_percent(key.id), Some(80));
+        assert_eq!(reloaded.cache_read_limit_percent(key.id), Some(10));
+
+        // 两端取值与清除
+        assert!(reloaded.set_cache_read_target_percent(key.id, Some(0)));
+        assert_eq!(reloaded.cache_read_target_percent(key.id), Some(0));
+        assert!(reloaded.set_cache_read_target_percent(key.id, Some(100)));
+        assert!(reloaded.set_cache_read_target_percent(key.id, None));
+        assert_eq!(
+            ClientKeyManager::load(&path).unwrap().cache_read_target_percent(key.id),
+            None
+        );
+        assert_eq!(
+            ClientKeyManager::load(&path).unwrap().cache_read_limit_percent(key.id),
+            Some(10),
+            "清除目标不应动上限"
+        );
     }
 
     #[test]

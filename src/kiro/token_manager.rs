@@ -1352,6 +1352,7 @@ pub struct MultiTokenManager {
     api_domain: Mutex<ApiDomain>,
     tool_compatibility_mode: Mutex<ToolCompatibilityMode>,
     input_token_deduction: AtomicU32,
+    reported_input_tokens: AtomicU32,
     /// 会话粘性路由：会话 → 上一轮成功凭据 的绑定表（运行时可开关 / 改 TTL）
     session_affinity: SessionAffinity,
     /// 账号级 429 限流故障转移开关（运行时可修改）
@@ -1653,6 +1654,7 @@ impl MultiTokenManager {
         let api_domain = config.api_domain;
         let tool_compatibility_mode = config.tool_compatibility_mode;
         let input_token_deduction = config.input_token_deduction;
+        let reported_input_tokens = config.reported_input_tokens;
         let session_affinity = SessionAffinity::new(
             config.session_affinity_enabled,
             config.session_affinity_ttl_secs,
@@ -1694,6 +1696,7 @@ impl MultiTokenManager {
             api_domain: Mutex::new(api_domain),
             tool_compatibility_mode: Mutex::new(tool_compatibility_mode),
             input_token_deduction: AtomicU32::new(input_token_deduction),
+            reported_input_tokens: AtomicU32::new(reported_input_tokens),
             session_affinity,
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
@@ -5233,6 +5236,29 @@ impl MultiTokenManager {
         tracing::info!(
             input_token_deduction = value,
             "输入 Token 扣减值已保存，对后续模型调用生效"
+        );
+        Ok(())
+    }
+
+    pub fn reported_input_tokens(&self) -> u32 {
+        self.reported_input_tokens.load(Ordering::Relaxed)
+    }
+
+    pub fn set_reported_input_tokens(&self, value: u32) -> anyhow::Result<()> {
+        let _update_guard = self.runtime_config_update_lock.lock();
+        anyhow::ensure!(
+            value <= crate::model::config::MAX_REPORTED_INPUT_TOKENS,
+            "reportedInputTokens 必须是 0 到 1000 的整数"
+        );
+        anyhow::ensure!(
+            self.config.config_path().is_some(),
+            "配置文件路径未知，无法保存固定上报输入 Token"
+        );
+        self.update_config_file(|config| config.reported_input_tokens = value)?;
+        self.reported_input_tokens.store(value, Ordering::Relaxed);
+        tracing::info!(
+            reported_input_tokens = value,
+            "固定上报输入 Token 已保存，对后续模型调用生效"
         );
         Ok(())
     }

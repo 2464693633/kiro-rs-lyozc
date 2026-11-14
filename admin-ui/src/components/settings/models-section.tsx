@@ -24,6 +24,7 @@ import { extractErrorMessage, cn, parseError } from '@/lib/utils'
 import type { CustomModelItem, AvailableModelItem } from '@/types/api'
 import { ToolCompatibilitySetting } from '@/components/settings/tool-compatibility-setting'
 import { InputTokenDeductionSetting } from '@/components/settings/input-token-deduction-setting'
+import { ReportedInputTokensSetting } from '@/components/settings/reported-input-tokens-setting'
 
 // ──── 厂商定义 ────────────────────────────────────────────────────────────
 
@@ -210,6 +211,7 @@ export function ModelsSection() {
     <div className="space-y-6">
       <ToolCompatibilitySetting />
       <InputTokenDeductionSetting />
+      <ReportedInputTokensSetting />
       <SettingGroup
         title="Prompt Cache 提示词缓存"
         description="控制向客户端返回的用量中是否包含 Anthropic 格式的缓存计量"

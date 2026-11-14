@@ -573,6 +573,20 @@ export async function setInputTokenDeduction(inputTokenDeduction: number): Promi
   return data
 }
 
+export interface ReportedInputTokensConfig {
+  reportedInputTokens: number
+}
+
+export async function getReportedInputTokens(): Promise<ReportedInputTokensConfig> {
+  const { data } = await api.get<ReportedInputTokensConfig>('/config/reported-input-tokens')
+  return data
+}
+
+export async function setReportedInputTokens(reportedInputTokens: number): Promise<ReportedInputTokensConfig> {
+  const { data } = await api.put<ReportedInputTokensConfig>('/config/reported-input-tokens', { reportedInputTokens })
+  return data
+}
+
 export async function getToolCompatibilityMode(): Promise<ToolCompatibilityConfig> {
   const { data } = await api.get<ToolCompatibilityConfig>('/config/tool-compatibility')
   return data

@@ -17,6 +17,13 @@ pub struct InputTokenDeductionConfig {
     pub input_token_deduction: u32,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReportedInputTokensConfig {
+    #[serde(deserialize_with = "crate::model::config::deserialize_reported_input_tokens")]
+    pub reported_input_tokens: u32,
+}
+
 // ============ 凭据状态 ============
 
 /// 所有凭据状态响应
@@ -1351,6 +1358,7 @@ pub struct ClientKeyItem {
     /// 是否对该 Key 做本地缓存计量模拟；false 时输入全部计入 input_tokens
     pub cache_metering: bool,
     pub cache_read_limit_percent: Option<u8>,
+    pub cache_read_target_percent: Option<u8>,
 }
 
 /// 客户端 Key 列表响应
@@ -1444,6 +1452,10 @@ pub struct CreateClientKeyRequest {
     /// 模拟缓存读取上限，整数 0..=100；省略或 null 表示不额外限制。
     #[serde(default)]
     pub cache_read_limit_percent: Option<u8>,
+    /// 固定的模拟缓存读取目标占比，整数 0..=100；省略或 null 表示按自然命中率。
+    /// 设置后覆盖 `cache_read_limit_percent`。
+    #[serde(default)]
+    pub cache_read_target_percent: Option<u8>,
     #[serde(default)]
     pub billing_mode: super::client_keys::BillingMode,
     #[serde(default)]
@@ -1474,6 +1486,9 @@ pub struct UpdateClientKeyRequest {
     /// 省略保留原设置；null 清除上限；整数 0..=100 设置百分比。
     #[serde(default, deserialize_with = "deserialize_cache_read_limit_patch")]
     pub cache_read_limit_percent: Option<Option<u8>>,
+    /// 省略保留原设置；null 清除目标；整数 0..=100 设置百分比。
+    #[serde(default, deserialize_with = "deserialize_cache_read_limit_patch")]
+    pub cache_read_target_percent: Option<Option<u8>>,
     pub billing_mode: Option<super::client_keys::BillingMode>,
     pub max_calls: Option<u64>,
 }

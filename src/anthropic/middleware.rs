@@ -154,16 +154,34 @@ impl AppState {
             .client_keys
             .as_ref()
             .and_then(|keys| keys.cache_read_limit_percent(key_id));
+        let target = self
+            .client_keys
+            .as_ref()
+            .and_then(|keys| keys.cache_read_target_percent(key_id));
+        // 固定上报只在本 Key 真正启用缓存计量时生效：关掉计量的 Key（或总开关关闭）
+        // 按「输入全额计入 input_tokens」上报，不应该再把输入折进 cache_creation。
+        let mut reported_input_tokens = 0;
         let usage = match self.cache_meter_for_key(key_id) {
-            Some(cache) => super::cache_metering::compute_cache_usage(&cache, request, key_id)
-                .await
-                .with_read_limit_percent(limit),
+            Some(cache) => {
+                if cache.is_enabled() {
+                    reported_input_tokens = self.kiro_provider.as_ref().map_or(0, |provider| {
+                        provider.token_manager().reported_input_tokens()
+                    });
+                }
+                super::cache_metering::compute_cache_usage(&cache, request, key_id)
+                    .await
+                    .with_read_limit_percent(limit)
+                    // 目标会凭配置合成读取量，关掉计量的 Key 不应参与，和固定上报同一道门。
+                    .with_read_target_percent(if cache.is_enabled() { target } else { None })
+            }
             None => super::cache_metering::CacheUsage::default(),
         };
-        usage.with_input_token_deduction(
-            self.kiro_provider.as_ref()
-                .map_or(0, |provider| provider.token_manager().input_token_deduction()),
-        )
+        usage
+            .with_input_token_deduction(
+                self.kiro_provider.as_ref()
+                    .map_or(0, |provider| provider.token_manager().input_token_deduction()),
+            )
+            .with_reported_input_tokens(reported_input_tokens)
     }
 
     /// 注入链路追踪存储

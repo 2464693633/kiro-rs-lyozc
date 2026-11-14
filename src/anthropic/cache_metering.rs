@@ -104,10 +104,16 @@ pub struct CacheUsage {
     pub prompt_total_est: i32,
     /// 仅对本地模拟的最终拆分生效，None 表示不额外限制。
     pub read_limit_percent: Option<u8>,
+    /// 固定的模拟缓存读取目标占比，None 表示按自然命中率上报。
+    /// 设置后直接决定 read 与 creation 的比例，并覆盖 `read_limit_percent`。
+    pub read_target_percent: Option<u8>,
     /// 本次未命中的 1h 前缀段（estimate 口径），不含已读缓存。
     pub cache_creation_1h_est: i32,
     /// 本次上游调用的输入上报扣减快照；不改变缓存条目和真实积分。
     pub input_token_deduction: u32,
+    /// 固定上报的 `input_tokens` 快照；0 表示按真实拆分上报。
+    /// 非 0 时保留命中的 `cache_read`，未缓存尾部并入 `cache_creation`。
+    pub reported_input_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +141,28 @@ impl CacheUsage {
         self
     }
 
+    pub fn with_reported_input_tokens(mut self, value: u32) -> Self {
+        self.reported_input_tokens = value;
+        self
+    }
+
+    /// 把已经守恒的三项改写成「固定 input + 保留 read + 其余归 creation」。
+    ///
+    /// `read` 原样保留（上限是扣减后的总量），`input` 取配置值与剩余量的较小者，
+    /// 其余全部归 `cache_creation`。三项之和仍等于传入的 `total`。
+    /// `reported_input_tokens == 0` 时原样返回，不参与计算。
+    fn apply_reported_input(&self, total: i32, read: i32) -> (i32, i32, i32) {
+        let total = total.max(0);
+        // total > 0 时至少给 input 留 1 个 token（见下方步骤 3 的 #111 说明）：
+        // 固定目标 100% 时 read 会占满总量，这里把保底让出来。
+        let read = read.clamp(0, if total > 0 { total - 1 } else { 0 });
+        let remaining = total - read;
+        let floor = if total > 0 { 1 } else { 0 };
+        let input = i64::from(self.reported_input_tokens)
+            .clamp(i64::from(floor), i64::from(remaining)) as i32;
+        (input, remaining - input, read)
+    }
+
     /// 精确 provider 拆分也遵守显式的上报扣减策略，保留三项占比及总量。
     /// 使用累计边界取整，避免小缓存项为零或极大计数时产生负数/溢出。
     pub fn reported_provider_usage(
@@ -145,15 +173,20 @@ impl CacheUsage {
         let input = i128::from(usage.uncached_input_tokens);
         let write = i128::from(usage.cache_write_input_tokens);
         let total = input + write + i128::from(usage.cache_read_input_tokens);
-        if self.input_token_deduction == 0 || total == 0 {
+        if total == 0 {
             return usage;
         }
-        let remaining = (total - i128::from(self.input_token_deduction)).max(0);
-        let input_boundary = remaining * input / total;
-        let write_boundary = remaining * (input + write) / total;
-        usage.uncached_input_tokens = input_boundary as i32;
-        usage.cache_write_input_tokens = (write_boundary - input_boundary) as i32;
-        usage.cache_read_input_tokens = (remaining - write_boundary) as i32;
+        if self.input_token_deduction > 0 {
+            let remaining = (total - i128::from(self.input_token_deduction)).max(0);
+            let input_boundary = remaining * input / total;
+            let write_boundary = remaining * (input + write) / total;
+            usage.uncached_input_tokens = input_boundary as i32;
+            usage.cache_write_input_tokens = (write_boundary - input_boundary) as i32;
+            usage.cache_read_input_tokens = (remaining - write_boundary) as i32;
+        }
+        // 上游精确快照是真值，不改写它的 input / read / write 三项。
+        // 固定上报与固定目标只作用于本地模拟拆分（`split_against_total`）：
+        // 这里改写会把上游如实报告的 0 输入、真实命中量覆盖掉。
         usage
     }
 
@@ -164,9 +197,15 @@ impl CacheUsage {
             return Some(CacheCreationUsage::default());
         }
         let estimated = i64::from(self.cache_covered_est).saturating_sub(i64::from(self.cache_read)).max(0);
-        if provider_supplied || estimated == 0 {
+        if provider_supplied {
             return None;
         }
+        if estimated == 0 {
+            return None;
+        }
+        // 已知边界：固定口径下 `total` 含并入的未缓存尾部，这里仍按模拟 creation 的
+        // 1h 占比分摊。客户端显式声明过 1h 断点时，1h 项会偏大（尾部本身没有 TTL 声明）；
+        // 只声明 5m（Claude Code 默认）时 one_hour_est 为 0，不受影响。
         let one_hour_est = i64::from(self.cache_creation_1h_est).clamp(0, estimated);
         let one_hour = (total * one_hour_est + estimated / 2) / estimated;
         Some(CacheCreationUsage {
@@ -177,6 +216,11 @@ impl CacheUsage {
 
     pub fn with_read_limit_percent(mut self, limit: Option<u8>) -> Self {
         self.read_limit_percent = limit;
+        self
+    }
+
+    pub fn with_read_target_percent(mut self, target: Option<u8>) -> Self {
+        self.read_target_percent = target;
         self
     }
 
@@ -195,6 +239,9 @@ impl CacheUsage {
         let total = (i64::from(total_real.max(0)) - i64::from(self.input_token_deduction))
             .max(0) as i32;
         if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
+            // 没有任何缓存覆盖（未声明 cache_control、或本次没有任何断点）：
+            // 本地根本没有写入条目，把输入折进 cache_creation 等于凭空声明一条
+            // 不存在的缓存写入。固定上报与固定目标在这里都不生效，输入全额计入 input。
             return (total, 0, 0);
         }
 
@@ -202,6 +249,9 @@ impl CacheUsage {
         let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
         let cache_total = (((total as f64) * ratio).round() as i32).min(total);
         let mut uncached_tail = total - cache_total;
+        // 整个 prompt 都被断点覆盖：每个 token 要么命中缓存、要么本轮真实写入，
+        // 没有「确实未缓存」的内容。顶层自动缓存（Claude Code 默认）就是这种形状。
+        let fully_covered = uncached_tail == 0;
 
         // 2. 覆盖前缀内部再按 estimate 口径的命中比例拆成 read 与 creation。
         let cache_read = ((cache_total as f64)
@@ -223,6 +273,23 @@ impl CacheUsage {
             uncached_tail = 1;
         }
 
+        // 固定目标：只在覆盖区内重分配 read / creation，上限是 cache_total。
+        // 覆盖区外的尾部是确实未缓存的输入，改标成缓存写入就是声明一次没发生的写入，
+        // 所以这里绝不动它。顶层自动缓存时 cache_total == total，目标即最终比例。
+        //
+        // 目标优先于读取上限：目标就是最终比例，不再受上限二次裁剪，
+        // 否则「一律按 N%」在上限更低时就不成立了。
+        if let Some(percent) = self.read_target_percent {
+            let wanted = (i64::from(total) * i64::from(percent.min(100)) / 100) as i32;
+            let read = wanted.min(cache_total).clamp(0, (total - 1).max(0));
+            if fully_covered {
+                // 全覆盖：input 取固定值（未启用时为保底 1），其余归 creation。
+                return self.apply_reported_input(total, read);
+            }
+            // 有真实尾部：尾部保持为 input，覆盖区内按目标拆分。
+            return (uncached_tail, total - uncached_tail - read, read);
+        }
+
         let limited_read = match self.read_limit_percent {
             Some(percent) => {
                 // 按最终 token 数向下取整，避免小请求因舍入超过配置比例。
@@ -231,6 +298,11 @@ impl CacheUsage {
             }
             None => cache_read,
         };
+        // 固定上报只在全覆盖时生效：有真实未缓存尾部时，把它折进 cache_creation
+        // 会声明一次没发生的缓存写入（该内容没有任何断点覆盖），因此退让为自然拆分。
+        if self.reported_input_tokens > 0 && fully_covered {
+            return self.apply_reported_input(total, limited_read);
+        }
         // 保持缓存写入和总量不变，超出的读取量转为普通输入。
         (uncached_tail + cache_read - limited_read, cache_creation, limited_read)
     }
@@ -2171,6 +2243,282 @@ mod tests {
         assert_eq!(low_hit.with_read_limit_percent(Some(60)).split_against_total(100), low_hit.split_against_total(100));
         let cold = CacheUsage { cache_read: 0, ..usage };
         assert_eq!(cold.with_read_limit_percent(Some(60)).split_against_total(100), (1, 99, 0));
+    }
+
+    /// 固定上报：input 停在配置值，命中的 read 原样保留，未缓存尾部并入 creation。
+    #[test]
+    fn reported_input_tokens_fixes_input_and_folds_tail_into_creation() {
+        let usage = CacheUsage {
+            cache_read: 95,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        // 关闭（0）时与原行为完全一致
+        assert_eq!(
+            usage.with_reported_input_tokens(0).split_against_total(100_000),
+            usage.split_against_total(100_000)
+        );
+
+        let fixed = usage.with_reported_input_tokens(2);
+        let (input, creation, read) = fixed.split_against_total(100_000);
+        assert_eq!(input, 2, "input 固定为配置值");
+        assert_eq!(read, 95_000, "命中的 read 原样保留");
+        assert_eq!(creation, 4_998, "其余全部归 creation");
+        assert_eq!(input + creation + read, 100_000, "三项仍严格守恒");
+
+        // Key 级读取上限先生效，剩余部分才按固定口径分配
+        let (input, creation, read) = fixed
+            .with_read_limit_percent(Some(60))
+            .split_against_total(100_000);
+        assert_eq!((input, creation, read), (2, 39_998, 60_000));
+        let (input, creation, read) = fixed
+            .with_read_limit_percent(Some(0))
+            .split_against_total(100_000);
+        assert_eq!((input, creation, read), (2, 99_998, 0));
+    }
+
+    /// 没有缓存覆盖时不得凭空造出 cache_creation：本地没写过条目，
+    /// 把输入折进写入量等于声明一条不存在的缓存。固定上报与固定目标都不生效。
+    #[test]
+    fn no_cache_coverage_never_synthesizes_creation() {
+        let bare = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        assert_eq!(bare.split_against_total(500), (500, 0, 0));
+        assert_eq!(
+            bare.with_reported_input_tokens(2).split_against_total(500),
+            (500, 0, 0),
+            "未声明断点时输入全额计入 input_tokens"
+        );
+        assert_eq!(
+            bare.with_read_target_percent(Some(80)).split_against_total(500),
+            (500, 0, 0),
+            "固定目标也不能无中生有"
+        );
+    }
+
+    /// 输入总量不足配置值时按总量收口，不会凭空造 token，也不会出现负数。
+    #[test]
+    fn reported_input_tokens_clamps_to_small_totals() {
+        let fixed = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_reported_input_tokens(2);
+        assert_eq!(fixed.split_against_total(0), (0, 0, 0));
+        assert_eq!(fixed.split_against_total(1), (1, 0, 0));
+        assert_eq!(fixed.split_against_total(2), (2, 0, 0));
+        assert_eq!(fixed.split_against_total(5), (2, 3, 0));
+
+        // 全命中且总量极小时，原有的「input 不为 0」保底先让出 1 个 token
+        // （客户端按零值不覆盖非零合并 usage，input 归零会残留估算值），
+        // 固定口径在其之后分配，因此 input 落在 1 而不是 0。
+        let hot = CacheUsage { cache_read: 100, ..fixed };
+        let (input, creation, read) = hot.split_against_total(3);
+        assert_eq!((input, creation, read), (1, 0, 2));
+        assert_eq!(input + creation + read, 3, "守恒");
+    }
+
+    /// 与输入扣减叠加：先扣减，再按固定口径分配扣减后的总量。
+    #[test]
+    fn reported_input_tokens_composes_with_input_deduction() {
+        let usage = CacheUsage {
+            cache_read: 95,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_input_token_deduction(2_000)
+        .with_reported_input_tokens(2);
+        let (input, creation, read) = usage.split_against_total(100_000);
+        assert_eq!(input, 2);
+        assert_eq!(read, 93_100, "读取量仍按扣减后的总量比例分摊");
+        assert_eq!(input + creation + read, 98_000, "守恒到扣减后的总量");
+    }
+
+    /// 上游精确快照是真值：固定上报与固定目标都不得改写它的三项。
+    #[test]
+    fn provider_snapshots_are_never_reshaped() {
+        let provider = crate::kiro::model::events::TokenUsage {
+            uncached_input_tokens: 1_000,
+            output_tokens: 500,
+            cache_write_input_tokens: 4_000,
+            cache_read_input_tokens: 95_000,
+        };
+        for usage in [
+            CacheUsage::default(),
+            CacheUsage::default().with_reported_input_tokens(2),
+            CacheUsage::default().with_read_target_percent(Some(80)),
+            CacheUsage::default()
+                .with_reported_input_tokens(2)
+                .with_read_target_percent(Some(80)),
+        ] {
+            let reported = usage.reported_provider_usage(provider);
+            assert_eq!(reported.uncached_input_tokens, 1_000);
+            assert_eq!(reported.cache_write_input_tokens, 4_000);
+            assert_eq!(reported.cache_read_input_tokens, 95_000);
+            assert_eq!(reported.output_tokens, 500);
+        }
+
+        // 上游如实报告 0 输入（全命中）时也不得被垫成配置值
+        let fully_cached = crate::kiro::model::events::TokenUsage {
+            uncached_input_tokens: 0,
+            output_tokens: 17,
+            cache_write_input_tokens: 4,
+            cache_read_input_tokens: 18_224,
+        };
+        let reported = CacheUsage::default()
+            .with_reported_input_tokens(2)
+            .with_read_target_percent(Some(80))
+            .reported_provider_usage(fully_cached);
+        assert_eq!(reported.uncached_input_tokens, 0);
+        assert_eq!(reported.cache_read_input_tokens, 18_224);
+        assert_eq!(reported.cache_write_input_tokens, 4);
+
+        // 输入扣减仍按原有三项比例缩减（既有行为，未改动）
+        let deducted = CacheUsage::default()
+            .with_input_token_deduction(2_000)
+            .reported_provider_usage(provider);
+        assert_eq!(
+            deducted.uncached_input_tokens
+                + deducted.cache_write_input_tokens
+                + deducted.cache_read_input_tokens,
+            98_000
+        );
+    }
+
+    /// 固定目标：一律按配置比例上报 read，自然命中率不参与。
+    #[test]
+    fn read_target_forces_the_configured_ratio_regardless_of_natural_hit_rate() {
+        let hot = CacheUsage {
+            cache_read: 95,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_reported_input_tokens(2);
+        let cold = CacheUsage { cache_read: 0, ..hot };
+
+        // 自然 95% 被压到 80%，自然 0% 被抬到 80%：同一个目标，同一个结果
+        for usage in [hot, cold] {
+            let (input, creation, read) =
+                usage.with_read_target_percent(Some(80)).split_against_total(100_000);
+            assert_eq!((input, creation, read), (2, 19_998, 80_000));
+            assert_eq!(input + creation + read, 100_000, "三项守恒");
+        }
+
+        // 0% 与 100% 两端
+        assert_eq!(
+            hot.with_read_target_percent(Some(0)).split_against_total(100_000),
+            (2, 99_998, 0)
+        );
+        let (input, creation, read) =
+            cold.with_read_target_percent(Some(100)).split_against_total(100_000);
+        assert_eq!(read, 99_999, "100% 让出 input 保底的 1 个 token");
+        assert_eq!((input, creation), (1, 0));
+
+        // 未设置目标时行为不变
+        assert_eq!(
+            hot.with_read_target_percent(None).split_against_total(100_000),
+            hot.split_against_total(100_000)
+        );
+    }
+
+    /// 目标优先于上限：否则「一律按 N%」在上限更低时不成立。
+    #[test]
+    fn read_target_overrides_the_read_limit_cap() {
+        let usage = CacheUsage {
+            cache_read: 95,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_reported_input_tokens(2)
+        .with_read_limit_percent(Some(10));
+
+        // 只有上限：压到 10%
+        assert_eq!(usage.split_against_total(100_000), (2, 89_998, 10_000));
+        // 目标 + 上限：目标说话
+        assert_eq!(
+            usage.with_read_target_percent(Some(80)).split_against_total(100_000),
+            (2, 19_998, 80_000)
+        );
+    }
+
+    /// 小总量与零总量：向下取整，不出现负数，input 保底不被吃掉。
+    #[test]
+    fn read_target_clamps_small_totals_and_keeps_input_floor() {
+        let usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            ..Default::default()
+        }
+        .with_reported_input_tokens(2)
+        .with_read_target_percent(Some(80));
+
+        assert_eq!(usage.split_against_total(0), (0, 0, 0));
+        // 1 × 80% 向下取整为 0
+        assert_eq!(usage.split_against_total(1), (1, 0, 0));
+        assert_eq!(usage.split_against_total(10), (2, 0, 8));
+        for total in [1, 2, 3, 7, 10, 99, 1_000] {
+            let (input, creation, read) = usage.split_against_total(total);
+            assert_eq!(input + creation + read, total, "total={total} 必须守恒");
+            assert!(input >= 1, "total={total} input 不能归零");
+            assert!(creation >= 0 && read >= 0, "total={total} 不能出现负数");
+        }
+    }
+
+    /// 关掉缓存计量的 Key（或总开关关闭）必须按「输入全额计入 input_tokens」上报。
+    /// middleware 既把 `reported_input_tokens` / `read_target_percent` 置零，
+    /// 拆分本身在没有覆盖段时也不会合成缓存两项——两道防线都要成立。
+    #[test]
+    fn disabled_metering_reports_full_input_either_way() {
+        // middleware 对无计量器的 Key 使用的就是这个值
+        let disabled = CacheUsage::default();
+        assert_eq!(disabled.reported_input_tokens, 0);
+        assert_eq!(disabled.read_target_percent, None);
+        assert_eq!(disabled.split_against_total(12_345), (12_345, 0, 0));
+
+        // 即使配置漏进来，没有覆盖段也不得合成 creation / read
+        assert_eq!(
+            disabled
+                .with_reported_input_tokens(2)
+                .with_read_target_percent(Some(80))
+                .split_against_total(12_345),
+            (12_345, 0, 0)
+        );
+    }
+
+    /// TTL 细分只拆本地真实写入过的量，不为没有写入的请求猜 TTL。
+    #[test]
+    fn creation_breakdown_only_splits_real_local_writes() {
+        let covered = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 100,
+            prompt_total_est: 100,
+            cache_creation_1h_est: 100,
+            ..Default::default()
+        };
+        let breakdown = covered
+            .creation_breakdown(500, false)
+            .expect("声明 1h 的覆盖段应可拆");
+        assert_eq!(breakdown.ephemeral_1h_input_tokens, 500);
+        assert_eq!(breakdown.ephemeral_5m_input_tokens, 0);
+
+        // 上游给了精确 usage 时不猜 TTL
+        assert_eq!(covered.creation_breakdown(500, true), None);
+        // 没有本地写入可拆时也不猜
+        let bare = CacheUsage { cache_covered_est: 0, ..covered };
+        assert_eq!(bare.creation_breakdown(498, false), None);
+        // 写入量为 0 时返回全零而不是 None
+        assert_eq!(covered.creation_breakdown(0, false), Some(CacheCreationUsage::default()));
     }
 
     #[test]

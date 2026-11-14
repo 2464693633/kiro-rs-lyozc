@@ -34,7 +34,7 @@ use super::{
         SetSelfHealConfigRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
-        ToolCompatibilityConfig, InputTokenDeductionConfig, UpdateProxyRequest, UpdateRefreshTokenRequest,
+        ToolCompatibilityConfig, InputTokenDeductionConfig, ReportedInputTokensConfig, UpdateProxyRequest, UpdateRefreshTokenRequest,
         SetCustomHeadersRequest,
         SetCustomModelsRequest,
         SetProtocolCompatibilityRequest,
@@ -728,6 +728,20 @@ pub async fn get_input_token_deduction(State(state): State<AdminState>) -> impl 
     Json(state.service.get_input_token_deduction())
 }
 
+pub async fn get_reported_input_tokens(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_reported_input_tokens())
+}
+
+pub async fn set_reported_input_tokens(
+    State(state): State<AdminState>,
+    Json(payload): Json<ReportedInputTokensConfig>,
+) -> impl IntoResponse {
+    match state.service.set_reported_input_tokens(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status_code(), Json(error.into_response())).into_response(),
+    }
+}
+
 pub async fn set_input_token_deduction(
     State(state): State<AdminState>,
     Json(payload): Json<InputTokenDeductionConfig>,
@@ -1244,6 +1258,7 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         is_system: k.is_system,
         cache_metering: k.cache_metering,
         cache_read_limit_percent: k.cache_read_limit_percent,
+        cache_read_target_percent: k.cache_read_target_percent,
     }
 }
 
@@ -1370,6 +1385,18 @@ pub async fn create_client_key(
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
     if payload
+        .cache_read_target_percent
+        .is_some_and(|target| target > 100)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "cacheReadTargetPercent 必须是 0 到 100 的整数",
+            )),
+        )
+            .into_response();
+    }
+    if payload
         .cache_read_limit_percent
         .is_some_and(|limit| limit > 100)
     {
@@ -1431,6 +1458,9 @@ pub async fn create_client_key(
     }
     if let Some(limit) = payload.cache_read_limit_percent {
         state.client_keys.set_cache_read_limit_percent(entry.id, Some(limit));
+    }
+    if let Some(target) = payload.cache_read_target_percent {
+        state.client_keys.set_cache_read_target_percent(entry.id, Some(target));
     }
     Json(CreateClientKeyResponse {
         id: entry.id,
@@ -1515,6 +1545,19 @@ pub async fn update_client_key(
 ) -> impl IntoResponse {
     use axum::http::StatusCode;
     if payload
+        .cache_read_target_percent
+        .flatten()
+        .is_some_and(|target| target > 100)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(
+                "cacheReadTargetPercent 必须是 0 到 100 的整数",
+            )),
+        )
+            .into_response();
+    }
+    if payload
         .cache_read_limit_percent
         .flatten()
         .is_some_and(|limit| limit > 100)
@@ -1562,6 +1605,9 @@ pub async fn update_client_key(
         }
         if let Some(limit) = payload.cache_read_limit_percent {
             state.client_keys.set_cache_read_limit_percent(id, limit);
+        }
+        if let Some(target) = payload.cache_read_target_percent {
+            state.client_keys.set_cache_read_target_percent(id, target);
         }
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {

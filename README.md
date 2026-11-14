@@ -735,6 +735,31 @@ Kiro 上游没有原生的结构化输出字段，因此 `output_config.format =
 
 这是运营方承担输入开销的计量策略，不会删除 Kiro 服务端提示词、减少上游实际积分或改变输出 Token。启用后的请求日志标记为「已扣减」，不再标记为上游原始真值。历史用量不回写；`count_tokens` 仍估算客户端原始请求，不扣减。未收到上游精确 Token 或上下文用量时，本地估算也会执行扣减，因此短请求可能显示零输入。全局设置适用于所有模型和客户端 Key，设回 `0` 即恢复后续调用的原计量。
 
+### 固定上报输入 Token
+
+管理后台「系统设置 → 模型 → 固定上报输入 Token」可把返回给客户端的 `input_tokens` 固定成指定数量。`config.json` 对应 `reportedInputTokens`，**默认 `2`**，`0` 表示关闭（按真实拆分上报），范围为 `0` 到 `1000` 的整数；保存后落盘并即时生效，无需重启。管理接口为 `GET/PUT /api/admin/config/reported-input-tokens`，更新请求体为 `{"reportedInputTokens":2}`，需要 Admin API Key；保存失败不会修改生效值。
+
+拆分规则：命中的 `cache_read_input_tokens` 按本地模拟原样保留（Key 级读取比例上限先生效），`input_tokens` 取配置值，未被缓存覆盖的输入全部并入 `cache_creation_input_tokens`。三项之和仍等于（扣减后的）真实输入总量，不凭空增减 token。输入总量不足配置值时按总量上报；与 `inputTokenDeduction` 叠加时先扣减、再按固定口径分配。
+
+上游返回精确 Token 快照时（含新 CreateResponse 协议的账号）同样套用该口径，避免同一客户端在新旧协议之间看到两种形状。并入 `cache_creation` 的尾部没有声明过 TTL，按默认 5 分钟计入 `cache_creation.ephemeral_5m_input_tokens`。
+
+该设置只改上报口径：不改变本地缓存条目的写入和命中、输出 Token，也不减少上游实际积分。启用后请求日志标记为「已扣减」。关闭了缓存计量模拟的客户端 Key（以及总开关关闭时）不受影响，仍按输入全额计入 `input_tokens` 上报。`count_tokens` 估算客户端原始请求，不受影响。
+
+### 模拟缓存读取目标与上限
+
+客户端 Key 页面的「新建 / 编辑」里有两个相邻设置，都只作用于本地模拟拆分，`0`–`100` 的整数，留空表示不生效：
+
+- **模拟缓存读取目标（`cacheReadTargetPercent`）**：一律按该比例上报模拟缓存读取，自然命中率不参与计算。设 `80` 时，自然命中 95% 会压到 80%，自然命中 0% 也会按 80% 上报。其余输入计入 `cache_creation_input_tokens`。
+- **模拟缓存读取上限（`cacheReadLimitPercent`）**：只封顶，不垫高。`min(模拟命中量, 总输入 × 上限%)`，超出部分转为普通输入。自然命中 20% 时设上限 60% 仍是 20%。
+
+**同时设置时目标优先**，上限不再二次裁剪——否则「一律按 N%」在上限更低时就不成立。Key 列表的缓存计量徽标据此区分：`模拟 =80%` 是目标，`模拟 ≤60%` 是上限。
+
+两者都按最终 token 数向下取整，三项之和仍等于（扣减后的）真实输入总量；`total > 0` 时至少给 `input_tokens` 留 1 个 token，所以目标 `100%` 会让出 1 个。管理接口是 Key 的创建 / 更新接口，`PUT` 时省略字段表示不修改、显式传 `null` 表示清除。
+
+目标与上限都只在模拟缓存计量开启时生效：关闭了该 Key 的缓存计量模拟、或全局开关关闭时，输入全额计入 `input_tokens`。上游返回精确 Token 快照的请求也套用同一口径，避免同一客户端在新旧协议之间看到两种形状。
+
+需要说明的是：目标垫高出来的缓存读取，本地 CacheMeter 里并没有对应条目——它改变的是上报口径，不是真实的缓存命中，也不减少上游实际积分。启用后请求日志标记为「已扣减」。要真正提高命中率，应调整 `cacheMeteringCapacity`（减少淘汰）、把请求间隔压进 TTL、保持稳定的 system/tools 前缀、配置 Redis 共享断点元数据或开启会话粘性路由；日志里的 `cache_meter stats` 行按 `miss_evicted` / `miss_expired` / `miss_no_breakpoint` 区分了原因。
+
 ### Tool Use
 
 `toolCompatibilityMode` 默认是 `raw`：保留客户端工具名、描述和参数，不替换为硬编码的 Kiro 内置工具 schema，也不注入旧的分块写入策略。上游要求的工具名长度限制、描述长度限制与 schema 规范化仍然生效。

@@ -1743,7 +1743,12 @@ async fn run_web_search_loop_inner(
         .client_keys
         .as_ref()
         .and_then(|keys| keys.cache_read_limit_percent(key_id));
+    let read_target = hook
+        .client_keys
+        .as_ref()
+        .and_then(|keys| keys.cache_read_target_percent(key_id));
     let input_token_deduction = provider.token_manager().input_token_deduction();
+    let reported_input_tokens = provider.token_manager().reported_input_tokens();
     let mut settlement = WebSearchUsageSettlement::new(hook, tracer.clone());
     let mut latest_metering: Option<MeteringEvent> = None;
     let mut all_thinking = String::new();
@@ -1768,6 +1773,12 @@ async fn run_web_search_loop_inner(
                     super::cache_metering::compute_cache_usage(cache, &payload, key_id)
                         .await
                         .with_read_limit_percent(read_limit)
+                        .with_read_target_percent(if cache.is_enabled() { read_target } else { None })
+                        .with_reported_input_tokens(if cache.is_enabled() {
+                            reported_input_tokens
+                        } else {
+                            0
+                        })
                 }
                 None => CacheUsage::default(),
             }

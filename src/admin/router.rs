@@ -22,6 +22,7 @@ use super::{
         get_api_domain, get_cache_metering_config, get_session_affinity_config,
         get_tool_compatibility_mode, set_tool_compatibility_mode,
         get_input_token_deduction, set_input_token_deduction,
+        get_reported_input_tokens, set_reported_input_tokens,
         get_load_balancing_mode, get_log_governance_config, get_model_api_retry_config,
         get_protocol_compatibility,
         get_proxy_failover_config, get_proxy_pool, get_quota_reset_recovery_config,
@@ -157,6 +158,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/input-token-deduction",
             get(get_input_token_deduction).put(set_input_token_deduction),
+        )
+        .route(
+            "/config/reported-input-tokens",
+            get(get_reported_input_tokens).put(set_reported_input_tokens),
         )
         .route(
             "/config/account-throttle",
