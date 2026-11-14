@@ -543,6 +543,11 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
           </div>
         )}
 
+        {step === 'form' && method === 'idc' && isStarting && (
+          <p role="status" className="text-xs text-muted-foreground">
+            正在生成授权链接，代理较慢时可能需要约一分钟，请稍候…
+          </p>
+        )}
         <DialogFooter>
           {step === 'select' && (
             <Button variant="outline" onClick={handleClose}>取消</Button>

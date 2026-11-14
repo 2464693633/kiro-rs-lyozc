@@ -59,6 +59,11 @@ const api = axios.create({
   },
 })
 
+// IdC startup performs two sequential AWS requests (up to 30s each).
+// Completing login can also refresh credentials and fetch the account balance.
+const loginStartOptions = { timeout: 75_000 }
+const loginCompletionOptions = { timeout: 120_000 }
+
 // 请求拦截器添加 API Key
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -779,13 +784,13 @@ export async function setCacheMeteringConfig(
 export async function startIdcLogin(
   req: StartIdcLoginRequest
 ): Promise<StartIdcLoginResponse> {
-  const { data } = await api.post<StartIdcLoginResponse>('/auth/idc/start', req)
+  const { data } = await api.post<StartIdcLoginResponse>('/auth/idc/start', req, loginStartOptions)
   return data
 }
 
 // 轮询 IdC 登录状态
 export async function pollIdcLogin(sessionId: string): Promise<PollIdcLoginResponse> {
-  const { data } = await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`)
+  const { data } = await api.post<PollIdcLoginResponse>(`/auth/idc/poll/${sessionId}`, undefined, loginCompletionOptions)
   return data
 }
 
@@ -901,7 +906,7 @@ export async function startSocialLogin(
 
 // 轮询 Social 登录状态
 export async function pollSocialLogin(sessionId: string): Promise<PollSocialLoginResponse> {
-  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`)
+  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/poll/${sessionId}`, undefined, loginCompletionOptions)
   return data
 }
 
@@ -910,7 +915,7 @@ export async function completeSocialLogin(
   sessionId: string,
   req: CompleteSocialLoginRequest
 ): Promise<PollSocialLoginResponse> {
-  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/complete/${sessionId}`, req)
+  const { data } = await api.post<PollSocialLoginResponse>(`/auth/social/complete/${sessionId}`, req, loginCompletionOptions)
   return data
 }
 
@@ -934,7 +939,9 @@ export async function pollSocialRelogin(
   sessionId: string
 ): Promise<PollSocialLoginResponse> {
   const { data } = await api.post<PollSocialLoginResponse>(
-    `/credentials/${credentialId}/relogin/social/poll/${sessionId}`
+    `/credentials/${credentialId}/relogin/social/poll/${sessionId}`,
+    undefined,
+    loginCompletionOptions,
   )
   return data
 }
@@ -947,7 +954,8 @@ export async function completeSocialRelogin(
 ): Promise<PollSocialLoginResponse> {
   const { data } = await api.post<PollSocialLoginResponse>(
     `/credentials/${credentialId}/relogin/social/complete/${sessionId}`,
-    req
+    req,
+    loginCompletionOptions,
   )
   return data
 }
@@ -959,7 +967,8 @@ export async function startIdcRelogin(
 ): Promise<StartIdcLoginResponse> {
   const { data } = await api.post<StartIdcLoginResponse>(
     `/credentials/${credentialId}/relogin/idc/start`,
-    req
+    req,
+    loginStartOptions,
   )
   return data
 }
@@ -970,7 +979,9 @@ export async function pollIdcRelogin(
   sessionId: string
 ): Promise<PollIdcLoginResponse> {
   const { data } = await api.post<PollIdcLoginResponse>(
-    `/credentials/${credentialId}/relogin/idc/poll/${sessionId}`
+    `/credentials/${credentialId}/relogin/idc/poll/${sessionId}`,
+    undefined,
+    loginCompletionOptions,
   )
   return data
 }

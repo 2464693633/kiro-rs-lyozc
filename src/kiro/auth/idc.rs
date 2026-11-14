@@ -52,11 +52,9 @@ fn oidc_endpoint(region: &str) -> String {
 pub async fn register_client(
     region: &str,
     start_url: &str,
-    config: &Config,
-    proxy: Option<&ProxyConfig>,
+    client: &reqwest::Client,
 ) -> anyhow::Result<RegisterClientResponse> {
     let url = format!("{}/client/register", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
 
     let body = RegisterClientRequest {
         client_name: "kiro-rs".to_string(),
@@ -76,7 +74,7 @@ pub async fn register_client(
         .json(&body)
         .send()
         .await
-        .context("注册 OIDC 客户端请求失败")?;
+        .map_err(|error| request_error("注册 OIDC 客户端", error))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -95,11 +93,9 @@ pub async fn start_device_authorization(
     start_url: &str,
     client_id: &str,
     client_secret: &str,
-    config: &Config,
-    proxy: Option<&ProxyConfig>,
+    client: &reqwest::Client,
 ) -> anyhow::Result<StartDeviceAuthorizationResponse> {
     let url = format!("{}/device_authorization", oidc_endpoint(region));
-    let client = build_client(proxy, 30, config.tls_backend)?;
 
     let body = StartDeviceAuthorizationRequest {
         client_id: client_id.to_string(),
@@ -114,7 +110,7 @@ pub async fn start_device_authorization(
         .json(&body)
         .send()
         .await
-        .context("发起设备授权请求失败")?;
+        .map_err(|error| request_error("发起设备授权", error))?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -160,7 +156,7 @@ pub async fn poll_token(
         .await
     {
         Ok(r) => r,
-        Err(e) => return PollResult::Error(e.into()),
+        Err(e) => return PollResult::Error(request_error("轮询授权状态", e)),
     };
 
     let status = resp.status();
@@ -189,4 +185,15 @@ pub async fn poll_token(
     }
 
     PollResult::Error(anyhow::anyhow!("轮询令牌失败 {}: {}", status, body_text))
+}
+
+fn request_error(stage: &str, error: reqwest::Error) -> anyhow::Error {
+    // Do not expose proxy credentials or request URLs in the admin response.
+    if error.is_timeout() {
+        anyhow::anyhow!("{}请求超时，请检查所选代理或网络到 AWS OIDC 的连接后重试", stage)
+    } else if error.is_connect() {
+        anyhow::anyhow!("{}连接失败，请检查所选代理是否可访问 AWS OIDC", stage)
+    } else {
+        anyhow::anyhow!("{}请求失败，请检查所选代理或网络连接", stage)
+    }
 }

@@ -303,11 +303,16 @@ export function IdcLoginDialog({ open, onOpenChange, onSuccess, mode = 'builder-
           </div>
         )}
 
+        {step === 'form' && isStarting && (
+          <p role="status" className="text-xs text-muted-foreground">
+            正在生成授权链接，代理较慢时可能需要约一分钟，请稍候…
+          </p>
+        )}
         <DialogFooter>
           {step === 'form' && (
             <Button onClick={handleStart} disabled={isStarting}>
               {isStarting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-              发起登录
+              {isStarting ? '正在生成授权链接…' : '发起登录'}
             </Button>
           )}
           {step === 'waiting' && (

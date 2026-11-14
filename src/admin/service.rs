@@ -4044,7 +4044,15 @@ impl AdminService {
         let config = self.token_manager.config();
 
         // 1. 注册 OIDC 客户端
-        let reg = idc::register_client(&region, &start_url, config, proxy.as_ref())
+        // Reuse the same proxy/TLS connection for both AWS calls instead of
+        // repeating a slow SOCKS/CONNECT handshake during device authorization.
+        let client = crate::http_client::build_client(proxy.as_ref(), 30, config.tls_backend)
+            .map_err(|_| {
+                AdminServiceError::InternalError(
+                    "创建登录网络客户端失败，请检查所选代理配置".to_string(),
+                )
+            })?;
+        let reg = idc::register_client(&region, &start_url, &client)
             .await
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
@@ -4054,8 +4062,7 @@ impl AdminService {
             &start_url,
             &reg.client_id,
             &reg.client_secret,
-            config,
-            proxy.as_ref(),
+            &client,
         )
         .await
         .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
